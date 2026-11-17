@@ -219,6 +219,11 @@ import { LINK_EXCUSED_DIRS, ProjectSymlinkRefusedError, walkFilesSync } from "./
  * R639 F1: an edge build carries SemVer build metadata, `al-runner 3.0.0-alpha.4+edge.20261022
  * (57f1e4f98)`; the metadata is one or more of `[0-9A-Za-z.-]`, never empty and never a space.
  */
+/** Fork: the first line of a command's output, trimmed (al-runner may print notes after `--version`). */
+export function firstLine(text: string): string {
+  return (text.trim().split("\n")[0] ?? "").trim();
+}
+
 export const AL_RUNNER_V3_VERSION =
   /^al-?runner 3\.\d+\.\d+(?:-[\w.]+)?(?:\+[0-9A-Za-z.-]+)? \([0-9a-f]+\)$/;
 
@@ -810,6 +815,8 @@ export interface AlRunnerV3Config {
   readonly alRunnerPath: string;
   /** §12: the update gate's run of an ungated CANDIDATE build; only the `.gated` check is relaxed. */
   readonly candidate?: boolean;
+  /** Fork: extra al-runner flags for every `test` and `serve` call (`alRunnerV3.extraArgs`). */
+  readonly extraArgs?: readonly string[];
   /** LethAL-owned scratch; `active/`, `alc-out/` and `cov/` go under it. */
   readonly instrumentedDir: string;
   readonly testDir: string;
@@ -1330,6 +1337,8 @@ export function v3CallArgv(a: {
   readonly isolation?: "test" | "codeunit";
   /** R907: `--skip-after-timeout`, right after the stop pair. Absent: not passed. */
   readonly skipAfterTimeout?: boolean;
+  /** Fork: `alRunnerV3.extraArgs`, before the app folders. */
+  readonly extraArgs?: readonly string[];
 }): string[] {
   return [
     a.alRunnerPath,
@@ -1360,6 +1369,7 @@ export function v3CallArgv(a: {
       : []),
     ...a.symbols.flatMap((s) => ["--define", s]),
     ...(a.coverageJson !== undefined ? ["--coverage-json", a.coverageJson] : []),
+    ...(a.extraArgs ?? []),
     a.activeDir,
     a.testDir,
   ];
@@ -3116,7 +3126,8 @@ export class AlRunnerV3Backend implements ExecutionBackend {
         stderr: String(e),
       }),
     );
-    const reported = (res.stdout || res.stderr).trim();
+    // Fork: some builds add lines after the version (e.g. "also on PATH: ..."); the version is line one.
+    const reported = firstLine(res.stdout || res.stderr);
     if (res.exitCode !== 0) {
       return {
         ok: false,
@@ -5219,6 +5230,7 @@ export class AlRunnerV3Backend implements ExecutionBackend {
         : {}),
       symbols: this.cfg.preprocessorSymbols ?? [],
       ...(o.coverageJson !== undefined ? { coverageJson: resolve(o.coverageJson) } : {}),
+      ...(this.cfg.extraArgs !== undefined ? { extraArgs: this.cfg.extraArgs } : {}),
       activeDir: o.activeDir,
       testDir: o.testDir,
     });
@@ -7093,6 +7105,7 @@ export class AlRunnerV3Backend implements ExecutionBackend {
             ...this.dotnetAssemblyDirs().flatMap((d) => ["--dotnet-assembly-dir", d]),
           ]
         : []),
+      ...(this.cfg.extraArgs ?? []),
     ]);
     lane.stats.daemons += 1;
     const daemon: Daemon = {

@@ -76,6 +76,10 @@ export interface AlRunnerV3ConfigSection {
   readonly daemonMaxRssGb: number;
   /** R952 (R948): replace a serve daemon after this many requests; 0 (default) = off. */
   readonly daemonMaxRequests: number;
+  /** Fork: extra al-runner flags, passed to every `test` and `serve` call (e.g. `--allow-network`). */
+  readonly extraArgs: readonly string[];
+  /** Fork: run an al-runner build the gate manifest does not list (e.g. a self-built fork). */
+  readonly allowUngated: boolean;
 }
 
 /**
@@ -120,6 +124,8 @@ export const V3_NO_CLIENT_DEFAULT = false;
 export const V3_ISOLATION_DEFAULT = "auto";
 
 const KEYS = [
+  "extraArgs",
+  "allowUngated",
   "memoryHeadroomGb",
   "daemonMaxRssGb",
   "daemonMaxRequests",
@@ -325,7 +331,23 @@ export function validateAlRunnerV3Config(
       `al-runner-v3-config-refused: "alRunnerV3.daemonMaxRequests" must be a whole number, 0 or more (0 turns the request bound off), got ${JSON.stringify(r.daemonMaxRequests)} (R952).`,
     );
   }
+  if (
+    r.extraArgs !== undefined &&
+    (!Array.isArray(r.extraArgs) ||
+      r.extraArgs.some((a: unknown) => typeof a !== "string" || a === ""))
+  ) {
+    throw new Error(
+      `al-runner-v3-config-refused: "alRunnerV3.extraArgs" must be a list of non-empty strings, got ${JSON.stringify(r.extraArgs)}.`,
+    );
+  }
+  if (r.allowUngated !== undefined && typeof r.allowUngated !== "boolean") {
+    throw new Error(
+      `al-runner-v3-config-refused: "alRunnerV3.allowUngated" must be a boolean, got ${JSON.stringify(r.allowUngated)}.`,
+    );
+  }
   return {
+    extraArgs: (r.extraArgs as string[] | undefined) ?? [],
+    allowUngated: (r.allowUngated as boolean | undefined) ?? false,
     memoryHeadroomGb: r.memoryHeadroomGb ?? MEMORY_HEADROOM_GB_DEFAULT,
     daemonMaxRssGb: r.daemonMaxRssGb ?? V3_DAEMON_MAX_RSS_GB_DEFAULT,
     daemonMaxRequests: r.daemonMaxRequests ?? 0,
@@ -401,14 +423,9 @@ export async function assertBcVersionMatchesPackages(
   }
 }
 
-/** T16 and M9: the platform refusal, before anything is built. Only Linux x64 was measured. */
+/** T16 and M9: the platform refusal, before anything is built. Fork: Windows is allowed too. */
 export function refuseV3Platform(platform: NodeJS.Platform = process.platform): void {
-  if (platform === "win32") {
-    throw new Error(
-      "al-runner-v3-windows-unsupported: --backend al-runner-v3 is not measured on Windows (R586 v1).",
-    );
-  }
-  if (platform !== "linux") {
+  if (platform !== "linux" && platform !== "win32") {
     throw new Error(
       `al-runner-v3-platform-unsupported: ${platform}: --backend al-runner-v3 was measured on Linux only (R586 v1).`,
     );
