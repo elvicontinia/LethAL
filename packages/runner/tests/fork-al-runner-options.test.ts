@@ -1,6 +1,6 @@
 // Fork: `alRunnerV3.extraArgs` and `alRunnerV3.allowUngated`, and the Windows platform check.
 import { describe, expect, test } from "bun:test";
-import { v3CallArgv } from "../src/al-runner-v3-backend";
+import { AL_RUNNER_V3_VERSION, firstLine, v3CallArgv } from "../src/al-runner-v3-backend";
 import { refuseV3Platform, validateAlRunnerV3Config } from "../src/al-runner-v3-config";
 
 const base = { packagesDir: "/p", bcVersion: "28.0.46665.47126" };
@@ -40,6 +40,15 @@ describe("fork: allowUngated", () => {
     expect(() => validateAlRunnerV3Config({ ...base, allowUngated: "yes" })).toThrow(
       '"alRunnerV3.allowUngated" must be a boolean',
     );
+  });
+});
+
+describe("fork: --version with a note after it", () => {
+  test("only the first line is the version", () => {
+    const out =
+      "al-runner 3.0.0-alpha.14 (4852ecc16)\r\nalso on PATH: C:\\shims\\al-runner.exe: (no answer within 2 s)\r\n";
+    expect(firstLine(out)).toBe("al-runner 3.0.0-alpha.14 (4852ecc16)");
+    expect(AL_RUNNER_V3_VERSION.test(firstLine(out))).toBe(true);
   });
 });
 

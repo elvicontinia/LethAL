@@ -33,6 +33,7 @@ import type { ServerSpawnFn } from "./al-runner-server";
 import {
   AlRunnerV3Backend,
   AlRunnerV3ServeFallbackWarmupError,
+  firstLine,
   resolveDotnetSidecar,
 } from "./al-runner-v3-backend";
 import {
@@ -5294,7 +5295,7 @@ export async function buildDoctorDeps(
                 stderr: String(e),
               }),
             );
-            const version = (v.stdout || v.stderr).trim();
+            const version = firstLine(v.stdout || v.stderr);
             if (v.exitCode !== 0)
               return {
                 ok: false,

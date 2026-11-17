@@ -219,6 +219,11 @@ import { LINK_EXCUSED_DIRS, ProjectSymlinkRefusedError, walkFilesSync } from "./
  * R639 F1: an edge build carries SemVer build metadata, `al-runner 3.0.0-alpha.4+edge.20261022
  * (57f1e4f98)`; the metadata is one or more of `[0-9A-Za-z.-]`, never empty and never a space.
  */
+/** Fork: the first line of a command's output, trimmed (al-runner may print notes after `--version`). */
+export function firstLine(text: string): string {
+  return (text.trim().split("\n")[0] ?? "").trim();
+}
+
 export const AL_RUNNER_V3_VERSION =
   /^al-?runner 3\.\d+\.\d+(?:-[\w.]+)?(?:\+[0-9A-Za-z.-]+)? \([0-9a-f]+\)$/;
 
@@ -3121,7 +3126,8 @@ export class AlRunnerV3Backend implements ExecutionBackend {
         stderr: String(e),
       }),
     );
-    const reported = (res.stdout || res.stderr).trim();
+    // Fork: some builds add lines after the version (e.g. "also on PATH: ..."); the version is line one.
+    const reported = firstLine(res.stdout || res.stderr);
     if (res.exitCode !== 0) {
       return {
         ok: false,
