@@ -18,7 +18,6 @@ import type {
 } from "../src/backend";
 import { hashTargetSource, readTargetSource } from "../src/baseline-snapshot";
 import { BcDevMcpBackend } from "../src/bcdev-backend";
-import { TestProjectNestedError } from "../src/verify";
 import type { BcDevConfigSection, LethalConfigFile, RunCliConfig } from "../src/cli";
 import { runFromCli } from "../src/cli";
 import { NOTHING_SCORED_EXIT_CODE, QUARANTINED_EXIT_CODE, exitCodeForReport } from "../src/cli";
@@ -75,6 +74,7 @@ import { QuarantineStore } from "../src/quarantine-store";
 import type { SessionReport } from "../src/report";
 import { quarantineResourceKey } from "../src/resource-key";
 import { ResultsStore } from "../src/store";
+import { TestProjectNestedError } from "../src/verify";
 import {
   VERIFY_EXIT,
   VerifyError,
@@ -3663,9 +3663,11 @@ const VALUE: Readonly<Record<string, string>> = {
 };
 
 /** R654: the backends `parseCliConfig` accepts on THIS platform. al-runner-v3 is refused off
- *  Linux (`refuseV3Platform`), so on Windows bcdev is the only valid value. */
+ *  Linux and (fork) Windows (`refuseV3Platform`). */
 const VALID_BACKENDS: readonly string[] =
-  process.platform === "linux" ? ["bcdev", "al-runner-v3"] : ["bcdev"];
+  process.platform === "linux" || process.platform === "win32"
+    ? ["bcdev", "al-runner-v3"]
+    : ["bcdev"];
 
 /** MEASURED exemption: flags `run --dry-run` accepts and ignores. R266 emptied it: `--out` now
  *  writes the listing and every other execution flag is refused. It may not grow. */

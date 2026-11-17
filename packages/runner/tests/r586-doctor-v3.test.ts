@@ -159,15 +159,15 @@ describe("doctor: al-runner-v3", () => {
     expect(r.checks[0]?.detail).toMatch(/four-number/);
   });
 
-  test("R834: beside a bcdev section, Windows is a failed check, not a pass and not a throw", async () => {
+  test("R834: beside a bcdev section, an unsupported platform is a failed check, not a pass and not a throw", async () => {
     const { bin, deps } = await setup(true);
     const cfg = { bcdev: BCDEV, alRunnerV3: { path: bin, packagesDir: deps, bcVersion: BC } };
-    const d = await buildDoctorDeps(cfg, { alRunnerSpawn: spawn, platform: "win32" });
+    const d = await buildDoctorDeps(cfg, { alRunnerSpawn: spawn, platform: "darwin" });
     const { alRunnerV3 } = d.deps;
     if (alRunnerV3 === undefined) throw new Error("no al-runner-v3 dep");
     const r = await runDoctor(d.cfg, { alRunnerV3 });
     expect(r.ok).toBe(false);
-    expect(r.checks[0]?.detail).toMatch(/al-runner-v3-windows-unsupported/);
+    expect(r.checks[0]?.detail).toMatch(/al-runner-v3-platform-unsupported/);
   });
 
   test("R834: the install hint names the absolute home path and says the default finds it", () => {

@@ -20,7 +20,7 @@ describe("T16: refused by name for v3, and not for v2", () => {
   const base = ["--project", "P", "--tests", "T", "--backend", "al-runner-v3"];
   // M9: the CLI refuses v3 on every platform but Linux, so on another OS (the Windows CI job) these
   // tests ASSERT that refusal instead of the Linux behaviour; neither direction is skipped.
-  const LINUX = process.platform === "linux";
+  const LINUX = process.platform === "linux" || process.platform === "win32"; // fork: Windows runs v3 too
   const PLATFORM_REFUSED = /al-runner-v3-(windows|platform)-unsupported/;
   test("--backend al-runner-v3 parses on Linux, and is refused by name elsewhere", () => {
     if (!LINUX) {
@@ -49,8 +49,8 @@ describe("T16: refused by name for v3, and not for v2", () => {
       /al-runner-v3 has no environment/,
     );
   });
-  test("Windows is refused by name; Linux is not", () => {
-    expect(() => refuseV3Platform("win32")).toThrow(/al-runner-v3-windows-unsupported/);
+  test("fork: Windows and Linux are not refused", () => {
+    expect(() => refuseV3Platform("win32")).not.toThrow();
     expect(() => refuseV3Platform("linux")).not.toThrow();
   });
   test("serverMode and selectorMode in the v3 section are refused by name", () => {
@@ -146,10 +146,10 @@ describe("T17: bcVersion is required and must equal the package folder's System 
   });
 });
 
-describe("M9: every platform but Linux is refused by name (only Linux was measured)", () => {
-  test("darwin, win32 and freebsd are refused; linux is not", () => {
+describe("M9: every platform but Linux and Windows is refused by name", () => {
+  test("darwin and freebsd are refused; linux and win32 are not", () => {
     expect(() => refuseV3Platform("darwin")).toThrow(/al-runner-v3-platform-unsupported: darwin/);
-    expect(() => refuseV3Platform("win32")).toThrow(/al-runner-v3-windows-unsupported/);
+    expect(() => refuseV3Platform("win32")).not.toThrow();
     expect(() => refuseV3Platform("freebsd")).toThrow(/al-runner-v3-platform-unsupported/);
     expect(() => refuseV3Platform("linux")).not.toThrow();
   });

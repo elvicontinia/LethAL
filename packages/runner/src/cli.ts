@@ -2449,7 +2449,7 @@ export function parseCliConfig(argv: readonly string[]): CliConfig {
       "--fail-on-survivors needs --lines or --changed-since: it fails on survivors on the changed lines, and a whole-app survivor count is a different quantity",
     );
   }
-  // R586 (T16): v3 is not measured on Windows.
+  // R586 (T16): v3 runs on Linux and (fork) Windows only.
   if (backendArg === "al-runner-v3") {
     refuseV3Platform();
     // R766 (b): N serve lanes in one backend. The run refuses by name, after the transport is
@@ -3420,7 +3420,8 @@ async function buildAlRunnerV3Backend(
       coverage,
       ...(coverageOffFiles.length > 0 ? { coverageOffFiles } : {}),
       sourceProjectDir: parsed.projectDir,
-      ...(deps.candidate === true ? { candidate: true } : {}),
+      ...(deps.candidate === true || c.allowUngated ? { candidate: true } : {}),
+      ...(c.extraArgs.length > 0 ? { extraArgs: c.extraArgs } : {}),
       ...(deps.serveFallbackWarmup !== undefined
         ? { serveFallbackWarmup: deps.serveFallbackWarmup }
         : {}),
