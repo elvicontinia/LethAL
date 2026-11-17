@@ -31,6 +31,7 @@ import {
   type V3Row,
   V3_REFUSAL_PREFIX,
   decodeV3Rows,
+  firstLine,
   v3DependencySkipLines,
   v3MissingDependencyStop,
 } from "./al-runner-v3-backend";
@@ -1562,7 +1563,7 @@ export async function runV3ContractProbe(env: V3ProbeEnv): Promise<V3ContractRes
       stdout: "",
       stderr: "",
     }));
-    const version = v.stdout.trim();
+    const version = firstLine(v.stdout);
     facts.push(
       fact(
         "version",
