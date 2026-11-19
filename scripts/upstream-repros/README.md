@@ -95,6 +95,25 @@ Counted on existing issues, no new entry (each is a known refusal awaiting a pro
 #7854 (System.ExportEncryptionKey, 2), #8011 (AutoFormatType 1 under Amount Auto Format, 2), #8002 (number sequence under
 TestIsolation = Function, 1). All are refusals (not run), none a wrong answer; BC's results are inferred, not measured on a server.
 
+## Coverage (PR-175)
+
+Two wrong answers (not refusals), so the daily update flags their fixes; 240 tests in all.
+- **`u8267-bare-insert-duplicate`** (#8267, [R1116]): a bare `Insert()` of an existing key raises nothing on al-runner.
+  - BC raises "already exists" (documented; inferred, not measured).
+  - When it flips, R1116's candidates are re-scored.
+- **`u8333-session-app-areas`** (#8333, [R1126]): the test session starts with no application areas, so a TestPage finds a
+  Premium-only control in an Essential company. BC reports it as not found (measured, from the issue body).
+  - Two apps, `A` then `T`.
+  - The issue's `Measure` test is left out: it fails on purpose on both sides, so it can never flip.
+
+## Coverage (PR-213)
+
+`u7995-null-value-type` (#7995, as #8268 reduced its Regex case; 244 tests in all): a never-assigned DotNet value passed where a
+.NET parameter is a value type is refused. BC's answers are measured (bc3, PR-213): `new DateTimeOffset(DateTime, null)` and
+`new Regex(String, RegexOptions, null)` fail with code `DotNetCreate:NullReference`, and `Convert.ToString(null Byte, 2)` returns
+`0`. Three tests differ on current; the control matches. The daily scan's "#7995: no regression entry" becomes "entry still
+differs from BC in 3 test(s)".
+
 ## Coverage (R-997)
 
 In the set (13 repros, 44 tests, about 50 s for both builds): #7811, #7812, #7818, #7819, #7853, #7854, #7922, #8006, #8027,

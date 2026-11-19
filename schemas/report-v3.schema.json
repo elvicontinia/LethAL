@@ -90,7 +90,10 @@
               "al-runner-v3-serve-default-fallback-warmup",
               "al-runner-v3-coverage-off",
               "time-budget-reached",
-              "nondebuggable-no-coverage"
+              "nondebuggable-no-coverage",
+              "withheld-kills",
+              "isolated-recheck-kills",
+              "workdate-changed"
             ]
           }
         },
@@ -482,8 +485,44 @@
               "runner-refused",
               "kill-not-reproduced",
               "confirm-stopped",
-              "test-discovery-failed"
+              "test-discovery-failed",
+              "workdate-changed",
+              "left-out-test-reach"
             ]
+          },
+          "withheldKill": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "failure"
+            ],
+            "properties": {
+              "failure": {
+                "type": "string"
+              },
+              "afterTest": {
+                "type": "string"
+              }
+            }
+          },
+          "isolatedRecheck": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "withheldFailure",
+              "killerGreenInMainBaseline"
+            ],
+            "properties": {
+              "withheldFailure": {
+                "type": "string"
+              },
+              "afterTest": {
+                "type": "string"
+              },
+              "killerGreenInMainBaseline": {
+                "type": "boolean"
+              }
+            }
           },
           "platformKillMechanism": {
             "type": "string"
@@ -874,6 +913,59 @@
               }
             }
           }
+        }
+      }
+    },
+    "confirm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputPath",
+        "inputSha256",
+        "sample",
+        "seed",
+        "selected",
+        "excludedSiteCount"
+      ],
+      "properties": {
+        "inputPath": {
+          "type": "string"
+        },
+        "inputSha256": {
+          "type": "string"
+        },
+        "sample": {
+          "type": "number"
+        },
+        "seed": {
+          "type": "string"
+        },
+        "selected": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "key",
+              "group"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "group": {
+                "type": "string",
+                "enum": [
+                  "noted",
+                  "nocov-noted",
+                  "sample"
+                ]
+              }
+            }
+          }
+        },
+        "excludedSiteCount": {
+          "type": "number"
         }
       }
     },
@@ -1316,6 +1408,9 @@
     "dependencySourceSha256": {
       "type": "string"
     },
+    "baselineWorkDate": {
+      "type": "string"
+    },
     "numberingDigest": {
       "type": "string"
     },
@@ -1375,7 +1470,8 @@
             "enum": [
               "compiled-out",
               "preproc-undecided-kept",
-              "exclude-test"
+              "exclude-test",
+              "company-write"
             ]
           }
         }

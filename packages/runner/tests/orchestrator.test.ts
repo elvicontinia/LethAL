@@ -4546,6 +4546,34 @@ describe("R-236c: a test with a reachable call that may open a TestPage is refus
     expect(got[0]).toMatchObject(sized);
     expect(backend.sink).toBeUndefined();
   });
+  // PR-113: the same for the baseline one-shot sink.
+  test("PR-113: a backend's baseline one-shot timing becomes one baseline-one-shot-timed event; the sink is removed at the end", async () => {
+    const shot = { codeunit: 79100, wallMs: 1234, reason: "cross-check" } as const;
+    class ShotBackend extends RecordingBackend {
+      sink: ((s: typeof shot) => void) | undefined;
+      setBaselineOneShotSink(sink?: (s: typeof shot) => void) {
+        this.sink = sink;
+      }
+      override async run(ref: TestMethodRef, opts: RunOpts): Promise<TestVerdict> {
+        if (ref.method === "UnsupportedTest") this.sink?.(shot);
+        return super.run(ref, opts);
+      }
+    }
+    const dirs = await project();
+    const backend = new ShotBackend({ ...FENCED, kind: "al-runner-v3", authoritative: false });
+    const events: RunEvent[] = [];
+    await runSession({
+      backend,
+      store: new ResultsStore(":memory:"),
+      ...dirs,
+      selectorIds,
+      emit: [createEmitter([(e) => events.push(e)])],
+    });
+    const got = events.filter((e) => e.type === "baseline-one-shot-timed");
+    expect(got.length).toBe(1);
+    expect(got[0]).toMatchObject(shot);
+    expect(backend.sink).toBeUndefined();
+  });
   // R909: Linux BC's page-open failure is a bare CLR exception with an AL top frame. It is named
   // only when that frame is a page call in the test app's source; the same text at any other
   // statement is an ordinary failure.
@@ -16531,6 +16559,78 @@ describe("runSession — Layer 5C-B2: a proven-complete lost ack earns one fresh
     expect(report.mutants.find((m) => m.mutantCode === "M0003")).toBeDefined();
   });
 
+  // ——— R1131 (PR-196): a start-WorkDate refusal is a step cause, never a plain transport error ———
+  test("R1131 a covering answer on a moved WorkDate is error / workdate-changed, and the session runs on", async () => {
+    const dir = freshTmpDir();
+    const client = new FakeLeaseClient();
+    client.reconcileStatus = tombstoned;
+    const { lease } = leaseCfg(client);
+    const dispatches = { count: 0 };
+    const report = await runSessionForTest(
+      m2Answers(
+        [
+          {
+            outcome: "error",
+            failureMessage: "workdate-changed: Alpha started on WorkDate 2026-11-20",
+            workDateRefusal: "workdate-changed",
+          },
+        ],
+        dispatches,
+      ),
+      { quarantineDir: dir, lease },
+    );
+    const m2 = report.mutants.find((m) => m.mutantCode === "M0002");
+    expect(m2?.verdict).toBe("error");
+    expect(m2?.cause).toBe("workdate-changed");
+    expect(m2?.failureNote).toContain("2026-11-20");
+    expect(dispatches.count).toBe(1);
+    expect(report.quarantined).toBeUndefined();
+    // Not a transport abort: the session scored the next mutant, and says so in the caveats.
+    expect(report.mutants.find((m) => m.mutantCode === "M0003")).toBeDefined();
+    expect(report.validity.caveats).toContain("workdate-changed");
+    // The banner counts them, beside the other named error causes.
+    expect(renderConsole(report)).toContain("workdate-changed 1");
+  });
+
+  test("R1131 a kill whose unmutated confirmation starts on a moved WorkDate is error / workdate-changed, not unstable", async () => {
+    const dir = freshTmpDir();
+    const client = new FakeLeaseClient();
+    client.reconcileStatus = tombstoned;
+    const { lease } = leaseCfg(client);
+    let activeMutant: string | null = null;
+    let m2Ran = false;
+    const backend = leaseBackend({
+      activate: async (id) => {
+        activeMutant = id;
+      },
+      run: async (ref) => {
+        if (activeMutant === "M0002") {
+          m2Ran = true;
+          return { ref, outcome: "fail" as const, durationMs: 1, failureMessage: "x", attestation: ATTESTED };
+        }
+        // The confirmation (no mutant, after M0002's kill) starts on another date.
+        if (m2Ran && activeMutant === null) {
+          m2Ran = false;
+          return {
+            ref,
+            outcome: "error" as const,
+            durationMs: 1,
+            failureMessage: "workdate-changed: Alpha started on WorkDate 2026-11-20",
+            workDateRefusal: "workdate-changed" as const,
+          };
+        }
+        return { ref, outcome: "pass" as const, durationMs: 1, attestation: ATTESTED };
+      },
+    });
+    const report = await runSessionForTest(backend, { quarantineDir: dir, lease });
+    const m2 = report.mutants.find((m) => m.mutantCode === "M0002");
+    expect(m2?.verdict).toBe("error");
+    expect(m2?.cause).toBe("workdate-changed");
+    expect(m2?.cause).not.toBe("unstable");
+    expect(report.counts.unstable).toBe(0);
+    expect(report.counts.killed).toBe(0);
+  });
+
   // ——— R-204b Part R: a lost answer after a stop that may have been accepted is never retried ———
   const lostAfter = (stopState?: StopState): Partial<TestVerdict> => ({
     ...LOST_ANSWER,
@@ -24385,6 +24485,9 @@ describe("R653: the orchestrator asks for the kill pair only before a cold fail 
       "activate null",
       `run null ${KILLER} fail`,
     ]);
+    // PR-81 (R1066): the unstable error is held and the mutant would be re-activated for the walk's next
+    // test. This covering set has none, so no test runs (one row) and, since the re-activation is sent
+    // only just before a test (L1), none is sent: one activation.
     expect(b.trace.filter((x) => x === "activate M0001")).toHaveLength(1);
     const rows = store.db
       .query("SELECT COUNT(*) AS n FROM test_results WHERE mutant_code = 'M0001'")
@@ -24768,14 +24871,16 @@ describe("R639: the covering loop and a refusal that follows a timeout", () => {
     }
   });
 
-  test("O3: a refused row WITHOUT the flag still ends the mutant; the next test never runs under it", async () => {
+  // PR-81 (R1066, owner ruling q-20261117T160215-3631a110): R639's stop at a refused row is reversed. A refused
+  // row without the flag is HELD and the walk goes on, so T2's hang is met and scored.
+  test("O3: a refused row WITHOUT the flag is held (PR-81); the walk goes on and the next test's hang is scored", async () => {
     const { backend, report } = await session(
       (mutant, ref) => (mutant !== null && ref.method === "T2" ? "timeout" : "pass"),
       t1Refused(false),
     );
-    expect(m1(report)?.verdict).toBe("error");
-    expect(m1(report)?.cause).toBe("runner-refused");
-    expect(ranUnder(backend, "M0001", "T2")).toBe(0);
+    expect(m1(report)?.verdict).toBe("timeout-killed");
+    // Once in the walk, once as PR-51's replay of the held timeout.
+    expect(ranUnder(backend, "M0001", "T2")).toBe(2);
   });
 
   test("O4: a pending kill-not-reproduced wins over the pending refusal; a reproduced kill wins over both", async () => {

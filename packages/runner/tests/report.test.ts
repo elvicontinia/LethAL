@@ -243,8 +243,11 @@ describe("Caveat union", () => {
       "al-runner-v3-coverage-off": true,
       "time-budget-reached": true,
       "nondebuggable-no-coverage": true,
+      "withheld-kills": true,
+      "isolated-recheck-kills": true,
+      "workdate-changed": true,
     };
-    expect(Object.keys(all).length).toBe(34);
+    expect(Object.keys(all).length).toBe(37);
   });
 });
 

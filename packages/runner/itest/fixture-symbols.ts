@@ -20,20 +20,33 @@
  * with `tar --format=ustar`.
  */
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
-import { type FileHandle, mkdir, open, readFile, readdir, writeFile } from "node:fs/promises";
+import {
+  cpSync,
+  createReadStream,
+  existsSync,
+  lstatSync,
+  readdirSync,
+  realpathSync,
+} from "node:fs";
+import { type FileHandle, cp, mkdir, open, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 /**
  * Where the symbol tar lives (gitignored, never committed). R670: named by its sha256's first 12
  * hex digits, so a rebuilt tar sits beside the one older worktrees still pin and never replaces it.
  */
-export const FIXTURE_SYMBOLS_TAR = "/work/lethal/.kraken-local/fixture-symbols-2279aee3857b.tar";
+export const FIXTURE_SYMBOLS_TAR = "/work/lethal/.kraken-local/fixture-symbols-165b17dd3aae.tar";
 
 /**
- * F5: the tar, pinned by sha256 (R673 rebuild, 2026-10-24, 2,103,091,200 bytes: the R670 tar,
- * `26f680ae…`, plus `.alpackages` for sandbox-names, -names-tests, -wrapped, -wrapped-tests,
- * -codefree and -codefree-tests; that replaced `fixture-symbols.tar`, `bdf460e2…`). A different tar is refused by name; changing it is a
+ * F5: the tar, pinned by sha256 (PR-162, 2026-11-18, 2,137,016,320 bytes: the R673 tar, `2279aee3…`,
+ * every member byte for byte, plus `.alpackages` for sandbox-recheck and -recheck-tests (leg RC's
+ * fixture) and for sandbox-dates, -optin and -order with their tests (R1128: in no tar before, so
+ * compile:fixtures skipped them); each new project holds Microsoft_System and, for a tests project,
+ * an alc build of its target. Not rebuilt by build-fixture-symbols-tar.sh, which drops
+ * sandbox-wrapped's WRAPDEF objects from its LethAL app copy (R1128);
+ * R673's was 2,103,091,200 bytes: the R670 tar, `26f680ae…`, plus `.alpackages` for sandbox-names,
+ * -names-tests, -wrapped, -wrapped-tests, -codefree and -codefree-tests; that replaced
+ * `fixture-symbols.tar`, `bdf460e2…`). A different tar is refused by name; changing it is a
  * deliberate edit here and in `FIXTURE_SYMBOLS_MANIFEST`, then a `--regate`. A re-pin refuses
  * EVERY worktree whose two folders came from the old tar, the gate worktree included (its marker
  * names the old pin, `al-runner-v3-gate-symbols-unverified`), and a FRESH worktree on any machine
@@ -42,7 +55,7 @@ export const FIXTURE_SYMBOLS_TAR = "/work/lethal/.kraken-local/fixture-symbols-2
  * its `SYMBOLS_MARKER`, and the next run extracts them from the new tar.
  */
 export const FIXTURE_SYMBOLS_TAR_SHA256 =
-  "2279aee3857bc2f123f602bb9dc265b1be783a782486d9982ddd37fd50d46359";
+  "165b17dd3aae07fbe02f1e918e5d6d3bba97d5fa5e5e295b94772f33de65b662";
 
 /**
  * R670: the pinned tar's files in archive order (`tar -tf`, directories left out), committed, with
@@ -114,6 +127,44 @@ export const GATE_ALPACKAGES = [
   "fixtures/sandbox-tests/.alpackages",
   "fixtures/sandbox-data-tests/.alpackages",
 ] as const;
+
+/**
+ * PR-165: the test dir the v3 itest hands al-runner. v3 also reads a test project's OWN `.alpackages`,
+ * beside `packagesDir`. A full symbol-tar extraction (compile:fixtures, kraken's lane setup) leaves one in
+ * test projects such as `sandbox-names-tests`. Measured: its Base Application 28.0 made v3 turn test data
+ * off for N1, N1E, N1S, WR and WRE, while a fresh worktree passed. So a test dir under `<repo>/fixtures`
+ * that has its own `.alpackages` is copied to `to` without it, and the legs read what a fresh worktree reads.
+ * Returned as is: a dir whose `.alpackages` is one of `gate` (the folders the itest prepares and means to
+ * use), a dir without one, and any dir outside `fixtures/` (a leg's scratch copy, which the leg may edit
+ * after building its backend, as leg X (c2) does; such copies are made without stray `.alpackages`).
+ */
+export function v3GateTestDir(
+  repo: string,
+  testDir: string,
+  to: () => string,
+  gate: readonly string[] = GATE_ALPACKAGES,
+): string {
+  const own = join(testDir, ".alpackages");
+  if (!existsSync(own)) return testDir;
+  if (gate.some((g) => join(repo, g) === own)) return testDir;
+  const rel = relative(join(repo, "fixtures"), testDir);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return testDir;
+  const dest = to();
+  cpSync(testDir, dest, {
+    recursive: true,
+    filter: (p) => relative(testDir, p) !== ".alpackages",
+  });
+  return dest;
+}
+
+/** PR-165: a leg's scratch copy of a fixture test dir, without a stray `.alpackages` (see `v3GateTestDir`). */
+export function copyTestDirForV3(repo: string, from: string, to: string): Promise<void> {
+  const keep = GATE_ALPACKAGES.some((g) => join(repo, g) === join(from, ".alpackages"));
+  return cp(from, to, {
+    recursive: true,
+    ...(keep ? {} : { filter: (p: string) => relative(from, p) !== ".alpackages" }),
+  });
+}
 
 /** At the worktree root: the sha256 of the tar the folders came from (or were verified against). */
 export const SYMBOLS_MARKER = ".fixture-symbols.sha256";

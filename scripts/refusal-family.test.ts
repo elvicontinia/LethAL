@@ -24,6 +24,11 @@ import {
   T12_REFUSALS,
   TABLE_CONNECTION,
   UNTOUCHED_HANDLE,
+  X2_REFUSALS,
+  X3_REFUSALS,
+  Y1_REFUSALS,
+  Y2_COLLATION,
+  Y2_XML,
   bcCheckApp,
   bcCheckFamily,
   cellName,
@@ -1143,10 +1148,302 @@ describe("PR-105: the t12-refusals family", () => {
     expect(classes.filter((c) => c.text.startsWith("Evaluate of"))).toHaveLength(3);
   });
 
-  test("last of FAMILIES (place 17, BC-check number 18, as 7 is skipped): its BC-check id", () => {
-    expect(Object.keys(FAMILIES).at(-1)).toBe("t12-refusals");
+  test("place 17 of FAMILIES, BC-check number 18, as 7 is skipped: its BC-check id", () => {
     expect(Object.keys(FAMILIES).indexOf(f.name)).toBe(16);
     expect(bcCheckApp(f).id).toBe("51000000-0000-4000-8000-000000051018");
+  });
+});
+
+describe("PR-133: the x2-refusals family", () => {
+  const f = X2_REFUSALS;
+  // the third cell reaches the C* text through a card TestPage, a modal handler, a TryFunction and an OnValidate
+  const TEXTS = [
+    "SetFilter: `C*` is not a BigInteger",
+    "RecordRef.GetTable of Integer 123",
+    "SetFilter: `C*` is not a BigInteger",
+  ];
+
+  test("three cells, an OnPrem app, distinct cell names, the nested cell binds a modal handler", () => {
+    expect(f.cells).toHaveLength(TEXTS.length);
+    expect(f.target).toBe("OnPrem");
+    const names = f.cells.map((c, i) => cellName(c, i));
+    expect(new Set(names).size).toBe(names.length);
+    expect(f.cells.at(-1)?.handlers).toHaveLength(1);
+  });
+
+  test("a run that gives the measured texts makes 2 refusal classes (the nested cell shares the C* text), none of them known", () => {
+    const rows = f.cells.map((_, i) => ({
+      name: `Codeunit${BASE_ID + 1 + i}.Cell`,
+      status: "error",
+      notRun: true,
+      message: `NotRun: out-of-scope: ${TEXTS[i]}`,
+    }));
+    const results = classify(f, rows);
+    expect(results.filter((r) => r.outcome === "refused")).toHaveLength(TEXTS.length);
+    const classes = refusalClasses(f, results);
+    expect(classes.every((c) => !c.known)).toBe(true);
+    expect(classes).toHaveLength(2);
+  });
+
+  test("place 18 of FAMILIES (BC-check number 19, as 7 is skipped): its BC-check id", () => {
+    expect(Object.keys(FAMILIES).indexOf(f.name)).toBe(17);
+    expect(bcCheckApp(f).id).toBe("51000000-0000-4000-8000-000000051019");
+  });
+});
+
+describe("PR-139: the x3-refusals family", () => {
+  const f = X3_REFUSALS;
+  const nul = (n: number) => "\u0000".repeat(n);
+  const WIDTHS = [3, 10, 12, 14, 30, 37, 40];
+  // amendment 1: the other NUL widths M28736's DO requests hold, appended after the state cells
+  const WIDTHS_A1 = [7, 9, 11, 13, 16, 21, 25, 27];
+  // 7 widths, then the width-10 array, TryFunction, nested-state and OnInsert cells, then amendment 1's 8 widths
+  const WIDTH_OF = [...WIDTHS, 10, 10, 10, 10, ...WIDTHS_A1];
+  const text = (n: number) =>
+    `Evaluate of \`${nul(n)}\` into Decimal (form not pinned by the corpus)`;
+
+  test("19 cells, an OnPrem app, distinct names, the NULs built in AL, the nested cell binds a handler", () => {
+    expect(f.cells).toHaveLength(19);
+    expect(f.cells).toHaveLength(WIDTH_OF.length);
+    expect(f.target).toBe("OnPrem");
+    const names = f.cells.map((c, i) => cellName(c, i));
+    expect(new Set(names).size).toBe(names.length);
+    expect(f.cells.slice(0, 7).map((c) => c.setup?.at(-1))).toEqual(
+      WIDTHS.map((n) => `for I := 1 to ${n} do T += Format(Ch);`),
+    );
+    expect(f.cells.slice(11).map((c) => c.setup?.at(-1))).toEqual(
+      WIDTHS_A1.map((n) => `for I := 1 to ${n} do T += Format(Ch);`),
+    );
+    expect(f.cells[9]?.handlers).toHaveLength(1);
+    expect(f.cells[8]?.call).toContain("Helper.EvalBare()");
+    // the support codeunit sits after the last cell's codeunit, inside the family's id range
+    expect(f.support).toContain(`codeunit ${BASE_ID + 1 + f.cells.length} "X3 Cache"`);
+    expect(f.support).toContain("trigger OnInsert()");
+    expect(f.support).toContain("SingleInstance = true;");
+  });
+
+  test("a run that gives the exact texts makes 15 refusal classes, the width-10 class with 5 cells, none known", () => {
+    const rows = f.cells.map((_, i) => ({
+      name: `Codeunit${BASE_ID + 1 + i}.Cell`,
+      status: "error",
+      notRun: true,
+      message: `NotRun: out-of-scope: ${text(WIDTH_OF[i] ?? 0)}`,
+    }));
+    const results = classify(f, rows);
+    expect(results.filter((r) => r.outcome === "refused")).toHaveLength(WIDTH_OF.length);
+    const classes = refusalClasses(f, results);
+    expect(classes.every((c) => !c.known)).toBe(true);
+    expect(classes).toHaveLength(15);
+    expect(classes.find((c) => c.text === text(10))?.cells).toHaveLength(5);
+  });
+
+  test("place 19 of FAMILIES (BC-check number 20, as 7 is skipped): its BC-check id", () => {
+    expect(Object.keys(FAMILIES).indexOf(f.name)).toBe(18);
+    expect(bcCheckApp(f).id).toBe("51000000-0000-4000-8000-000000051020");
+  });
+});
+
+describe("PR-159: the y1-refusals family", () => {
+  const f = Y1_REFUSALS;
+  const JSON_TEXT_Y1 =
+    "DotNet Newtonsoft.Json.JsonTextWriter.WriteStartObject raised the .NET exception Newtonsoft.Json.JsonWriterException: Token StartObject in state Object would result in an invalid JSON object. Path 'message.body.toRecipients[0].emailAddress'.; the text AL would see is not pinned (ADR-014 section 7)";
+  const TEXTS = [
+    "RecordRef.GetTable of Integer 12345",
+    "RecordRef.GetTable of Integer 12345",
+    JSON_TEXT_Y1,
+  ];
+
+  test("three cells, an OnPrem app, distinct names, the guard checks IsRecord before GetTable, the path is toRecipients[0]", () => {
+    expect(f.cells).toHaveLength(3);
+    expect(f.target).toBe("OnPrem");
+    const names = f.cells.map((c, i) => cellName(c, i));
+    expect(new Set(names).size).toBe(names.length);
+    expect(f.cells[1]?.call).toBe("Helper.GetLog(V);");
+    expect(f.support).toContain("if VariantRecord.IsRecord then\n            exit;");
+    expect(f.cells[2]?.setup).toContain("JW.WritePropertyName('toRecipients');");
+    expect(f.cells[2]?.setup).not.toContain("JW.WritePropertyName('ccRecipients');");
+  });
+
+  test("a run that gives the measured texts makes 2 refusal classes (the 12345 class has 2 cells), none known", () => {
+    const rows = f.cells.map((_, i) => ({
+      name: `Codeunit${BASE_ID + 1 + i}.Cell`,
+      status: "error",
+      notRun: true,
+      message: `NotRun: out-of-scope: ${TEXTS[i]}`,
+    }));
+    const results = classify(f, rows);
+    expect(results.filter((r) => r.outcome === "refused")).toHaveLength(TEXTS.length);
+    const classes = refusalClasses(f, results);
+    expect(classes.every((c) => !c.known)).toBe(true);
+    expect(classes).toHaveLength(2);
+    expect(classes.find((c) => c.text === TEXTS[0])?.cells).toHaveLength(2);
+  });
+
+  test("place 20 of FAMILIES (BC-check number 21, as 7 is skipped): its BC-check id", () => {
+    expect(Object.keys(FAMILIES).indexOf(f.name)).toBe(19);
+    expect(bcCheckApp(f).id).toBe("51000000-0000-4000-8000-000000051021");
+  });
+});
+
+describe("PR-191: the y2-xml family", () => {
+  const f = Y2_XML;
+
+  test("21 cells (18 refusers, 3 passing controls), distinct names, support ids clear of every cell id, app.json range covers them", () => {
+    expect(f.cells).toHaveLength(21);
+    expect(f.cells.filter((c) => c.method.startsWith("Ctl")).map((c) => c.method)).toEqual([
+      "CtlByVarSetterOnly",
+      "CtlByValueSetOnly",
+      "CtlDeepSetupOnly",
+    ]);
+    const names = f.cells.map((c, i) => cellName(c, i));
+    expect(new Set(names).size).toBe(names.length);
+    const ids = [...f.support.matchAll(/^codeunit (\d+) /gm)].map((m) => Number(m[1]));
+    expect(ids).toEqual([51000, 51022, 51023, 51024, 51025]);
+    const range = JSON.parse(emitApp(f)["app.json"] ?? "{}").idRanges[0];
+    expect(range).toEqual({ from: 51000, to: 51000 + 1 + 21 + 4 });
+    expect(Math.min(...ids.slice(1))).toBeGreaterThan(51000 + f.cells.length);
+  });
+
+  test("extraIds moves the idRanges end by exactly that much; a family without it is unchanged", () => {
+    const end = (x: Family) => JSON.parse(emitApp(x)["app.json"] ?? "{}").idRanges[0].to;
+    const n = f.cells.length;
+    expect(end({ ...f, extraIds: 0 })).toBe(51000 + 1 + n);
+    expect(end({ ...f, extraIds: 7 })).toBe(51000 + 1 + n + 7);
+    const { extraIds: _drop, ...none } = f;
+    expect(end(none)).toBe(51000 + 1 + n);
+    const y1 = Y1_REFUSALS;
+    expect(end(y1)).toBe(51000 + 1 + y1.cells.length);
+  });
+
+  test("the wrapper is not SingleInstance; the deep cells set the SingleInstance codeunit, bind, write a blob, then Commit", () => {
+    expect(f.support.split('codeunit 51022 "Y2 Chain"')[0]).not.toContain("SingleInstance");
+    const deep = f.cells.filter((c) => c.method.startsWith("Deep"));
+    expect(deep).toHaveLength(2);
+    for (const c of deep) {
+      expect(c.setup).toEqual([
+        "Single.SetValue('x');",
+        "BindSubscription(Sub);",
+        "W.WriteBlob();",
+        "Commit();",
+      ]);
+    }
+  });
+
+  test("the by-var cell passes the target to a procedure that never sets it, then uses the target", () => {
+    const c = f.cells.find((x) => x.method === "UnassignedNodeByVar");
+    expect(c?.setup).toContain("W.SkipSetter(W2);");
+    expect(c?.call).toBe("W2.UseNode();");
+    expect(f.support).toContain('procedure SkipSetter(var Target: Codeunit "Y2 Xml Node")');
+    // SkipSetter touches no XML value, so the first refusing statement is the caller's UseNode
+    const body = /procedure SkipSetter[\s\S]*?\n {4}end;/.exec(f.support)?.[0] ?? "";
+    expect(body).not.toMatch(/XmlNode|Unset|Is Xml|IsXml/);
+  });
+
+  test("the deep control sets up exactly as the deep refusers, runs the chain, and asserts the state", () => {
+    const deep = f.cells.find((c) => c.method === "DeepNodeAsContent");
+    const ctl = f.cells.find((c) => c.method === "CtlDeepSetupOnly");
+    expect(ctl?.setup?.slice(0, 4)).toEqual([...(deep?.setup ?? [])]);
+    expect(ctl?.setup).toContain("Chain.NoopDeep(W);");
+    expect(ctl?.call).toBe("W.AssertDeepState(Single);");
+  });
+
+  test("place 21 of FAMILIES (BC-check number 22, as 7 is skipped): its BC-check id", () => {
+    expect(Object.keys(FAMILIES).indexOf(f.name)).toBe(20);
+    expect(bcCheckApp(f).id).toBe("51000000-0000-4000-8000-000000051022");
+  });
+});
+
+describe("PR-195: the y2-collation family", () => {
+  const f = Y2_COLLATION;
+
+  test("7 cells (6 refusers, 1 passing control), distinct names, support ids clear of every cell id, app.json range covers them", () => {
+    expect(f.cells).toHaveLength(7);
+    expect(f.cells.filter((c) => c.method.startsWith("Ctl")).map((c) => c.method)).toEqual([
+      "CtlAscii",
+    ]);
+    const names = f.cells.map((c, i) => cellName(c, i));
+    expect(new Set(names).size).toBe(names.length);
+    const ids = [...f.support.matchAll(/^codeunit (\d+) /gm)].map((m) => Number(m[1]));
+    expect(ids).toEqual([51000, 51008, 51009]);
+    const range = JSON.parse(emitApp(f)["app.json"] ?? "{}").idRanges[0];
+    expect(range).toEqual({ from: 51000, to: 51000 + 1 + 7 + 2 });
+    expect(Math.min(...ids.slice(1))).toBeGreaterThan(51000 + f.cells.length);
+    expect(f.support).toMatch(/^table 51000 /m);
+  });
+
+  test("the refusing codeunit 51000 is SingleInstance with a global Override; so is the second support codeunit", () => {
+    const first = f.support.split('codeunit 51008 "Y2C Single"')[0] ?? "";
+    expect(first).toContain("SingleInstance = true;");
+    expect(first).toContain("Override: Integer;");
+    expect(first).toContain("procedure SetOverride(N: Integer)");
+    expect(f.support.split("SingleInstance = true;")).toHaveLength(3);
+  });
+
+  test("every refuser calls SetOverride before Derive; the control does not", () => {
+    for (const c of f.cells.slice(0, 6)) {
+      expect(c.call.indexOf("W.SetOverride(")).toBeGreaterThanOrEqual(0);
+      expect(c.call.indexOf("W.SetOverride(")).toBeLessThan(c.call.indexOf("W.Derive("));
+    }
+    expect(f.cells[6]?.call).not.toContain("SetOverride");
+  });
+
+  test("readers: y2single, y2cover (the Override global), y2order (text order and key order) and y2rows (the insert cells' table)", () => {
+    expect((f.readers ?? []).map((r) => r.name)).toEqual([
+      "y2single",
+      "y2cover",
+      "y2order",
+      "y2rows",
+    ]);
+    expect(f.support).toMatch(
+      /procedure RowCount\(\): Text[\s\S]*?Row: Record "Y2C Row";[\s\S]*?Row\.Count\(\)/,
+    );
+    expect(f.support).toContain("exit(Format(D.GetOverride()));");
+    const order = /procedure OrderText[\s\S]*?\n {4}end;/.exec(f.support)?.[0] ?? "";
+    for (const s of [
+      "Acute > 'Z'",
+      "Acute < 'a'",
+      "Acute > 'z'",
+      "Tilde > 'a'",
+      "Tilde < 'Z'",
+      "FindSet()",
+    ])
+      expect(order).toContain(s);
+    expect(f.support).toMatch(/^table 51001 "Y2C Order Row"/m);
+  });
+
+  test("InRange has the mutated shape, three calls deep: Derive -> Clean -> InRange", () => {
+    expect(f.support).toContain(
+      "exit(((Ch >= '') and (Ch <= 'Z')) or ((Ch >= '0') and (Ch <= '9')));",
+    );
+    expect(f.support).toContain("exit(Clean(Name));");
+    expect(f.support).toContain("if InRange(Ch) then");
+    expect(f.cells.every((c) => c.call.includes("W.Derive("))).toBe(true);
+  });
+
+  test("the refusers use U+516C (20844) and U+041A (1050), each plain, after an insert, after a SingleInstance set", () => {
+    const codes = f.cells.slice(0, 6).map((c) => c.setup?.[0]);
+    expect(codes).toEqual([
+      "Ch := 20844;",
+      "Ch := 1050;",
+      "Ch := 20844;",
+      "Ch := 1050;",
+      "Ch := 20844;",
+      "Ch := 1050;",
+    ]);
+    expect(f.cells[2]?.setup).toContain("Row.Insert();");
+    expect(f.cells[4]?.setup).toContain("Single.SetValue('x');");
+  });
+
+  test("the control errors only on a mismatch and expects the cleaned text", () => {
+    const ctl = f.cells[6];
+    expect(ctl?.call).toContain("Derive('ABC 12')");
+    expect(ctl?.call).toContain("if Result <> 'ABC 12' then Error(");
+  });
+
+  test("last of FAMILIES (place 22, BC-check number 23, as 7 is skipped): its BC-check id", () => {
+    expect(Object.keys(FAMILIES).at(-1)).toBe("y2-collation");
+    expect(Object.keys(FAMILIES).indexOf(f.name)).toBe(21);
+    expect(bcCheckApp(f).id).toBe("51000000-0000-4000-8000-000000051023");
   });
 });
 

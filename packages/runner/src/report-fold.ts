@@ -1,5 +1,6 @@
 import { compareCodeUnits } from "@lethal/schemata";
 import type { BackendCapabilities, TestMethodRef } from "./backend";
+import type { ConfirmGiven, ConfirmRecord } from "./confirm";
 import type { DependencyReportSourceRecord } from "./dependency-report-source";
 import type { EquivalenceMark } from "./equivalence-marks";
 import type { RunEvent } from "./events";
@@ -20,8 +21,10 @@ import {
   type SessionOutcome,
   type TestMethodRecord,
   mutantRef,
+  withheldKillOf,
 } from "./report";
 import type { BatchArtifact, CarryHidden } from "./store";
+import { describeRequestPageRefusal, describeTestPageUnsupported } from "./testpage-unsupported";
 
 /** R443: this run's numbering facts, from `mutation-set-generated`. All three or none. */
 export interface FoldedNumbering {
@@ -91,6 +94,9 @@ export interface FoldStatics {
     /** GH-25: present exactly when `--changed-since` was given. */
     readonly changedSince?: ChangedSinceSource;
   };
+  /** PR-171: the `--confirm-from` narrowing this run was GIVEN, if any. Its excluded site count is
+   *  LEARNED from `mutation-set-generated.excludedByConfirm`. */
+  readonly confirm?: ConfirmGiven;
   /** R45: the `--tests-only` narrowing this run was GIVEN, if any. */
   readonly testsOnly?: readonly string[];
   /** R53: whether this run was allowed to end BC sessions to score a non-terminating mutant. */
@@ -173,10 +179,14 @@ export interface FoldedReport {
     readonly excludedSiteCount: number;
     readonly changedSince?: ChangedSinceSource;
   };
+  /** PR-171: the confirm narrowing, with the LEARNED site count reunited onto it. */
+  readonly confirm?: ConfirmRecord;
   readonly testsOnly?: readonly string[];
   readonly staleTestApp?: { readonly missingTests: readonly string[] };
   readonly permissionsRefusedTests?: readonly string[];
   readonly testPageUnsupportedTests?: readonly string[];
+  /** R1135: the subset of `testPageUnsupportedTests` whose baseline failure is the request-page refusal. */
+  readonly requestPageTests?: readonly string[];
   /** R-236c: baseline verdicts classified `tests-testpage-refused`, plus the session scan's
    *  `tests-testpage-refused` event; see `SessionReport.testPageRefused`. */
   readonly testPageRefusedTests?: readonly string[];
@@ -220,6 +230,8 @@ export interface FoldedReport {
   readonly dependencyReportSources?: readonly DependencyReportSourceRecord[];
   /** R565 — see `SessionReport.dependencySourceSha256`. Absent for an older stream. */
   readonly dependencySourceSha256?: string;
+  /** R1131 — see `SessionReport.baselineWorkDate`. The first batch's; absent for an older stream. */
+  readonly baselineWorkDate?: string;
   /** R206 — see `SessionReport.warmKills`. */
   readonly warmKills: number;
   /** R175 — see `SessionReport.unplaceableCount`. */
@@ -363,6 +375,7 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
   let excludedByExclude = 0;
   let excludedByOperator = 0;
   let excludedByLines = 0;
+  let excludedByConfirm = 0;
   let numbering: FoldedNumbering | undefined;
   let sourceSha256: string | undefined;
   let dependencyReportSources: readonly DependencyReportSourceRecord[] | undefined;
@@ -375,6 +388,7 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
   const staleTestApp = new Set<string>();
   const permissionsRefusedTests = new Set<string>();
   const testPageUnsupportedTests = new Set<string>();
+  const requestPageTests = new Set<string>();
   const testPageRefusedTests = new Set<string>();
   // PR-36: keyed by test, so an event seen twice (a resumed session) counts each test once
   const restrictiveDefaultTests = new Map<
@@ -383,6 +397,9 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
   >();
   const baselineStoppedTests = new Set<string>();
   let stoppedBudgetMs: number | undefined;
+  // R1131: the first batch's baseline start WorkDate (ponytail: a later batch on another date, after midnight,
+  // is not recorded here; its rows carry `workdate-changed` only if a batch's own answers moved).
+  let baselineWorkDate: string | undefined;
   const runnerDisagreementTests = new Set<string>();
   let testBuildSymbols: readonly string[] = [];
   let excludedTests: readonly ExcludedTestRecord[] = [];
@@ -485,6 +502,7 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
         excludedByExclude = e.excludedByExclude;
         excludedByOperator = e.excludedByOperator;
         excludedByLines = e.excludedByLines ?? 0;
+        excludedByConfirm = e.excludedByConfirm ?? 0;
         sourceSha256 = e.sourceSha256;
         // R565: written together by the producer, so a stream with only one is corrupt.
         if ((e.dependencyReportSources === undefined) !== (e.dependencySourceSha256 === undefined))
@@ -516,6 +534,7 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
       case "baseline-batch-finished":
         sawBaselineBatchFinished = true;
         if (e.stoppedBudgetMs !== undefined) stoppedBudgetMs = e.stoppedBudgetMs;
+        baselineWorkDate ??= e.workDate;
         // R106: a batch with at least one GREEN test is a batch that reaches the coverage filter.
         // A batch whose baseline is entirely red does not — `runSession` records every mutant
         // "no green baseline tests" and `continue`s BEFORE step 5 — so it owes no `coverage-split`
@@ -539,6 +558,13 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
           }
           if (v.classification.includes("tests-testpage-unsupported")) {
             testPageUnsupportedTests.add(v.name);
+            // The orchestrator's precedence (describeTestPageRefusal): the Windows TestPage text wins.
+            if (
+              describeTestPageUnsupported(v.failureMessage) === undefined &&
+              describeRequestPageRefusal(v.failureMessage) !== undefined
+            ) {
+              requestPageTests.add(v.name);
+            }
           }
           if (v.classification.includes("tests-testpage-refused")) {
             testPageRefusedTests.add(v.name);
@@ -733,6 +759,67 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
       case "batch-invalidated":
         invalidations.push({ batchIndex: e.batchIndex, reason: e.reason });
         break;
+      case "recheck-baseline-finished":
+        // PR-144: the recheck's own baseline. Deliberately read into NOTHING: the session's baseline
+        // figures (`baselineGreen`, unsupported tests, timings) are the main pass's alone.
+        break;
+      case "mutant-rechecked": {
+        // PR-144: the ONLY event that replaces an earlier row, by (batchIndex, mutantId). A row that is
+        // not there, or is not a withheld kill, is a caller-contract violation, never a plausible default.
+        const at = outcomes.findIndex(
+          (o) => o.batchIndex === e.batchIndex && o.mutant.mutantId === e.mutant.mutantId,
+        );
+        const prior = at < 0 ? undefined : outcomes[at];
+        if (
+          prior === undefined ||
+          withheldKillOf(prior.verdict, prior.cause, prior.failureNote) === undefined
+        ) {
+          throw new Error(
+            `foldEvents: mutant-rechecked for ${e.mutant.mutantId} (batch ${e.batchIndex}) names no withheld-kill row of this session; refusing to replace another row (PR-144).`,
+          );
+        }
+        if (e.recovery === undefined) {
+          if (e.keptNote === undefined) {
+            throw new Error(
+              `foldEvents: mutant-rechecked for ${e.mutant.mutantId} carries neither a recovery nor a keptNote (PR-144).`,
+            );
+          }
+          // After the whole old note, so it still ends with V3_NOT_RUN_SUFFIX where `withheldKillOf` looks.
+          outcomes[at] = {
+            ...prior,
+            failureNote: `${prior.failureNote ?? ""} ${e.keptNote}`,
+            durationMs: (prior.durationMs ?? 0) + e.durationMs,
+          };
+          break;
+        }
+        const r = e.recovery;
+        const {
+          cause: _cause,
+          failureNote: _failureNote,
+          killingTest: _killingTest,
+          killingTestFailure: _killingTestFailure,
+          killPosition: _killPosition,
+          reproducedFailure: _reproducedFailure,
+          stopEvidence: _stopEvidence,
+          killingTestRef: _killingTestRef,
+          ...rest
+        } = prior;
+        outcomes[at] = {
+          ...rest,
+          verdict: "killed",
+          durationMs: (prior.durationMs ?? 0) + e.durationMs,
+          coveringTests: r.coveringTests,
+          killingTest: r.killingTest,
+          killReproduced: true as const,
+          ...(r.killingTestFailure !== undefined
+            ? { killingTestFailure: r.killingTestFailure }
+            : {}),
+          ...(r.killPosition !== undefined ? { killPosition: r.killPosition } : {}),
+          ...(r.reproducedFailure !== undefined ? { reproducedFailure: r.reproducedFailure } : {}),
+          isolatedRecheck: r.isolatedRecheck,
+        };
+        break;
+      }
       default:
         break; // unknown event type — ignored, not fatal (forward compatibility, events.ts)
     }
@@ -866,6 +953,9 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
           },
         }
       : {}),
+    ...(statics.confirm !== undefined
+      ? { confirm: { ...statics.confirm, excludedSiteCount: excludedByConfirm } }
+      : {}),
     ...(statics.testsOnly !== undefined && statics.testsOnly.length > 0
       ? { testsOnly: statics.testsOnly }
       : {}),
@@ -876,6 +966,7 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
     ...(testPageUnsupportedTests.size > 0
       ? { testPageUnsupportedTests: [...testPageUnsupportedTests].sort() }
       : {}),
+    ...(requestPageTests.size > 0 ? { requestPageTests: [...requestPageTests].sort() } : {}),
     ...(testPageRefusedTests.size > 0
       ? { testPageRefusedTests: [...testPageRefusedTests].sort() }
       : {}),
@@ -946,6 +1037,7 @@ export function foldEvents(statics: FoldStatics, events: readonly RunEvent[]): F
     ...(sourceSha256 !== undefined ? { sourceSha256 } : {}),
     ...(dependencyReportSources !== undefined ? { dependencyReportSources } : {}),
     ...(dependencySourceSha256 !== undefined ? { dependencySourceSha256 } : {}),
+    ...(baselineWorkDate !== undefined ? { baselineWorkDate } : {}),
   };
 }
 

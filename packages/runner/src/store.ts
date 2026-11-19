@@ -16,6 +16,7 @@ import {
   twinSiteOf,
 } from "./selection";
 import { RETIRED_V2_BACKEND, v2RetiredRun } from "./v2-retired";
+import { commonWorkDate } from "./workdate-guard";
 
 /** R644: two faced lists name the same tests (order ignored); a `null` (no record) equals nothing. */
 /** PR-21: a stored JSON text, or `undefined` when it does not parse (the reader then has no value). */
@@ -361,6 +362,8 @@ export interface RunRow {
 export interface TestNarrowing {
   readonly testsOnly: readonly string[];
   readonly excludeTests: readonly string[];
+  /** PR-212: the `testKeyOf` of each test a BC run left out because it writes the Company table. Absent when none. */
+  readonly companyWrites?: readonly string[];
 }
 
 /** R896: the `runner_build` suffix of an `isolation: "auto"` run (always last). */
@@ -523,14 +526,16 @@ function parseTestNarrowing(value: string | null, runId: number): TestNarrowing 
     typeof parsed !== "object" ||
     parsed === null ||
     !strings((parsed as Record<string, unknown>).testsOnly) ||
-    !strings((parsed as Record<string, unknown>).excludeTests)
+    !strings((parsed as Record<string, unknown>).excludeTests) ||
+    ((parsed as Record<string, unknown>).companyWrites !== undefined &&
+      !strings((parsed as Record<string, unknown>).companyWrites))
   ) {
     throw new Error(
       `store.ts: run ${runId} has a corrupt "test_narrowing" column value ${JSON.stringify(value)}`,
     );
   }
-  const { testsOnly, excludeTests } = parsed as TestNarrowing;
-  return { testsOnly, excludeTests };
+  const { testsOnly, excludeTests, companyWrites } = parsed as TestNarrowing;
+  return { testsOnly, excludeTests, ...(companyWrites !== undefined ? { companyWrites } : {}) };
 }
 
 /** Verdicts `invalidateBatch` leaves as they are (and so does the R513 read-time rewrite). */
@@ -1044,6 +1049,10 @@ export class ResultsStore {
           : JSON.stringify({
               testsOnly: info.testNarrowing.testsOnly,
               excludeTests: [...new Set(info.testNarrowing.excludeTests)].sort(),
+              ...(info.testNarrowing.companyWrites !== undefined &&
+              info.testNarrowing.companyWrites.length > 0
+                ? { companyWrites: [...new Set(info.testNarrowing.companyWrites)].sort() }
+                : {}),
             }),
         info.resumeInputs === undefined ? null : JSON.stringify(info.resumeInputs),
       ) as {
@@ -2247,12 +2256,15 @@ export class ResultsStore {
         `store.ts: baseline_snapshots row for run ${row.run_id} batch ${row.batch_index} has a corrupt payload — expected a JSON array of observations`,
       );
     }
+    const workDate = commonWorkDate(baseline as BaselineObservation[]);
     return {
       runId: row.run_id,
       batchIndex: row.batch_index,
       batchHash: row.batch_hash,
       testAppHash: row.test_app_hash,
       baseline: baseline as BaselineObservation[],
+      // R1131: the date its baseline verdicts carry; absent on a snapshot from before it.
+      ...(workDate !== undefined ? { workDate } : {}),
       // PR-21: unparseable state is no state (the serve resume then re-runs its baseline, by name)
       ...(row.backend_state !== null
         ? { backendState: parseJsonOrUndefined(row.backend_state) }

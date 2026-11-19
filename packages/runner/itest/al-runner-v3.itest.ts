@@ -39,7 +39,7 @@
  * No leg needs a BC server.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync } from "node:fs";
 import { appendFile, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -62,7 +62,11 @@ import {
 } from "../src/al-runner-v3-backend";
 import { MEMORY_HEADROOM_GB_DEFAULT, baselineSampleIds } from "../src/al-runner-v3-baseline-check";
 import { AL_RUNNER_V3_NOT_AUTHORITATIVE } from "../src/al-runner-v3-config";
-import { runV3ContractProbe, v3DefectWarnings } from "../src/al-runner-v3-contract";
+import {
+  V3_CAPABILITY_FACTS,
+  runV3ContractProbe,
+  v3DefectWarnings,
+} from "../src/al-runner-v3-contract";
 import {
   AL_RUNNER_V3_DEFAULT_PATH,
   AlRunnerV3UngatedBuildError,
@@ -70,7 +74,15 @@ import {
   resolveV3Binary,
   sha256OfFile,
 } from "../src/al-runner-v3-pin";
-import { type V3BuildPin, findV3Pin, undoTPin, v3ReadingsDigest } from "../src/al-runner-v3-pins";
+import {
+  type V3BuildPin,
+  baselineBatchingFor,
+  baselineBatchingOffReason,
+  findV3Pin,
+  sleepRuleRetiredFor,
+  undoTPin,
+  v3ReadingsDigest,
+} from "../src/al-runner-v3-pins";
 import { FRESH_PROBE_ENV } from "../src/al-runner-v3-probe-cache";
 import {
   AlRunnerV3SeedError,
@@ -80,7 +92,7 @@ import {
 } from "../src/al-runner-v3-seed";
 import { SLEEP_NOTE_TAG } from "../src/al-runner-v3-sleep";
 import { AlcCompileError, ArtifactCompiler, defaultArtifactIo } from "../src/artifact";
-import { buildBackend } from "../src/cli";
+import { type RunCliConfig, buildBackend, v3RecheckOf } from "../src/cli";
 import type { EventSubscriber } from "../src/events";
 import { formatFailure } from "../src/format-failure";
 import { BASELINE_TIMEOUT_DEFAULT, type SessionConfig, runSession } from "../src/orchestrator";
@@ -139,6 +151,7 @@ import {
   O1_SEED_TEST,
   type V3RowFacts,
   V3_DBI_LEG,
+  V3_DBM_LEG,
   V3_DB_LEG,
   V3_ISO_LEG,
   V3_K_CANDIDATE_SKIP,
@@ -147,6 +160,7 @@ import {
   V3_N1E_LEG,
   V3_N1S_LEG,
   V3_O1_LEG,
+  V3_RC_LEG,
   V3_S1E_LEG,
   V3_WR_KILLERS,
   V3_WR_STATE_NOTES,
@@ -160,6 +174,8 @@ import {
   judgeN1Serve,
   judgeO1Seed,
   judgeOrderProbe,
+  judgeRecheckBaseline,
+  judgeRecheckLeg,
   judgeStateNotes,
   judgeWrArms,
   legKSection,
@@ -185,8 +201,8 @@ import {
   readGateBaseline,
   recordRequested,
 } from "./baseline-guard";
-import { prepareFixtureSymbols } from "./fixture-symbols";
-import { GATE_WARNINGS } from "./gate-expected";
+import { copyTestDirForV3, prepareFixtureSymbols, v3GateTestDir } from "./fixture-symbols";
+import { DBM_FIGURES, GATE_WARNINGS } from "./gate-expected";
 import { emitFailed, emitPassed, emitSkipped } from "./gate-receipt";
 import {
   WarningsObservedError,
@@ -241,6 +257,8 @@ const SYMBOLS_B_BASELINE_PATH = join(HERE, "al-runner-v3.symbols-lethalb.baselin
 // R602: legs MO (multi-object files) and WR (`#if`-wrapped files), each recorded once under R332.
 const MULTIOBJECT_BASELINE_PATH = join(HERE, "al-runner-v3.multiobject.baseline.json");
 const WRAPPED_BASELINE_PATH = join(HERE, "al-runner-v3.wrapped.baseline.json");
+// PR-144: leg RC (the withheld-kill recheck), recorded once under R332 by the owner of the live gate.
+const RECHECK_BASELINE_PATH = join(HERE, "al-runner-v3.recheck.baseline.json");
 // R814: resolved once, so `current` moving during a gate cannot swap the binary under it.
 const BIN = resolveV3Binary(process.env.LETHAL_ALRUNNER_V3_PATH ?? AL_RUNNER_V3_DEFAULT_PATH);
 const CANDIDATE = process.env.LETHAL_ALRUNNER_V3_CANDIDATE === "1";
@@ -342,6 +360,20 @@ async function microsoftDeps(scratch: string): Promise<string> {
   return dir;
 }
 
+/** PR-165: each test dir staged without its own `.alpackages`, once per run (see `v3GateTestDir`). */
+const stagedTestDirs = new Map<string, string>();
+let testDirStage: string | undefined;
+function gateTestDir(testDir: string): string {
+  const hit = stagedTestDirs.get(testDir);
+  if (hit !== undefined) return hit;
+  const dir = v3GateTestDir(REPO, testDir, () => {
+    testDirStage ??= mkdtempSync(join(tmpdir(), "lethal-v3-testdirs-"));
+    return join(testDirStage, String(stagedTestDirs.size), basename(testDir));
+  });
+  stagedTestDirs.set(testDir, dir);
+  return dir;
+}
+
 function backendCfg(
   o: Partial<AlRunnerV3Config> &
     Pick<
@@ -358,7 +390,7 @@ function backendCfg(
       transport: TRANSPORT,
       environment: ENVIRONMENT,
     },
-    o,
+    { ...o, testDir: gateTestDir(o.testDir) },
   );
 }
 
@@ -566,6 +598,12 @@ function assertServeCounters(b: AlRunnerV3Backend, leg: string, killed: number):
 /** R612 M-2: leg C's warn-fact readings, for the receipt. */
 let legCWarnFacts: Record<string, string> | undefined;
 
+/** PR-117: leg C's eight capability readings, for DBM's seam rule and the receipt's `batchFacts`. */
+let legCBatchFacts: Record<string, string> | undefined;
+
+/** PR-117: set only when DBM passed with its batched pre-committed figure (2 requests). */
+let dbmBatched = false;
+
 /** Returns the warn lines (R612 `serve-keep-reasons`) of a passing leg, for the receipt. */
 async function legC(scratch: string): Promise<readonly string[]> {
   // R667 (r12): `message-has-no-type-prefix`'s Assert half needs Microsoft's Library Assert, which
@@ -594,10 +632,23 @@ async function legC(scratch: string): Promise<readonly string[]> {
   legCWarnFacts = Object.fromEntries(
     r.facts.filter((f) => V3_WARN_FACTS.includes(f.fact)).map((f) => [f.fact, f.verdict]),
   );
-  // RC-2 (I-2): a defect fact moving to `gone` is held; any diverged is gate-fail. 28 facts (r13,
-  // R590: 9 defect, 18 contract, 1 warn); a warn fact (V3_WARN_FACTS) only adds its line, except
+  // PR-117: the capability readings, for DBM and the receipt (recorded only if DBM batches and passes).
+  legCBatchFacts = Object.fromEntries(
+    r.facts
+      .filter((f) => (V3_CAPABILITY_FACTS as readonly string[]).includes(f.fact))
+      .map((f) => [f.fact, f.verdict]),
+  );
+  // RC-2 (I-2): a defect fact moving to `gone` is held; any diverged is gate-fail. 36 facts (r13,
+  // R590: 9 defect, 18 contract, 1 warn; PR-114a: 8 capability, each must read matches); a warn fact (V3_WARN_FACTS) only adds its line, except
   // `unkept` (R1000), which is gate-fail.
-  const c = classifyLegC(r.facts, V3_DEFECT_FACTS, V3_LEG_C_FACTS, V3_WARN_FACTS, activePin?.legC);
+  const c = classifyLegC(
+    r.facts,
+    V3_DEFECT_FACTS,
+    V3_LEG_C_FACTS,
+    V3_WARN_FACTS,
+    activePin?.legC,
+    V3_CAPABILITY_FACTS,
+  );
   for (const l of c.lines) console.log(`  C: ${l}`);
   if (c.outcome === "gate-fail") throw new LegFailure(`C: ${c.lines.join("; ")}`);
   if (c.outcome === "infra-fail") throw new V3LegEnvironment(`C: ${c.lines.join("; ")}`);
@@ -816,6 +867,266 @@ async function legDBI(scratch: string, version: string): Promise<void> {
   must(b.baselineDaemon, "DBI: the backend does not report a daemon baseline");
 }
 
+/**
+ * PR-114a: leg DBM's selector ids. They must lie inside the TARGET's idRanges (sandbox-optin: 77200-77249,
+ * objects 77200 and 77201 used), or alc rejects the instrumented app and every mutant reads `error`.
+ */
+const DBM_IDS = { selectorId: 77249, controlId: 77248, tableId: 77247 } as const;
+
+/**
+ * PR-114a: leg DBM, the daemon baseline over a fixture with SEVERAL test codeunits that 114b will batch
+ * (`docs/superpowers/specs/2026-11-17-pr114a-batching-capability-facts.md`). `sandbox-optin` and
+ * `-tests` (4 test codeunits, no OnRun) run twice under serve-entries: once with `daemonBaseline` and
+ * once with the one-shot baseline. Per mutant the two must agree (verdict, `killingTest`, note): a
+ * self-relative check, so no new frozen baseline file. The daemon session must not drop its baseline,
+ * must make one request per codeunit (4), and its sample must be `baselineSampleIds(4)`. Batching is
+ * OFF in 114a (no pin allows it), so these are today's request counts; 114b moves them. No fixture
+ * file is edited (R-307's golden list).
+ */
+async function legDBM(scratch: string, version: string): Promise<void> {
+  try {
+    await legDBMRun(scratch);
+  } catch (e) {
+    // A build with no serve path refuses `entries` by name: not applicable, as DBI reads it.
+    if (!isGateWarningsError(e) && isNoServeRefusal(version, String(e))) {
+      console.log("  DBM: not applicable: this build has no serve-entries path");
+      return;
+    }
+    throw e;
+  }
+}
+
+/** The procedures of sandbox-optin that its tests call (directly or through `Greet`/`Store`); every other one is never run. */
+const DBM_CALLED_PROCEDURES = new Set([
+  "KilledGuard",
+  "SurvivingGuard",
+  "Welcome",
+  "Greet",
+  "Remember",
+  "Store",
+  "Remembered",
+]);
+
+async function legDBMRun(scratch: string): Promise<void> {
+  const deps = await microsoftDeps(scratch);
+  let dbmSeam = false;
+  let dbmSeamWhy = "";
+  const run = async (name: "dbm-daemon" | "dbm-oneshot") => {
+    // Own scratch per session: GATE_WARNINGS keys on its name, and the two sessions warn differently.
+    const dir = join(scratch, name);
+    await mkdir(dir, { recursive: true });
+    const daemon = name === "dbm-daemon";
+    const b = new AlRunnerV3Backend(
+      backendCfg({
+        instrumentedDir: join(dir, "backend"),
+        testDir: fixture("sandbox-optin-tests"),
+        packagesDir: deps,
+        bcVersion: SANDBOX_BC,
+        selectorObjectId: DBM_IDS.selectorId,
+        transport: "serve-entries" as const,
+        ...(daemon ? { daemonBaseline: true, memoryHeadroomGb: MEMORY_HEADROOM_GB_DEFAULT } : {}),
+      }),
+    );
+    // As in DB: a fixed reader keeps the guard's one warning the same on every host. PR-119: it also
+    // makes the admission of a concurrent cross-check sample (`maxBytes` set, 1 GiB used) the same everywhere.
+    if (daemon) {
+      b.seams.memoryReader = () => ({
+        usedBytes: 2 ** 30,
+        maxBytes: 32 * 2 ** 30,
+        source: "/sys/fs/cgroup/memory.max",
+      });
+      // PR-115: batches of 2 over the four test codeunits (the default 8 would make one request with nothing to
+      // leave out). Ignored when batching is off for this build.
+      b.seams.baselineBatchSize = 2;
+      // PR-119: set explicitly, never the default's: the leg asserts `samplesOverlapped >= 1` below. The
+      // sample's size is fixed too, so admission never reads a host's (or a closed daemon's) real RSS.
+      b.seams.concurrentSamples = true;
+      b.seams.sampleRss = () => 2 ** 30;
+      // PR-117: DBM tests batching on every gate run, through the seam, whatever the build's record says.
+      // The seam is on exactly when this run's leg C, this backend's own fresh probe and the Sleep rule all allow it.
+      const st = await b.status();
+      must(st.ok, `DBM: the status check failed before the baseline: ${st.details}`);
+      const build = b.runningBuild();
+      const probe = b.contractResult();
+      const probeAll = V3_CAPABILITY_FACTS.every(
+        (n) => probe?.facts.find((f) => f.fact === n)?.verdict === "matches",
+      );
+      const sleepGone =
+        build !== undefined && sleepRuleRetiredFor(probe, build.version, build.binarySha256);
+      if (legCBatchFacts === undefined) {
+        dbmSeam = false;
+        dbmSeamWhy =
+          "leg C was not among the selected legs, so there is no leg C reading to rest on";
+      } else {
+        const legCAll = V3_CAPABILITY_FACTS.every((n) => legCBatchFacts?.[n] === "matches");
+        if (legCAll !== probeAll)
+          throw new V3LegEnvironment(
+            `DBM: leg C and the DBM backend's own probe disagree on the eight capability facts (leg C ${JSON.stringify(legCBatchFacts)}; probe ${JSON.stringify(
+              Object.fromEntries(
+                V3_CAPABILITY_FACTS.map((n) => [
+                  n,
+                  probe?.facts.find((f) => f.fact === n)?.verdict,
+                ]),
+              ),
+            )})`,
+          );
+        dbmSeam = legCAll && probeAll && sleepGone;
+        dbmSeamWhy = dbmSeam
+          ? "leg C and the probe read all eight capability facts matches and the Sleep rule is retired"
+          : !legCAll
+            ? "leg C did not read all eight capability facts matches"
+            : "the Sleep rule is not retired";
+      }
+      b.seams.baselineBatching = dbmSeam;
+    }
+    const r = await session(dir, b, {
+      projectDir: fixture("sandbox-optin"),
+      testDir: fixture("sandbox-optin-tests"),
+      selectorIds: DBM_IDS,
+    });
+    console.log(`  DBM ${name}: ${counts(r)} over ${r.mutants.length}`);
+    must(r.mutants.length > 0, `DBM ${name}: the session measured no mutant`);
+    // M3: both sessions read the pre-committed figures, so equality cannot pass on two equally empty sessions.
+    assertCounts(
+      r,
+      `DBM ${name}`,
+      DBM_FIGURES.killed,
+      DBM_FIGURES.survived,
+      DBM_FIGURES.noCoverage,
+      DBM_FIGURES.totalMutantSites,
+    );
+    assertCleanLeg(r, b, `DBM ${name}`);
+    // R164, L1: sandbox-optin's refused loop procedures are never called by a test; what keeps a mutant that
+    // could loop for ever off a server is that none of them is covered. Every mutant outside the called
+    // procedures must read no-coverage.
+    const stray = r.mutants.filter(
+      (m) => !DBM_CALLED_PROCEDURES.has(m.procedureName) && m.verdict !== "no-coverage",
+    );
+    must(
+      stray.length === 0,
+      `DBM ${name}: ${stray.length} mutant(s) in a procedure no test calls were run (${stray
+        .slice(0, 5)
+        .map((m) => `${m.mutantCode} ${m.procedureName} ${m.verdict}`)
+        .join(", ")}); R164 keeps hang-capable sites off a server`,
+    );
+    return { r, b };
+  };
+  const one = await run("dbm-oneshot");
+  const dm = await run("dbm-daemon");
+  // Empty-vs-empty must not pass: both sessions measured mutants.
+  must(one.r.mutants.length > 0, "DBM: the one-shot session measured no mutant");
+  // R164: a hang-capable site never enters a gate other than itest:hang. NOTE: the built-in operators refuse hang
+  // sites (R196) and never tag a mutant `hangCapable`, so this check cannot fire on today's operators; it only
+  // guards an operator that does tag one. The real guard is the per-session "no mutant outside the called
+  // procedures ran" check above.
+  const hangy = [...one.r.mutants, ...dm.r.mutants].filter((m) => m.hangCapable !== undefined);
+  must(
+    hangy.length === 0,
+    `DBM: ${hangy.length} hang-capable mutant(s) on sandbox-optin (${hangy
+      .slice(0, 5)
+      .map((m) => m.mutantCode)
+      .join(", ")}); R164 keeps them out of this gate`,
+  );
+  const table = (r: SessionReport): Map<string, string> =>
+    new Map(
+      rowFacts(r).map((m) => [
+        m.mutantCode,
+        `${m.verdict}|${m.killingTest ?? ""}|${m.failureNote ?? ""}`,
+      ]),
+    );
+  const a = table(one.r);
+  const c = table(dm.r);
+  const diffs = [...new Set([...a.keys(), ...c.keys()])]
+    .filter((k) => a.get(k) !== c.get(k))
+    .map((k) => `${k}: one-shot ${a.get(k) ?? "absent"} -> daemon ${c.get(k) ?? "absent"}`);
+  for (const d of diffs) console.log(`    - ${d}`);
+  must(
+    diffs.length === 0 && a.size === one.r.mutants.length && c.size === dm.r.mutants.length,
+    `DBM: ${diffs.length} per-mutant difference(s) between the daemon and the one-shot baseline`,
+  );
+  const d = dm.b.daemonBaselineReport();
+  console.log(`  DBM: daemon baseline ${JSON.stringify(d)}`);
+  must(d.dropped === undefined, `DBM: the daemon baseline was dropped: ${d.dropped}`);
+  must(d.codeunits === 4, `DBM: ${d.codeunits} codeunits, pre-committed 4`);
+  // PR-115 (M-A, M2): conditional on the build. A build in V3_BASELINE_BATCHING_BUILDS MUST batch: two batches of
+  // 2, each leaving out the other two. Any other build (an update gate's candidate) sends one request per codeunit.
+  // PR-117: batching is forced on through the seam when leg C, this backend's probe and the Sleep rule allow it.
+  // On: 2 requests. Otherwise: 4, and the reason is printed.
+  console.log(
+    `  DBM: build ${dm.b.runningBuild()?.version ?? "?"}, batching through the seam ${dbmSeam ? "on" : `off (${dbmSeamWhy})`}`,
+  );
+  const wantRequests = dbmSeam ? 2 : 4;
+  must(
+    d.requests === wantRequests,
+    `DBM: ${d.requests} requests for ${d.codeunits} codeunits, pre-committed ${wantRequests} (seam ${dbmSeam ? "on" : `off: ${dbmSeamWhy}`})`,
+  );
+  const want = baselineSampleIds(Array.from({ length: d.codeunits }, (_, i) => i)).length;
+  must(
+    d.sampledCodeunits.length === want,
+    `DBM: ${d.sampledCodeunits.length} codeunits sampled, pre-committed ${want}`,
+  );
+  // PR-119: the fixed memory reader and sample size above make admission build-independent. Four codeunits
+  // put samples at index 1 and 3; codeunit 2 always needs a request of its own (batch {2,3} or alone), so
+  // the first sample overlaps it. Checked before the accessor and before the leg's `dbmBatched = dbmSeam`.
+  must(
+    d.samplesOverlapped >= 1,
+    `DBM: ${d.samplesOverlapped} cross-check sample(s) ran beside the daemon (${d.samplesSequential} in place), pre-committed at least 1`,
+  );
+  const j = judgeDaemonBaseline("DBM", d, d.codeunits - want, want);
+  for (const n of j.notes) console.log(`  ${n}`);
+  must(j.fail === undefined, j.fail ?? "");
+  must(dm.b.baselineDaemon, "DBM: the backend does not report a daemon baseline");
+  // PR-117: the accessor. A fresh backend WITHOUT the seam must answer what the build's own record, its probe and
+  // the Sleep rule say (a candidate has no record: false).
+  const fdir = join(scratch, "dbm-accessor");
+  await mkdir(fdir, { recursive: true });
+  const fresh = new AlRunnerV3Backend(
+    backendCfg({
+      instrumentedDir: join(fdir, "backend"),
+      testDir: fixture("sandbox-optin-tests"),
+      packagesDir: deps,
+      bcVersion: SANDBOX_BC,
+      selectorObjectId: DBM_IDS.selectorId,
+      transport: "serve-entries" as const,
+      daemonBaseline: true,
+      memoryHeadroomGb: MEMORY_HEADROOM_GB_DEFAULT,
+    }),
+  );
+  const fst = await fresh.status();
+  must(fst.ok, `DBM: the accessor check's status failed: ${fst.details}`);
+  const fb = fresh.runningBuild();
+  must(fb !== undefined, "DBM: the accessor check's backend found no build");
+  const record = CANDIDATE ? undefined : await checkGated(BIN, fb?.version ?? "");
+  const expected = CANDIDATE
+    ? false
+    : baselineBatchingFor(
+        fresh.contractResult(),
+        fb?.version ?? "",
+        fb?.binarySha256 ?? "",
+        record,
+      );
+  console.log(
+    `  DBM: accessor without the seam ${fresh.isBaselineBatching()}, expected ${expected} (${fresh.baselineBatchingOffWhy() ?? "allowed"})`,
+  );
+  must(
+    fresh.isBaselineBatching() === expected,
+    `DBM: isBaselineBatching() is ${fresh.isBaselineBatching()} without the seam, the build's record, probe and Sleep rule say ${expected}`,
+  );
+  // M1: the reason too, so a status() that threads the wrong record shows as a different sentence.
+  const expectedWhy = baselineBatchingOffReason(
+    fresh.contractResult(),
+    fb?.version ?? "",
+    fb?.binarySha256 ?? "",
+    record,
+  );
+  must(
+    fresh.baselineBatchingOffWhy() === expectedWhy,
+    `DBM: baselineBatchingOffWhy() is ${JSON.stringify(fresh.baselineBatchingOffWhy())}, the build's record, probe and Sleep rule say ${JSON.stringify(expectedWhy)}`,
+  );
+  // Recorded by the receipt only when batching ran and every check above held.
+  dbmBatched = dbmSeam;
+}
+
 async function legS3(scratch: string): Promise<void> {
   let refused = "";
   try {
@@ -930,7 +1241,7 @@ async function legN1E(scratch: string, version: string): Promise<void> {
 async function legN1S(scratch: string, version: string): Promise<void> {
   const deps = await microsoftDeps(scratch);
   const tests = join(scratch, "names-tests-reduced");
-  await cp(fixture("sandbox-names-tests"), tests, { recursive: true });
+  await copyTestDirForV3(REPO, fixture("sandbox-names-tests"), tests);
   const al = join(tests, "src", "NamesTests.Codeunit.al");
   const text = await readFile(al, "utf8");
   const at = text.indexOf('procedure "Dot.Step"()');
@@ -1106,7 +1417,7 @@ async function o1SeedCheck(
 async function legISO(scratch: string, version: string): Promise<void> {
   const cache = await microsoftDeps(scratch);
   const tests = join(scratch, "sandbox-order-tests");
-  await cp(fixture("sandbox-order-tests"), tests, { recursive: true });
+  await copyTestDirForV3(REPO, fixture("sandbox-order-tests"), tests);
   await writeFile(join(tests, "src", "IsolateProbe.al"), ISO_PROBE_AL);
   const server = new AlRunnerServer(
     BIN,
@@ -1216,7 +1527,7 @@ async function legO1(scratch: string, version: string): Promise<void> {
     const dep = join(scratch, "cdo-src", "sandbox-order");
     const tests = join(scratch, "cdo-src", "sandbox-order-tests");
     await cp(fixture("sandbox-order"), dep, { recursive: true });
-    await cp(fixture("sandbox-order-tests"), tests, { recursive: true });
+    await copyTestDirForV3(REPO, fixture("sandbox-order-tests"), tests);
     const cdoApp = JSON.parse(await readFile(join(CDO, "Test", "app.json"), "utf8")) as {
       dependencies?: { id: string; name: string; publisher: string; version: string }[];
     };
@@ -1534,6 +1845,76 @@ async function legMO(scratch: string, serve = false): Promise<SessionReport> {
   assertCounts(r, leg, 7, 1, 6, 14);
   assertCleanLeg(r, b, leg);
   if (serve) logServeCounters(b, "MOE");
+  return r;
+}
+
+/**
+ * RC (PR-144): the withheld-kill recheck on `sandbox-recheck`, pre-committed in
+ * `docs/superpowers/specs/2026-11-18-pr144-withheld-kill-recheck.md` §0f (amendment 6; §0b is the design). The main pass runs under
+ * `"isolation": "test"` on serve, one worker, with `recheckWithheldKills` on; the recheck is `v3RecheckOf`, the
+ * same code the CLI uses, with a nested backend under method isolation. The table (`judgeRecheckLeg`) is checked
+ * FIRST, by name, before the own-baseline compare.
+ */
+async function legRC(scratch: string): Promise<SessionReport> {
+  const projectDir = fixture("sandbox-recheck");
+  const testDir = fixture("sandbox-recheck-tests");
+  const ids = { selectorId: 76049, controlId: 76048, tableId: 76047 };
+  const packagesDir = await microsoftDeps(scratch);
+  const make = (isolation: "test" | "method", dir: string) =>
+    new AlRunnerV3Backend(
+      backendCfg({
+        instrumentedDir: dir,
+        testDir,
+        packagesDir,
+        bcVersion: SANDBOX_BC,
+        selectorObjectId: ids.selectorId,
+        sourceProjectDir: projectDir,
+        transport: "serve-entries",
+        isolation,
+      }),
+    );
+  const mainConfig = {
+    projectDir,
+    testDir,
+    selectorIds: ids,
+    workers: 1,
+  } as unknown as SessionConfig;
+  const recheck = v3RecheckOf({
+    parsed: { backendKind: "al-runner-v3" } as RunCliConfig,
+    effectiveConfig: {
+      alRunnerV3: {
+        path: BIN,
+        packagesDir,
+        bcVersion: SANDBOX_BC,
+        recheckWithheldKills: true,
+        recheckBudgetSeconds: 1800,
+      },
+    } as never,
+    mainConfig,
+    build: async (_config, dir) => make("method", dir),
+    runSession,
+    newStore: () => new ResultsStore(join(scratch, "recheck.sqlite")),
+    scratchRoot: scratch,
+  });
+  if (recheck === undefined) throw new LegFailure("RC: the recheck was not built from its config");
+  const b = make("test", join(scratch, "backend"));
+  const r = await session(scratch, b, {
+    projectDir,
+    testDir,
+    selectorIds: ids,
+    workers: 1,
+    recheck,
+  });
+  const fails = [
+    ...judgeRecheckLeg(r.mutants, r.validity.caveats),
+    ...judgeRecheckBaseline(r.unsupportedTests),
+  ];
+  for (const f of fails) console.log(`    - ${f}`);
+  const [first] = fails;
+  if (first !== undefined) throw new LegFailure(first);
+  console.log(
+    `  RC: ${r.mutants.filter((m) => m.isolatedRecheck !== undefined).length} recovered (the Sevens mutants), ${r.mutants.filter((m) => m.withheldKill !== undefined).length} still withheld (the SevensB mutants), as pre-committed`,
+  );
   return r;
 }
 
@@ -2546,6 +2927,9 @@ async function main(): Promise<void> {
     preflightGateBaseline(MULTIOBJECT_BASELINE_PATH, "al-runner-v3 itest leg MO");
   if (LEGS.includes("WR"))
     preflightGateBaseline(WRAPPED_BASELINE_PATH, "al-runner-v3 itest leg WR");
+  // PR-144: leg RC refuses at start while its baseline is missing (R332).
+  if (LEGS.includes(V3_RC_LEG))
+    preflightGateBaseline(RECHECK_BASELINE_PATH, "al-runner-v3 itest leg RC");
   // R918: MOE and WRE compare with the same two files, so they refuse at start without them too.
   if (LEGS.includes("MOE"))
     preflightGateBaseline(MULTIOBJECT_BASELINE_PATH, "al-runner-v3 itest leg MOE");
@@ -2589,6 +2973,7 @@ async function main(): Promise<void> {
     ["Y-B", SYMBOLS_B_BASELINE_PATH],
     ["MO", MULTIOBJECT_BASELINE_PATH],
     ["WR", WRAPPED_BASELINE_PATH],
+    [V3_RC_LEG, RECHECK_BASELINE_PATH],
   ]);
   const recordPaths = LEGS.flatMap((l) => {
     const p = recordBaselines.get(l);
@@ -2633,6 +3018,7 @@ async function main(): Promise<void> {
         else if (leg === V3_S1E_LEG) await legS1(scratch, V3_S1E_LEG, version);
         else if (leg === V3_DB_LEG) await legS1(scratch, V3_DB_LEG, version);
         else if (leg === V3_DBI_LEG) await legDBI(scratch, version);
+        else if (leg === V3_DBM_LEG) await legDBM(scratch, version);
         else if (leg === "S3") await legS3(scratch);
         else if (leg === "N1") await legN1(scratch);
         else if (leg === V3_N1E_LEG) await legN1E(scratch, version);
@@ -2700,6 +3086,22 @@ async function main(): Promise<void> {
           } catch (e) {
             if (e instanceof BaselineRecordedError) throw e;
             throw new LegFailure(`MO: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        } else if (leg === V3_RC_LEG) {
+          // PR-144: the pre-committed table ran inside the leg (nothing is written on a difference); then
+          // the own-baseline compare, which a record run writes (R332).
+          const r = await legRC(scratch);
+          try {
+            await assertGateBaseline(
+              r,
+              RECHECK_BASELINE_PATH,
+              "al-runner-v3 itest leg RC",
+              process.env,
+              pinnedRecord(),
+            );
+          } catch (e) {
+            if (e instanceof BaselineRecordedError) throw e;
+            throw new LegFailure(`RC: ${e instanceof Error ? e.message : String(e)}`);
           }
         } else if (leg === "MOE") {
           // R918: the serve legs, compared with the ONE-SHOT legs' frozen baselines and never
@@ -2820,6 +3222,8 @@ async function main(): Promise<void> {
       legs,
       lines,
       ...(legCWarnFacts !== undefined ? { warnFacts: legCWarnFacts } : {}),
+      ...(legCBatchFacts !== undefined ? { batchFacts: legCBatchFacts } : {}),
+      ...(dbmBatched ? { dbmBatched: true } : {}),
       ...(PIN !== undefined ? { pinApplied: PIN.id, pinDigest: v3ReadingsDigest(PIN) } : {}),
       oracleBcBuild: ORACLE_BC_BUILD,
       writtenAt: new Date().toISOString(),

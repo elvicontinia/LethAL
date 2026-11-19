@@ -25,6 +25,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -192,6 +195,55 @@
             }
           }
         },
+        "confirm": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inputPath",
+            "inputSha256",
+            "sample",
+            "seed",
+            "selected"
+          ],
+          "properties": {
+            "inputPath": {
+              "type": "string"
+            },
+            "inputSha256": {
+              "type": "string"
+            },
+            "sample": {
+              "type": "number"
+            },
+            "seed": {
+              "type": "string"
+            },
+            "selected": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key",
+                  "group"
+                ],
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  },
+                  "group": {
+                    "type": "string",
+                    "enum": [
+                      "noted",
+                      "nocov-noted",
+                      "sample"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
         "testsOnly": {
           "type": "array",
           "items": {
@@ -202,6 +254,9 @@
           "type": "boolean"
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -246,6 +301,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -282,6 +340,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -312,6 +373,9 @@
           "type": "number"
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -443,6 +507,9 @@
           "type": "number"
         },
         "excludedByLines": {
+          "type": "number"
+        },
+        "excludedByConfirm": {
           "type": "number"
         },
         "refusedFiles": {
@@ -631,6 +698,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -703,7 +773,8 @@
                 "enum": [
                   "compiled-out",
                   "preproc-undecided-kept",
-                  "exclude-test"
+                  "exclude-test",
+                  "company-write"
                 ]
               }
             }
@@ -715,7 +786,97 @@
             "type": "string"
           }
         },
+        "httpPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "codeunits",
+            "open",
+            "handler",
+            "unread"
+          ],
+          "properties": {
+            "codeunits": {
+              "type": "number"
+            },
+            "open": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "codeunit",
+                  "file",
+                  "policy"
+                ],
+                "properties": {
+                  "codeunit": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "policy": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "handler": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "codeunit",
+                  "file",
+                  "policy"
+                ],
+                "properties": {
+                  "codeunit": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "policy": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "unread": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "codeunit",
+                  "file",
+                  "policy"
+                ],
+                "properties": {
+                  "codeunit": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "policy": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "httpPolicyFailed": {
+          "type": "string"
+        },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -739,6 +900,9 @@
           }
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -785,6 +949,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -822,6 +989,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -846,6 +1016,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -867,6 +1040,9 @@
         },
         "stoppedBudgetMs": {
           "type": "number"
+        },
+        "workDate": {
+          "type": "string"
         },
         "verdicts": {
           "type": "array",
@@ -922,6 +1098,9 @@
           }
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -1009,6 +1188,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -1051,6 +1233,9 @@
           }
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -1106,6 +1291,9 @@
           }
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -1299,7 +1487,9 @@
             "runner-refused",
             "kill-not-reproduced",
             "confirm-stopped",
-            "test-discovery-failed"
+            "test-discovery-failed",
+            "workdate-changed",
+            "left-out-test-reach"
           ]
         },
         "killingTestFailure": {
@@ -1366,6 +1556,9 @@
           "type": "string"
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -1584,6 +1777,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -1736,6 +1932,270 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tests",
+        "elapsedMs",
+        "verdicts",
+        "seq"
+      ],
+      "properties": {
+        "type": {
+          "const": "recheck-baseline-finished"
+        },
+        "tests": {
+          "type": "number"
+        },
+        "elapsedMs": {
+          "type": "number"
+        },
+        "verdicts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "outcome"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "pass",
+                  "fail",
+                  "skip",
+                  "timeout",
+                  "deadline-exceeded",
+                  "error"
+                ]
+              }
+            }
+          }
+        },
+        "seq": {
+          "type": "number"
+        },
+        "atMs": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "mutant",
+        "batchIndex",
+        "durationMs",
+        "seq"
+      ],
+      "properties": {
+        "type": {
+          "const": "mutant-rechecked"
+        },
+        "mutant": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mutantId",
+            "file",
+            "startIndex",
+            "endIndex",
+            "startLine",
+            "operatorName",
+            "operatorVersion",
+            "astHash",
+            "objectType",
+            "codeunitId",
+            "codeunitName",
+            "procedureName",
+            "originalText",
+            "mutatedText"
+          ],
+          "properties": {
+            "mutantId": {
+              "type": "string"
+            },
+            "file": {
+              "type": "string"
+            },
+            "startIndex": {
+              "type": "number"
+            },
+            "endIndex": {
+              "type": "number"
+            },
+            "startLine": {
+              "type": "number"
+            },
+            "operatorName": {
+              "type": "string"
+            },
+            "operatorVersion": {
+              "type": "string"
+            },
+            "astHash": {
+              "type": "string"
+            },
+            "reachGrain": {
+              "type": "string",
+              "enum": [
+                "statement",
+                "enclosing",
+                "unplaced"
+              ]
+            },
+            "reachLine": {
+              "type": "number"
+            },
+            "objectType": {
+              "type": "string"
+            },
+            "codeunitId": {
+              "type": "number"
+            },
+            "codeunitName": {
+              "type": "string"
+            },
+            "procedureName": {
+              "type": "string"
+            },
+            "procedureScope": {
+              "type": "string",
+              "enum": [
+                "local",
+                "public"
+              ]
+            },
+            "coverageArmNames": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "triggerName": {
+              "type": "string"
+            },
+            "procedureStartLine": {
+              "type": "number"
+            },
+            "procedureEndLine": {
+              "type": "number"
+            },
+            "nonDebuggable": {
+              "const": true
+            },
+            "procedureOverloadIndex": {
+              "type": "number"
+            },
+            "gapId": {
+              "type": "string"
+            },
+            "blockStartLine": {
+              "type": "number"
+            },
+            "blockEndLine": {
+              "type": "number"
+            },
+            "identityOrdinal": {
+              "type": "number"
+            },
+            "memberHash": {
+              "type": "string"
+            },
+            "originalText": {
+              "type": "string"
+            },
+            "mutatedText": {
+              "type": "string"
+            },
+            "platformKillMechanism": {
+              "type": "string"
+            },
+            "hangCapable": {
+              "type": "string"
+            },
+            "equivalenceRisk": {
+              "type": "string"
+            }
+          }
+        },
+        "batchIndex": {
+          "type": "number"
+        },
+        "durationMs": {
+          "type": "number"
+        },
+        "keptNote": {
+          "type": "string"
+        },
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "killingTest",
+            "coveringTests",
+            "isolatedRecheck"
+          ],
+          "properties": {
+            "killingTest": {
+              "type": "string"
+            },
+            "killingTestFailure": {
+              "type": "string"
+            },
+            "killPosition": {
+              "type": "number"
+            },
+            "reproducedFailure": {
+              "type": "string"
+            },
+            "coveringTests": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "isolatedRecheck": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "withheldFailure",
+                "killerGreenInMainBaseline"
+              ],
+              "properties": {
+                "withheldFailure": {
+                  "type": "string"
+                },
+                "afterTest": {
+                  "type": "string"
+                },
+                "killerGreenInMainBaseline": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        },
+        "seq": {
+          "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -1779,6 +2239,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -1802,6 +2265,9 @@
           "type": "string"
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -1845,6 +2311,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -1869,7 +2338,8 @@
           "enum": [
             "warmup",
             "prefetch",
-            "live"
+            "live",
+            "baseline"
           ]
         },
         "lane": {
@@ -1934,6 +2404,45 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "codeunit",
+        "wallMs",
+        "reason",
+        "seq"
+      ],
+      "properties": {
+        "type": {
+          "const": "baseline-one-shot-timed"
+        },
+        "codeunit": {
+          "type": "number"
+        },
+        "wallMs": {
+          "type": "number"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "cross-check",
+            "too-slow",
+            "other"
+          ]
+        },
+        "seq": {
+          "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -1968,6 +2477,9 @@
           "type": "string"
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -2064,6 +2576,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -2083,6 +2598,9 @@
           "type": "string"
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }
@@ -2154,6 +2672,9 @@
         },
         "seq": {
           "type": "number"
+        },
+        "atMs": {
+          "type": "number"
         }
       }
     },
@@ -2173,6 +2694,9 @@
           "type": "number"
         },
         "seq": {
+          "type": "number"
+        },
+        "atMs": {
           "type": "number"
         }
       }

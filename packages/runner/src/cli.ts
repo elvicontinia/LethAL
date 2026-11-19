@@ -82,9 +82,17 @@ import {
   cliOk,
   wantsEnvelope,
 } from "./cli-envelope";
+import {
+  ConfirmBackendNotBcdevError,
+  ConfirmInputNotReportError,
+  type Confirmation,
+  mergeConfirmation,
+  renderConfirmation,
+  sha256Hex,
+} from "./confirm";
 import { dependencyCheckWarning, dependencyCodeunitsOf } from "./dependency-codeunits";
 import { DeploymentVerifier } from "./deployment-verifier";
-import { ENV_STATUS_REACHABLE_NO_VENDOR_STATUS, runDoctor } from "./doctor";
+import { ENV_STATUS_REACHABLE_NO_VENDOR_STATUS, dependencyClosure, runDoctor } from "./doctor";
 import type {
   DependenciesProbe,
   DoctorCheck,
@@ -92,6 +100,7 @@ import type {
   DoctorDeps,
   DoctorReport,
   ServerDependenciesProbe,
+  TextSearchDependenciesProbe,
 } from "./doctor";
 import { EnvToolClient, EnvToolError, READS_KEYS, validateEnvToolConfig } from "./env-tool";
 import type { EnvToolBlock, EnvToolConfigSection } from "./env-tool";
@@ -106,18 +115,22 @@ import type { EnvToolSession } from "./env-tool-session";
 import { loadEquivalenceMarks } from "./equivalence-marks";
 import { symbolPackageIdentity } from "./published-test-app";
 import { watchProjectInputs } from "./source-drift";
+import { type CachedPackage, type TextSearchApp, readCachedPackage } from "./text-search-fields";
 
 // Moved to equivalence-marks.ts so verify.ts can read marks without importing the CLI.
 export { EQUIVALENCE_MARKS_FILENAME, loadEquivalenceMarks } from "./equivalence-marks";
 import { type AcceptResult, computeAcceptResult, loadAcceptList } from "./accept-list";
 import { changedLineSurvivors, renderChangedLineSurvivors } from "./changed-line-survivors";
 import type { ReportView } from "./changed-line-survivors";
-import type { EventSubscriber } from "./events";
+import { companyWriteLines, companyWriteMethods } from "./company-writes";
+import { discoverTests } from "./discovery";
+import type { EventSubscriber, RunEvent } from "./events";
 import { type ExplainOutput, assertExplainableReport, explain } from "./explain";
 import { type ExplainSuggestedOutput, suggest } from "./explain-suggest";
 import { formatFailure } from "./format-failure";
 import { ApiBaseUnsetError, HarnessVerifier, UnfilteredExtensionsQueryError } from "./harness";
 import type { HarnessDetails, LeaseSnapshot } from "./harness";
+import { httpPolicyLines, httpPolicyOf } from "./http-policy";
 import { largeFoldWarning } from "./large-fold";
 import { type ForceResetOutcome, LeaseClient, LeaseUnavailableError } from "./lease";
 import { changedLinesSince, parseLineArg } from "./line-filter";
@@ -159,6 +172,7 @@ import { assertResourceSelectorRuntime, runtimeBelow14 } from "./resource-select
 import { RunMutantTransport } from "./run-mutant-transport";
 import { ResultsStore } from "./store";
 import type { PublishOutcomeRow } from "./store";
+import { buildTestAppModel, readTestAppSources } from "./testpage-scan";
 import { createTimingFold, foldTimingFile } from "./timing-summary";
 import {
   AlRunnerV2RetiredError,
@@ -182,6 +196,7 @@ import {
   testProjectNestedProblem,
 } from "./verify";
 import { setPackageCacheDirs, walkFiles } from "./walk";
+import { type RecheckRunner, recheckSiteKey } from "./withheld-recheck";
 
 /**
  * `cli.ts` is argument marshaling only — everything that decides pass/fail
@@ -448,6 +463,9 @@ export const DRY_RUN_REFUSED = [
   "fresh-probe",
   "isolate-tests",
   "fail-on-survivors",
+  "confirm-from",
+  "confirm-sample",
+  "confirm-seed",
 ] as const;
 
 export interface DryRunCliConfig {
@@ -497,6 +515,8 @@ export interface DryRunCliConfig {
   readonly allowLargeRun?: true;
   readonly testDir?: string;
   readonly timeBudgetSeconds?: number;
+  /** PR-212: `--keep-company-tests`, said back by the dry run's company-writes line. */
+  readonly keepCompanyTests?: true;
 }
 
 export interface RunCliConfig {
@@ -575,6 +595,8 @@ export interface RunCliConfig {
    * and raises `tests-narrowed`; the report names each test in `excludedTests`.
    */
   readonly excludeTests?: readonly string[];
+  /** PR-212 (R1113): `--keep-company-tests` runs the test methods that write the Company table; by default a BC run leaves them out. */
+  readonly keepCompanyTests?: boolean;
   /**
    * R44: `--max-guards-per-batch <n>` bounds how many injected guards go into one published
    * artifact. Absent means no limit.
@@ -634,6 +656,15 @@ export interface RunCliConfig {
   readonly isolateTests?: boolean;
   /** PR-77: `--fail-on-survivors`: exit `SURVIVORS_ON_CHANGED_LINES_EXIT_CODE` when a counted survivor sits on the changed lines. Needs a line filter. */
   readonly failOnSurvivors?: true;
+  /**
+   * PR-171 (R1122): `--confirm-from <v3 report.json> [--confirm-sample <n>] [--confirm-seed <s>]`.
+   * Deploy only the mutants that report selects. Absent means an ordinary run. See `SessionConfig.confirm`.
+   */
+  readonly confirm?: {
+    readonly path: string;
+    readonly sample?: number;
+    readonly seed?: string;
+  };
   /**
    * R47: `--resume` (most recent unfinished run) or `--resume-run <id>` (a named one). Absent means
    * a fresh run. See `SessionConfig.resume`.
@@ -858,6 +889,18 @@ export interface VerifyCliConfig {
   readonly noReachFilter?: boolean;
 }
 
+/**
+ * PR-171 (R1122): `lethal confirm-merge <v3.json> <bc.json> --out <file>`. Joins a v3 report to the
+ * report of the `--confirm-from` run made from it and writes the `lethal-confirmation` artifact.
+ * Reads those two files only: no server, database or config.
+ */
+export interface ConfirmMergeCliConfig {
+  readonly mode: "confirm-merge";
+  readonly v3Path: string;
+  readonly bcPath: string;
+  readonly outPath: string;
+}
+
 export interface ExplainCliConfig {
   readonly mode: "explain";
   readonly reportPath: string;
@@ -938,6 +981,7 @@ export type CliConfig =
   | ExplainCliConfig
   | VerifyCliConfig
   | ExportCliConfig
+  | ConfirmMergeCliConfig
   | CampaignCliConfig
   | InitCliConfig
   | HelpCliConfig
@@ -952,6 +996,7 @@ export const VALID_SUBCOMMANDS = [
   "doctor",
   "explain",
   "export",
+  "confirm-merge",
   "campaign",
   "verify",
   "native-check",
@@ -974,6 +1019,7 @@ const CAMPAIGN_ACTIONS = ["freeze", "anchors", "compare"] as const;
  */
 const SUBCOMMANDS_TAKING_POSITIONALS: ReadonlySet<string> = new Set([
   "campaign",
+  "confirm-merge",
   "explain",
   "export",
 ]);
@@ -1057,6 +1103,7 @@ USAGE
   lethal explain           <report.json> [--top <n>] [--project <dir>] [--suggest] [--events <path>]
   lethal export            <report.json> --format mutation-elements --project <dir> --out <path>
                                          [--thresholds <high,low>]
+  lethal confirm-merge     <v3.json> <bc.json> --out <path>
   lethal campaign freeze   --manifest <path> --stage <name> --report <path> --expect-mutants <n>
   lethal campaign anchors  --manifest <path> --stage <name> --report <path> [--project <dir>]
   lethal campaign compare  --manifest <path> --stage <name> --report <path> [--json]
@@ -1127,8 +1174,23 @@ RUN — scope. These bound cost. --tests-only can change a verdict; the others c
                              a name that matches no test is refused). CAN CHANGE A VERDICT like
                              --tests-only; the report flags 'tests-narrowed' and lists it in
                              excludedTests
-  --skip-known-survivors     skip mutants a prior finished run recorded as survivors
-  --allow-large-run          run more than ${LARGE_RUN_MUTANT_THRESHOLD} mutation sites (refused by default — a whole
+  --keep-company-tests       run the test methods that write the Company table (Insert, Delete or
+                             Rename on a Record Company, in the method or in one test-app procedure
+                             it calls). A BC run (bcdev, envtool) LEAVES THEM OUT by default and
+                             names them: on BC 29 they broke the server's tier (R1113). A write two
+                             calls away is not seen. Use it on a server you can restart. Also read
+                             by --dry-run. al-runner-v3 never leaves them out
+  --skip-known-survivors    skip mutants a prior finished run recorded as survivors
+  --confirm-from <v3.json>   deploy only the mutants an al-runner-v3 report selects: its survivors
+                             noted '[v3-refused-test-nearby]', its no-coverage rows noted by R609,
+                             and a seeded sample of its unnoted survivors (R1122). Join the result
+                             with 'lethal confirm-merge'. Refused by name beside --resume,
+                             --skip-known-survivors, --exclude-test, a different scope or source,
+                             and any backend but bcdev
+  --confirm-sample <n>       how many unnoted survivors to add (default 30; 0 turns it off). Needs
+                             --confirm-from
+  --confirm-seed <text>      the sample's seed (default: the sha256 of the report). Needs --confirm-from
+  --allow-large-run        run more than ${LARGE_RUN_MUTANT_THRESHOLD} mutation sites (refused by default — a whole
                              real app costs days and usually cannot publish at all)
   --dry-run                  list what would be mutated; execute no tests. Reports both the raw
                              mutation-site count and the DEPLOYED count (they differ), plus this
@@ -1144,7 +1206,13 @@ RUN — scope. These bound cost. --tests-only can change a verdict; the others c
                              --dry-run added. Every other execution flag (--workers ...) is
                              refused with --dry-run, because a dry run executes no tests.
                              --backend is optional; every backend lists the #if arms of alc's
-                             build
+                             build. With --backend and a config, it also runs the config
+                             pre-flight a real run does (config keys, environment, license,
+                             packages folder, alc, selector ids) and refuses by the same error
+                             names; it does NOT run what needs the al-runner binary (the pinned-
+                             build check) or a server. By choice of scope it does not check the
+                             accept list (lethal.accepted.json) or the equivalence-marks file
+                             either, so a malformed one still passes a dry run.
 
 RUN — cost and recovery
   --max-guards-per-batch <n> cap guards per published build. Publish cost scales with guard
@@ -1311,6 +1379,13 @@ EXPLAIN — what a finished report MEANS, as JSON on stdout
                              went) on stderr. Stdout stays the one JSON document; --json is refused.
                              Refused on a report without gap ids
 
+CONFIRM-MERGE — join an al-runner-v3 report to the BC run made from it (R1122)
+  Writes a 'lethal-confirmation' JSON (not a report): every v3 mutant with its v3 verdict, its
+  BC verdict when BC measured it, a final verdict and who measured it. A BC error is not a
+  measurement and keeps v3's verdict. BC kills on the Linux RDLC stub (R1121) stay kills and are
+  counted apart. It refuses by name when the two reports do not belong together. A kill by an
+  unnoted survivor in the sample prints 'unnoted-disagreement': run the whole scope on BC then.
+
 CAMPAIGN — the measurement gates, with 'committed before the run' machine-checked
   A measurement campaign states what it expects in a file, COMMITS it, and only then runs. These
   three verbs are what enforce that: each one reads the campaign manifest, resolves the records
@@ -1456,6 +1531,8 @@ export const RUN_FLAGS = {
   "tests-only": { type: "string", multiple: true },
   // R745: repeatable — see `RunCliConfig.excludeTests`.
   "exclude-test": { type: "string", multiple: true },
+  // PR-212: see `RunCliConfig.keepCompanyTests`.
+  "keep-company-tests": { type: "boolean", default: false },
   // R44: see `RunCliConfig.maxGuardsPerBatch`.
   "max-guards-per-batch": { type: "string" },
   // R47: see `RunCliConfig.mutantTimeoutMs` / `resume`.
@@ -1517,6 +1594,10 @@ export const RUN_FLAGS = {
   "no-reach-filter": { type: "boolean", default: false },
   // PR-77: see `RunCliConfig.failOnSurvivors`.
   "fail-on-survivors": { type: "boolean", default: false },
+  // PR-171 (R1122): see `RunCliConfig.confirm`. Owned by `run` alone in FLAG_OWNERS.
+  "confirm-from": { type: "string" },
+  "confirm-sample": { type: "string" },
+  "confirm-seed": { type: "string" },
 } as const;
 
 /** Flags only `lethal run` reads. One sentence serves them all: none has a second home. */
@@ -1546,11 +1627,15 @@ const RUN_ONLY_FLAGS = [
   "resume-run",
   "retry-stranded",
   "stop-hung-sessions",
+  "keep-company-tests",
   "allow-large-run",
   "fresh-probe",
   "isolate-tests",
   "progress-out",
   "fail-on-survivors",
+  "confirm-from",
+  "confirm-sample",
+  "confirm-seed",
 ] as const;
 
 /**
@@ -1605,7 +1690,7 @@ export const FLAG_OWNERS: ReadonlyArray<{
   { flag: "db", owners: ["run", "clear-ceiling", "verify"] },
   {
     flag: "out",
-    owners: ["run", "init", "export"],
+    owners: ["run", "init", "export", "confirm-merge"],
     instead:
       "`lethal explain`, `lethal doctor --json` and `lethal verify` print JSON on stdout; redirect it to a file.",
   },
@@ -2041,6 +2126,25 @@ export function parseCliConfig(argv: readonly string[]): CliConfig {
     };
   }
 
+  if (subcommand === "confirm-merge") {
+    const [, v3Path, bcPath, ...stray] = positionals;
+    if (v3Path === undefined || v3Path === "" || bcPath === undefined || bcPath === "") {
+      throw new Error(
+        "missing required <v3.json> <bc.json>: the al-runner-v3 report, then the report of the `lethal run --confirm-from <v3.json>` run made from it. `lethal confirm-merge` reads only those two files.",
+      );
+    }
+    if (stray.length > 0) {
+      throw new Error(
+        `\`lethal confirm-merge\` takes exactly two reports, <v3.json> <bc.json>; got stray argument(s): ${stray.join(" ")}`,
+      );
+    }
+    const outPath = values.out;
+    if (outPath === undefined || outPath === "") {
+      throw new Error("missing required --out <file> (where the confirmation JSON is written).");
+    }
+    return { mode: "confirm-merge", v3Path, bcPath, outPath };
+  }
+
   if (subcommand === "export") {
     const [, reportPath] = positionals;
     if (reportPath === undefined || reportPath === "") {
@@ -2363,6 +2467,7 @@ export function parseCliConfig(argv: readonly string[]): CliConfig {
       ...(values["allow-large-run"] === true ? { allowLargeRun: true as const } : {}),
       ...(values.tests !== undefined ? { testDir: values.tests } : {}),
       ...(timeBudgetSeconds !== undefined ? { timeBudgetSeconds } : {}),
+      ...(values["keep-company-tests"] === true ? { keepCompanyTests: true as const } : {}),
       ...only,
       ...exclude,
       ...operators,
@@ -2450,6 +2555,29 @@ export function parseCliConfig(argv: readonly string[]): CliConfig {
       "--fail-on-survivors needs --lines or --changed-since: it fails on survivors on the changed lines, and a whole-app survivor count is a different quantity",
     );
   }
+  // PR-171 (R1122): the sample and seed mean nothing without the report they draw from.
+  const confirmFrom = values["confirm-from"];
+  if (confirmFrom === "") {
+    throw new Error("--confirm-from needs the path of an al-runner-v3 report (a run's --out file)");
+  }
+  if (confirmFrom === undefined) {
+    for (const f of ["confirm-sample", "confirm-seed"] as const) {
+      if (values[f] !== undefined) throw new Error(`--${f} needs --confirm-from`);
+    }
+  }
+  const confirmSampleRaw = values["confirm-sample"];
+  // Digits only: "", "0x10" and "1e1" are refused by name, not read as numbers.
+  if (confirmSampleRaw !== undefined && !/^\d+$/.test(confirmSampleRaw)) {
+    throw new Error(
+      `--confirm-sample must be a whole number written in digits, 0 or more (0 turns the sample off); got ${JSON.stringify(confirmSampleRaw)}`,
+    );
+  }
+  const confirmSample = confirmSampleRaw === undefined ? undefined : Number(confirmSampleRaw);
+  if (values["confirm-seed"] === "") throw new Error("--confirm-seed must not be empty");
+  const confirmSeed = values["confirm-seed"];
+  // The confirm run is the BC run: v3 is what its report came from, never what confirms it.
+  if (confirmFrom !== undefined && !isBcdev(backendArg))
+    throw new ConfirmBackendNotBcdevError(backendArg);
   // R586 (T16): v3 runs on Linux and (fork) Windows only.
   if (backendArg === "al-runner-v3") {
     refuseV3Platform();
@@ -2490,9 +2618,19 @@ export function parseCliConfig(argv: readonly string[]): CliConfig {
     ...(values["allow-large-run"] === true ? { allowLargeRun: true } : {}),
     ...(values["retry-stranded"] === true ? { retryStranded: true } : {}),
     ...(values["stop-hung-sessions"] === true ? { stopHungSessions: true } : {}),
+    ...(values["keep-company-tests"] === true ? { keepCompanyTests: true } : {}),
     ...(values["fresh-probe"] === true ? { freshProbe: true } : {}),
     ...(values["isolate-tests"] === true ? { isolateTests: true } : {}),
     ...(values["fail-on-survivors"] === true ? { failOnSurvivors: true as const } : {}),
+    ...(confirmFrom !== undefined
+      ? {
+          confirm: {
+            path: confirmFrom,
+            ...(confirmSample !== undefined ? { sample: confirmSample } : {}),
+            ...(confirmSeed !== undefined ? { seed: confirmSeed } : {}),
+          },
+        }
+      : {}),
     ...(values["isolate-tests"] === true && values.workers !== undefined
       ? { baselineProcesses: workers }
       : {}),
@@ -3230,6 +3368,108 @@ export function pinV3Binary(parsed: RunCliConfig, config: LethalConfigFile): Let
 }
 
 /**
+ * PR-144: `SessionConfig.recheck` for a v3 run unless `alRunnerV3.recheckWithheldKills` is `false` (on by
+ * default, PR-182), else `undefined`. The nested session is the main pass's own config (the pinned binary and sidecar, R1018) with
+ * `isolation` forced to `"method"`, on a fresh backend and an in-memory store, narrowed to the targets'
+ * exact sites and covering tests, under the recheck's own budget. It carries no `recheck`, no `resume` and
+ * no event subscriber of the main run: its events never reach the main stream.
+ */
+export function v3RecheckOf(a: {
+  readonly parsed: RunCliConfig;
+  readonly effectiveConfig: LethalConfigFile;
+  readonly mainConfig: SessionConfig;
+  readonly build: (config: LethalConfigFile, scratchDir: string) => Promise<ExecutionBackend>;
+  readonly runSession: (cfg: SessionConfig) => Promise<SessionReport>;
+  readonly newStore: () => ResultsStore;
+  readonly scratchRoot: string;
+}): SessionConfig["recheck"] | undefined {
+  if (a.parsed.backendKind !== "al-runner-v3") return undefined;
+  // PR-182: an absent key means the config parser's default (on). No section: `buildBackend` refuses it by name.
+  const raw = a.effectiveConfig.alRunnerV3;
+  if (typeof raw !== "object" || raw === null) return undefined;
+  // An explicit opt-out needs no validation here either: `buildBackend` judges the section.
+  if ((raw as { recheckWithheldKills?: unknown }).recheckWithheldKills === false) return undefined;
+  const section = validateAlRunnerV3Config(raw);
+  if (!section.recheckWithheldKills) return undefined;
+  const runner: RecheckRunner = async (req) => {
+    const methodConfig: LethalConfigFile = {
+      ...a.effectiveConfig,
+      alRunnerV3: { ...(a.effectiveConfig.alRunnerV3 as object), isolation: "method" },
+    };
+    const {
+      recheck: _recheck,
+      resume: _resume,
+      retryStranded: _retryStranded,
+      skipKnownSurvivors: _skip,
+      // PR-171: the nested run is narrowed to the targets' exact sites, which `--confirm-from` refuses.
+      confirm: _confirm,
+      lines: _lines,
+      changedSince: _changedSince,
+      emit: _emit,
+      timeBudgetSeconds: _budget,
+      backend: _backend,
+      store: _store,
+      instrumentedDir: _dir,
+      // excludeTests stays in `base` (R488: the excluded look-alike tests are excluded in the nested run too).
+      ...base
+    } = a.mainConfig;
+    const lines: LineRange[] = req.targets.map((t) => ({
+      file: t.mutant.file.replaceAll("\\", "/"),
+      start: t.mutant.startLine,
+      end: t.mutant.startLine,
+    }));
+    const exactSites = new Set(req.targets.map((t) => recheckSiteKey(t.mutant)));
+    const backend = await a.build(methodConfig, join(a.scratchRoot, "recheck"));
+    const store = a.newStore();
+    const events: RunEvent[] = [];
+    try {
+      const report = await a.runSession({
+        ...base,
+        backend,
+        store,
+        instrumentedDir: join(a.scratchRoot, "recheck-instrumented"),
+        emit: [(e) => events.push(e)],
+        lines,
+        exactSites,
+        keepOnlyTests: req.tests,
+        timeBudgetSeconds: req.budgetSeconds,
+      });
+      const ctx = report.validity.executionContexts.find((c) => c.binarySha256 !== undefined);
+      return {
+        rows: report.mutants,
+        baseline: events.flatMap((e) =>
+          e.type === "baseline-batch-finished"
+            ? e.verdicts.map((v) => ({ name: v.name, outcome: v.outcome }))
+            : [],
+        ),
+        baselineElapsedMs: events.reduce(
+          (n, e) => (e.type === "phase-left" && e.phase === "baseline" ? n + e.elapsedMs : n),
+          0,
+        ),
+        identity: {
+          ...(ctx?.runnerBuild !== undefined ? { version: ctx.runnerBuild } : {}),
+          ...(ctx?.binarySha256 !== undefined ? { binarySha256: ctx.binarySha256 } : {}),
+          ...(report.sourceSha256 !== undefined ? { sourceSha256: report.sourceSha256 } : {}),
+          ...(report.dependencySourceSha256 !== undefined
+            ? { dependencySourceSha256: report.dependencySourceSha256 }
+            : {}),
+        },
+      };
+    } finally {
+      try {
+        store.close();
+        await backend.close?.();
+      } catch (err) {
+        console.warn(
+          `[lethal] recheck cleanup failed (best-effort): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  };
+  return { budgetSeconds: section.recheckBudgetSeconds, runner };
+}
+
+/**
  * Runs Task 6's `startEnvToolSession` lifecycle EXACTLY ONCE for a `run` invocation and returns a
  * `LethalConfigFile` with `bcdev` substituted by the resolved section — the object `buildBackend`,
  * `leaseSessionFor`, and `resourceIdentityFor` all read `configFile.bcdev` from (each calls
@@ -3250,6 +3490,21 @@ export function pinV3Binary(parsed: RunCliConfig, config: LethalConfigFile): Let
  * function is the only caller in `cli.ts`, and it always validates immediately before starting,
  * so that ordering holds on every path that reaches it.
  */
+export function validateEnvToolSection(configFile: LethalConfigFile): EnvToolConfigSection {
+  // Item 6 (final review): see `resolveEnvToolSession`. PR-194: pure (config and process.env), so a
+  // dry run calls it too.
+  const bcdevRaw = configFile.bcdev ?? {};
+  const bcdevDeclaredKeys = (READS_KEYS as readonly string[]).filter((key) => {
+    const v = (bcdevRaw as Record<string, unknown>)[key];
+    return typeof v === "string" && v !== "";
+  });
+  return validateEnvToolConfig(configFile.envTool, {
+    env: process.env,
+    hasPackageCachePath: Boolean(configFile.bcdev?.packageCachePath),
+    bcdevDeclaredKeys,
+  });
+}
+
 export async function resolveEnvToolSession(
   parsed: RunCliConfig,
   configFile: LethalConfigFile,
@@ -3279,15 +3534,7 @@ export async function resolveEnvToolSession(
   // its own to check that against, so the overlap is computed here, from the SAME raw bcdev
   // section `startEnvToolSession` below reads, and handed in as plain key names.
   const bcdevRaw = configFile.bcdev ?? {};
-  const bcdevDeclaredKeys = (READS_KEYS as readonly string[]).filter((key) => {
-    const v = (bcdevRaw as Record<string, unknown>)[key];
-    return typeof v === "string" && v !== "";
-  });
-  const envCfg = validateEnvToolConfig(configFile.envTool, {
-    env: process.env,
-    hasPackageCachePath: Boolean(configFile.bcdev?.packageCachePath),
-    bcdevDeclaredKeys,
-  });
+  const envCfg = validateEnvToolSection(configFile);
   const makeClient =
     deps.makeClient ??
     ((cfg: EnvToolConfigSection) => new EnvToolClient(cfg, undefined, parsed.projectDir));
@@ -3356,6 +3603,155 @@ export async function v3CoverageMode(
 }
 
 /**
+ * PR-194 (R1133): every refusal a real run makes from the config, the files it names and the flags
+ * alone, before it builds or spawns anything. ONE function: `buildBackend` calls it where it
+ * refused before, and `lethal run --dry-run` calls it too, so the two refuse by the same error
+ * names and texts. It spawns nothing and calls no server. What needs the al-runner binary
+ * (`--version`, the `.gated` pin check, R814) or a server is NOT here.
+ *
+ * `envToolDeployed`: a deploy came from an env-tool session. `deferBcdevSection`: the bcdev
+ * section is filled in by provisioning (`envTool`), so a dry run cannot judge it.
+ */
+export async function preflightRunConfig(a: {
+  readonly parsed: Pick<BackendInputs, "backendKind" | "projectDir">;
+  readonly configFile: LethalConfigFile;
+  readonly selectorIds: SelectorConfig;
+  readonly source?: ReadonlyMap<string, Buffer> | undefined;
+  readonly resolvedProbing?: ResolvedAssemblyProbingPaths | undefined;
+  readonly alToolPaths?: typeof defaultAlToolPaths;
+  readonly alcRunnable?: ((p: string) => boolean) | undefined;
+  readonly envToolDeployed?: boolean;
+  readonly deferBcdevSection?: boolean;
+}): Promise<{
+  readonly preprocessorSymbols: readonly string[];
+  readonly probing: ResolvedAssemblyProbingPaths;
+  readonly v3?: {
+    readonly c: ReturnType<typeof validateAlRunnerV3Config>;
+    readonly environmentChoice: Awaited<ReturnType<typeof chooseV3Environment>>;
+    readonly license: Awaited<ReturnType<typeof readLicenseIdentity>> | undefined;
+    readonly alcPath: string;
+  };
+  readonly bcdev?: {
+    readonly c: BcDevConfigSection;
+    readonly alcPath: string;
+    readonly altoolPath: string | undefined;
+  };
+}> {
+  const { parsed, configFile } = a;
+  const alToolPaths = a.alToolPaths ?? defaultAlToolPaths;
+  // R101(c): validated FIRST, for both backends, before anything is constructed — a typo'd symbol
+  // list must fail immediately rather than after a compile that silently used the other branch.
+  const preprocessorSymbols = validatePreprocessorSymbols(configFile.preprocessorSymbols);
+  // R900: a missing folder is refused by name instead of surfacing later as AL0451 in every batch.
+  const probing =
+    a.resolvedProbing ?? (await assemblyProbingPathsFor(parsed.projectDir, configFile));
+  if (parsed.backendKind === "al-runner-v3") {
+    refuseV3Platform();
+    // R888: the run's first check (runFromCli) already warned about unreadable packages; stay quiet.
+    await validateSelectorIdsForProject(parsed.projectDir, a.selectorIds, a.source, {
+      packageDirs: configuredPackageCaches(configFile),
+      warn: () => {},
+    });
+    const c = validateAlRunnerV3Config(configFile.alRunnerV3);
+    // R938: the target project (the dir LethAL runs), not the tests dir. Refuses by name when the
+    // environment is unknown (owner's ruling A), before the version check, alc or any compile.
+    const environmentChoice = await chooseV3Environment(parsed.projectDir, c.environment);
+    // R956: the license file is read (and hashed) here, before anything runs; unreadable is refused by name.
+    const license = c.license !== undefined ? await readLicenseIdentity(c.license) : undefined;
+    await assertBcVersionMatchesPackages(c.packagesDir, c.bcVersion);
+    if (c.alcPath !== undefined) assertAlcRunnable(c.alcPath, a.alcRunnable);
+    const alcPath = c.alcPath ?? (await alToolPaths())?.alcPath;
+    if (alcPath === undefined) {
+      throw new Error(
+        'could not locate alc under the AL Language VS Code extension install; --backend al-runner-v3 compiles every batch with alc before v3 runs it (R586). Install the extension, or set "alRunnerV3.alcPath".',
+      );
+    }
+    return { preprocessorSymbols, probing, v3: { c, environmentChoice, license, alcPath } };
+  }
+
+  if (a.deferBcdevSection === true) {
+    // The bcdev fields come from provisioning, but the envTool section and the alc lookup do not.
+    validateEnvToolSection(configFile);
+    assertBcdevToolsLocated(configFile.bcdev ?? {}, await alToolPaths(), true);
+    await validateSelectorIdsForProject(parsed.projectDir, a.selectorIds, a.source, {
+      packageDirs: configuredPackageCaches(configFile),
+      warn: () => {},
+    });
+    return { preprocessorSymbols, probing };
+  }
+  const c = validateBcDevConfig(configFile.bcdev);
+  // Important 3 (Task 7 review): a worker backend that silently drops `envToolDeploy` would build
+  // a `ContainerDeployer` and publish via altool to an env-tool-provisioned HTTPS environment —
+  // exactly the plausible-silent-default this project forbids. Every caller building a bcdev
+  // backend for a config with an `envTool` section MUST thread `deploy` through; a call site that
+  // forgets throws here, loudly, rather than silently falling back to altool. Checked BEFORE any
+  // I/O (`defaultAlToolPaths`, `mkdir`) so this is reachable without a real alc/altool install.
+  const envToolDeploy = a.envToolDeployed === true;
+  if (configFile.envTool !== undefined && !envToolDeploy) {
+    throw new Error(
+      "buildBackend: bcdev config has an `envTool` section configured but no env-tool deploy was " +
+        "supplied — refusing to fall back to ContainerDeployer/altool, which would silently " +
+        "publish outside the configured environment tool",
+    );
+  }
+  const resolved = assertBcdevToolsLocated(c, await alToolPaths(), envToolDeploy);
+  // R3/R4: validated after alc/altool are confirmed present (so the "could not locate..." guard
+  // above still fires first when BOTH are wrong) but before any compiler touches the target.
+  await validateSelectorIdsForProject(parsed.projectDir, a.selectorIds, a.source, {
+    packageDirs: configuredPackageCaches(configFile),
+    warn: () => {},
+  });
+  return {
+    preprocessorSymbols,
+    probing,
+    bcdev: { c, alcPath: resolved.alcPath, altoolPath: resolved.altoolPath },
+  };
+}
+
+/**
+ * PR-194: the bcdev alc/altool lookup, shared by `preflightRunConfig` and, for an `envTool` run, by
+ * `runFromCliWithAccept` BEFORE it provisions a billed environment. Reads only `alcPath`/`altoolPath`
+ * of the bcdev section and the AL extension folder. Returns the resolved paths, alc defined.
+ */
+export function assertBcdevToolsLocated(
+  c: Pick<BcDevConfigSection, "alcPath" | "altoolPath">,
+  toolPaths: { readonly alcPath: string; readonly altoolPath: string } | undefined,
+  envToolDeploy: boolean,
+): { readonly alcPath: string; readonly altoolPath: string | undefined } {
+  const resolved = resolveAlToolPaths(c, toolPaths);
+  // R43/R64: a configured `alcPath`/`altoolPath` SATISFIES the requirement below — the gate exists
+  // to catch "no AL compiler/publisher anywhere", and an explicit path is one. Compilation is
+  // always local, so alc is required everywhere; altool is spawned only by `ContainerDeployer`
+  // (the non-envTool branch of `deployerFor`).
+  if (resolved.alcPath === undefined) {
+    // R21: the env-tool publish path never touches altool, so naming it there would be a confusing gate.
+    if (envToolDeploy) {
+      throw new Error(
+        "could not locate alc.exe under the AL Language VS Code extension install " +
+          "(~/.vscode/extensions/ms-dynamics-smb.al-*); alc.exe is required because compilation " +
+          "is always local, even when publishing through envTool — install the AL extension, or " +
+          "set bcdev.alcPath",
+      );
+    }
+    throw new Error(
+      "could not locate alc.exe/altool.exe under the AL Language VS Code extension install " +
+        "(~/.vscode/extensions/ms-dynamics-smb.al-*); install the extension, set bcdev.alcPath " +
+        "and bcdev.altoolPath",
+    );
+  }
+  // R64: the container publish path spawns altool, so a pinned `alcPath` alone must NOT wave it
+  // through to fail later at publish time.
+  if (!envToolDeploy && resolved.altoolPath === undefined) {
+    throw new Error(
+      "could not locate altool.exe under the AL Language VS Code extension install " +
+        "(~/.vscode/extensions/ms-dynamics-smb.al-*); publishing to a container spawns altool — " +
+        "install the extension, or set bcdev.altoolPath",
+    );
+  }
+  return { alcPath: resolved.alcPath, altoolPath: resolved.altoolPath };
+}
+
+/**
  * R586 (plan r2 §9): the al-runner-v3 backend from the `alRunnerV3` section. Sequential. The
  * transport is serve-entries where proven and one-shot otherwise (R761), unless the config names
  * one. Coverage is turned off (with a warning) by `v3CoverageMode`.
@@ -3365,9 +3761,8 @@ async function buildAlRunnerV3Backend(
   configFile: LethalConfigFile,
   scratchDir: string,
   deps: {
-    readonly alToolPaths: typeof defaultAlToolPaths;
-    /** R834: replaces the check that `alRunnerV3.alcPath` is executable. Injected by tests. */
-    readonly alcRunnable?: (p: string) => boolean;
+    /** PR-194: what `preflightRunConfig` resolved for v3. */
+    readonly v3: NonNullable<Awaited<ReturnType<typeof preflightRunConfig>>["v3"]>;
     readonly spawn?: SpawnFn;
     /** R635: the serve-entries daemon's spawn. */
     readonly serverSpawn?: ServerSpawnFn;
@@ -3382,26 +3777,8 @@ async function buildAlRunnerV3Backend(
     readonly assemblyProbingPaths: readonly string[];
   },
 ): Promise<ExecutionBackend> {
-  refuseV3Platform();
-  // R888: the run's first check (runFromCli) already warned about unreadable packages; stay quiet.
-  await validateSelectorIdsForProject(parsed.projectDir, deps.selectorIds, deps.source, {
-    packageDirs: configuredPackageCaches(configFile),
-    warn: () => {},
-  });
-  const c = validateAlRunnerV3Config(configFile.alRunnerV3);
-  // R938: the target project (the dir LethAL runs), not the tests dir. Refuses by name when the
-  // environment is unknown (owner's ruling A), before the version check, alc or any compile.
-  const environmentChoice = await chooseV3Environment(parsed.projectDir, c.environment);
-  // R956: the license file is read (and hashed) here, before anything runs; unreadable is refused by name.
-  const license = c.license !== undefined ? await readLicenseIdentity(c.license) : undefined;
-  await assertBcVersionMatchesPackages(c.packagesDir, c.bcVersion);
-  if (c.alcPath !== undefined) assertAlcRunnable(c.alcPath, deps.alcRunnable);
-  const alcPath = c.alcPath ?? (await deps.alToolPaths())?.alcPath;
-  if (alcPath === undefined) {
-    throw new Error(
-      'could not locate alc under the AL Language VS Code extension install; --backend al-runner-v3 compiles every batch with alc before v3 runs it (R586). Install the extension, or set "alRunnerV3.alcPath".',
-    );
-  }
+  // PR-194: the config refusals ran in `preflightRunConfig`; this takes what they resolved.
+  const { c, environmentChoice, license, alcPath } = deps.v3;
   const { mode: coverage, offFiles: coverageOffFiles } = await v3CoverageMode(
     c.coverage,
     parsed.projectDir,
@@ -3495,20 +3872,26 @@ export async function buildBackend(
   /** R900: the list `runFromCli` resolved before provisioning; absent, resolved here. */
   resolvedProbing?: ResolvedAssemblyProbingPaths,
 ): Promise<ExecutionBackend> {
-  // R101(c): validated FIRST, for both backends, before anything is constructed — a typo'd symbol
-  // list must fail immediately rather than after a compile that silently used the other branch.
-  const preprocessorSymbols = validatePreprocessorSymbols(configFile.preprocessorSymbols);
-  // R900: checked before anything is built: a missing folder is refused by name instead of
-  // surfacing later as AL0451 in every batch.
-  const probing = resolvedProbing ?? (await assemblyProbingPathsFor(parsed.projectDir, configFile));
+  // PR-194: every config refusal, in the one function `--dry-run` calls too.
+  const pre = await preflightRunConfig({
+    parsed,
+    configFile,
+    selectorIds,
+    source,
+    resolvedProbing,
+    ...(deps.alToolPaths !== undefined ? { alToolPaths: deps.alToolPaths } : {}),
+    alcRunnable: deps.alcRunnable,
+    envToolDeployed: envToolDeploy !== undefined,
+  });
+  const { preprocessorSymbols, probing } = pre;
   const assemblyProbingPaths = probing.paths;
   if (assemblyProbingPaths.length > 0) {
     console.warn(`[lethal] alc assembly probing paths: ${describeAssemblyProbingPaths(probing)}`);
   }
   if (parsed.backendKind === "al-runner-v3") {
+    if (pre.v3 === undefined) throw new Error("preflightRunConfig returned no v3 section");
     return buildAlRunnerV3Backend(parsed, configFile, scratchDir, {
-      alToolPaths: deps.alToolPaths ?? defaultAlToolPaths,
-      ...(deps.alcRunnable !== undefined ? { alcRunnable: deps.alcRunnable } : {}),
+      v3: pre.v3,
       ...(deps.alRunnerSpawn !== undefined ? { spawn: deps.alRunnerSpawn } : {}),
       ...(deps.alRunnerServerSpawn !== undefined ? { serverSpawn: deps.alRunnerServerSpawn } : {}),
       ...(deps.alRunnerCandidate === true ? { candidate: true as const } : {}),
@@ -3522,72 +3905,10 @@ export async function buildBackend(
     });
   }
 
-  const c = validateBcDevConfig(configFile.bcdev);
-
-  // Important 3 (Task 7 review): a worker backend that silently drops `envToolDeploy` would build
-  // a `ContainerDeployer` and publish via altool to an env-tool-provisioned HTTPS environment —
-  // exactly the plausible-silent-default this project forbids. Every caller building a bcdev
-  // backend for a config with an `envTool` section MUST thread `deploy` through; a call site that
-  // forgets throws here, loudly, rather than silently falling back to altool. Checked BEFORE any
-  // I/O (`defaultAlToolPaths`, `mkdir`) so this is reachable without a real alc/altool install.
-  if (configFile.envTool !== undefined && envToolDeploy === undefined) {
-    throw new Error(
-      "buildBackend: bcdev config has an `envTool` section configured but no env-tool deploy was " +
-        "supplied — refusing to fall back to ContainerDeployer/altool, which would silently " +
-        "publish outside the configured environment tool",
-    );
-  }
-
-  const alToolPaths = deps.alToolPaths ?? defaultAlToolPaths;
-  const toolPaths = await alToolPaths();
-  const resolved = resolveAlToolPaths(c, toolPaths);
-  // R43/R64: a configured `alcPath`/`altoolPath` SATISFIES the requirement below — the gate exists
-  // to catch "no AL compiler/publisher anywhere", and an explicit path is one. Which of the two a
-  // session actually needs depends on the publish route, so the gate asks for exactly those:
-  // compilation is always local, so alc is required everywhere; altool is spawned only by
-  // `ContainerDeployer` (the non-envTool branch of `deployerFor`).
-  if (resolved.alcPath === undefined) {
-    // R21: the env-tool publish path (`envToolDeploy` defined, `deployerFor` below takes the
-    // env-tool branch) never constructs a `ContainerDeployer` and so never touches
-    // `toolPaths.altoolPath` — altool.exe is irrelevant there. `alc.exe` is still genuinely
-    // required on EVERY path: compilation is always local, env-tool or not. Naming altool.exe as
-    // a requirement on a path that never uses it is a confusing gate for an install that only
-    // has the AL compiler and not the (server-publish-only) altool binary.
-    if (envToolDeploy !== undefined) {
-      throw new Error(
-        "could not locate alc.exe under the AL Language VS Code extension install " +
-          "(~/.vscode/extensions/ms-dynamics-smb.al-*); alc.exe is required because compilation " +
-          "is always local, even when publishing through envTool — install the AL extension, or " +
-          "set bcdev.alcPath",
-      );
-    }
-    throw new Error(
-      "could not locate alc.exe/altool.exe under the AL Language VS Code extension install " +
-        "(~/.vscode/extensions/ms-dynamics-smb.al-*); install the extension, set bcdev.alcPath " +
-        "and bcdev.altoolPath",
-    );
-  }
-  // R64: the container publish path spawns altool, so a pinned `alcPath` alone must NOT wave it
-  // through to fail later at publish time — but a pinned `altoolPath` genuinely satisfies it, the
-  // same way `alcPath` satisfies the compiler half. Before that override existed this branch was
-  // unreachable (no extension meant no alc either), which is why the message is separate: "install
-  // the extension" is unhelpful advice for someone who did pin a compiler and nothing else.
-  if (envToolDeploy === undefined && resolved.altoolPath === undefined) {
-    throw new Error(
-      "could not locate altool.exe under the AL Language VS Code extension install " +
-        "(~/.vscode/extensions/ms-dynamics-smb.al-*); publishing to a container spawns altool — " +
-        "install the extension, or set bcdev.altoolPath",
-    );
-  }
-  // R3/R4: validated here — after alc/altool are confirmed present (so the "could not locate..."
-  // guard above still fires first when BOTH conditions are wrong, matching this function's prior
-  // error-priority for an incomplete install) but before any compiler/deployer object touches the
-  // target project, and well before an actual `alc` invocation would burn a live BC round trip on
-  // an AL0297.
-  await validateSelectorIdsForProject(parsed.projectDir, selectorIds, source, {
-    packageDirs: configuredPackageCaches(configFile),
-    warn: () => {},
-  });
+  const { bcdev } = pre;
+  if (bcdev === undefined) throw new Error("preflightRunConfig returned no bcdev section");
+  const { c } = bcdev;
+  const resolved = { alcPath: bcdev.alcPath, altoolPath: bcdev.altoolPath };
   const outputDir = join(scratchDir, "publish");
   await mkdir(outputDir, { recursive: true });
   const compiler = new ArtifactCompiler(
@@ -3729,6 +4050,40 @@ export function permissionCanaryFor(
   if (parsed.backendKind !== "bcdev") return {};
   const client = new PermissionCanaryClient(odataCfgFor(validateBcDevConfig(configFile.bcdev)));
   return { permissionCanary: () => runPermissionCanary(client) };
+}
+
+/**
+ * PR-132 (R1113): printed by a bcdev dry run beside its `tests:` line. The baseline runs the whole test app, and one test that
+ * hangs there quarantines the run, even when `--only` narrows the target to one file.
+ */
+export const BASELINE_WHOLE_SUITE_NOTE =
+  "  the baseline runs every test in it; one test that hangs quarantines the whole run (R1113). --tests-only <glob> narrows the baseline when you know the covering tests (it can change a verdict).";
+
+/** The dry run's `tests:` line, and on bcdev (where a hang quarantines the run) the whole-suite note. */
+export function dryRunTestsLines(backendKind: string | undefined, testDir: string): string[] {
+  const head = `tests: ${testDir} (the real run tests with this app; a dry run runs none)`;
+  return backendKind === "bcdev" ? [head, BASELINE_WHOLE_SUITE_NOTE] : [head];
+}
+
+/**
+ * PR-132 (R1113): the way back from a quarantined bcdev run, with the run's own server, instance and config, printed after
+ * "kept scratch folder". Step 1 applies only when the quarantine message asked for a service-tier restart (R658).
+ */
+export function quarantineRecoverySteps(o: {
+  readonly quarantined: boolean;
+  readonly server: string | undefined;
+  readonly instance: string | undefined;
+  readonly configPath: string;
+}): string[] {
+  // Only a quarantined run on a known bcdev tier has a way back to print (al-runner has no tier).
+  if (!o.quarantined || o.server === undefined || o.instance === undefined) return [];
+  return [
+    "[lethal] the run is quarantined. To recover:",
+    `  1. If the message above says the lease must not be trusted until an NST restart (R658), restart the BC service tier of ${o.server} / ${o.instance} first.`,
+    `  2. lethal force-reset-lease --server ${o.server} --instance ${o.instance} --config ${o.configPath}`,
+    `  3. lethal clear-quarantine --config ${o.configPath}`,
+    "  4. Run again. If the test that hung is outside your scope, leave it out with --exclude-test <Codeunit.Method>, or run only the covering tests at baseline with --tests-only <glob>. Both can change a verdict; the report flags 'tests-narrowed'.",
+  ];
 }
 
 export function resourceIdentityFor(
@@ -4395,6 +4750,14 @@ export async function runFromCliWithAccept(
   } else {
     await removeScratchQuietly(scratchRoot);
   }
+  // PR-132 (R1113): the way back, with this run's own server, instance and config.
+  for (const line of quarantineRecoverySteps({
+    quarantined,
+    server: tier.resourceServer,
+    instance: tier.resourceServerInstance,
+    configPath: given.configPath,
+  }))
+    console.warn(line);
   // PR-79: from the snapshot the run parsed, never from disk.
   // An error here must not lose the finished run: it comes back beside the report, and `main`
   // prints it and refuses to pass (exit 1 unless the report's own code is 3, 4 or 7).
@@ -4521,7 +4884,8 @@ export async function runFromCliWithAccept(
             // examined yet.
             const equivalenceMarks = await loadEquivalenceMarks(parsed.projectDir);
             // PR-100: folds the run's events into the TIMING section printed once, below.
-            const timingFold = createTimingFold();
+            // R1119: the in-process events carry no atMs, so the fold reads this clock for the lane line
+            const timingFold = createTimingFold({ now: () => performance.now() });
             runTimingFold = timingFold;
             const emitSubscribers: EventSubscriber[] = [
               progress,
@@ -4545,11 +4909,20 @@ export async function runFromCliWithAccept(
             if (parsed.progressOutPath !== undefined) {
               progressOutFd = openSync(parsed.progressOutPath, "w");
               const fd = progressOutFd;
-              emitSubscribers.push(createNdjsonSink((chunk) => writeSync(fd, chunk)));
+              const opened = performance.now(); // PR-121: each line's `atMs`
+              emitSubscribers.push(
+                createNdjsonSink(
+                  (chunk) => writeSync(fd, chunk),
+                  () => performance.now() - opened,
+                ),
+              );
             }
             // R360: kept for the scratch-folder decision after the session, see above.
             tier = resourceIdentityFor(parsed, effectiveConfig);
-            report = await runTheSession({
+            // PR-171: the v3 report `--confirm-from` selects from, read once here.
+            const confirmInput =
+              parsed.confirm === undefined ? undefined : await readConfirmFile(parsed.confirm.path);
+            const mainConfig: SessionConfig = {
               backend,
               store,
               projectDir: parsed.projectDir,
@@ -4583,6 +4956,7 @@ export async function runFromCliWithAccept(
                 : {}),
               ...(parsed.testsOnly !== undefined ? { testsOnly: parsed.testsOnly } : {}),
               ...(parsed.excludeTests !== undefined ? { excludeTests: parsed.excludeTests } : {}),
+              ...(parsed.keepCompanyTests === true ? { keepCompanyTests: true } : {}),
               ...(parsed.maxGuardsPerBatch !== undefined
                 ? { maxGuardsPerBatch: parsed.maxGuardsPerBatch }
                 : {}),
@@ -4597,6 +4971,19 @@ export async function runFromCliWithAccept(
                 : {}),
               ...(parsed.groupRuns !== undefined ? { groupRuns: parsed.groupRuns } : {}),
               ...(parsed.resume !== undefined ? { resume: parsed.resume } : {}),
+              ...(parsed.confirm !== undefined && confirmInput !== undefined
+                ? {
+                    confirm: {
+                      inputPath: parsed.confirm.path,
+                      input: confirmInput.value,
+                      inputSha256: confirmInput.sha256,
+                      ...(parsed.confirm.sample !== undefined
+                        ? { sample: parsed.confirm.sample }
+                        : {}),
+                      ...(parsed.confirm.seed !== undefined ? { seed: parsed.confirm.seed } : {}),
+                    },
+                  }
+                : {}),
               ...(parsed.retryStranded === true ? { retryStranded: true } : {}),
               ...(parsed.stopHungSessions === true ? { stopHungSessions: true } : {}),
               ...(equivalenceMarks !== undefined ? { equivalenceMarks } : {}),
@@ -4619,7 +5006,21 @@ export async function runFromCliWithAccept(
               ...tier,
               ...leaseSessionFor(parsed, effectiveConfig),
               ...permissionCanaryFor(parsed, effectiveConfig),
+            };
+            // PR-144: the withheld-kill recheck (on by default), from the run's pinned config.
+            const recheck = v3RecheckOf({
+              parsed,
+              effectiveConfig,
+              mainConfig,
+              build: (cfg, dir) =>
+                build(parsed, cfg, dir, deploy, {}, selectorIds, source, probing),
+              runSession: runTheSession,
+              newStore: () => new ResultsStore(":memory:"),
+              scratchRoot,
             });
+            report = await runTheSession(
+              recheck !== undefined ? { ...mainConfig, recheck } : mainConfig,
+            );
           } finally {
             // Best-effort cleanup — mirrors orchestrator.ts's own posture (~line 2056: "deliberately
             // swallow errors here... a failure here must not mask/replace whatever real error is already
@@ -5652,6 +6053,82 @@ export async function buildDoctorDeps(
     return { dependencies };
   };
 
+  // PR-128 (R1110): every package in the cache (not only direct dependencies) that declares a
+  // text-optimized field, with its installed versions on the server read by id.
+  const textSearchDependencies = async (): Promise<TextSearchDependenciesProbe> => {
+    if (projectDirForDeps === undefined) {
+      return {
+        skip: "pass --project <dir> to scan the package cache for dependencies that need SQL Server Full-Text Search",
+      };
+    }
+    if (cachePath === undefined || cachePath === "") {
+      return { skip: 'the config names no "bcdev.packageCachePath" to look for packages in' };
+    }
+    if (configFile.envTool !== undefined) {
+      return {
+        skip: "this config has an envTool section; its server is reached through the tool, and doctor does not read installed extensions there",
+      };
+    }
+    let walked: Awaited<ReturnType<typeof walkFiles>> | undefined;
+    try {
+      walked = await walkFiles(cachePath, { links: "yield-files" });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    // Only the project's dependency closure counts: a leftover package in the cache is not published.
+    const target = await readAppJsonDependencies(join(projectDirForDeps, "app.json"));
+    const roots = [...target.dependencies];
+    if (testsDir !== undefined) {
+      const tests = await readAppJsonDependencies(join(testsDir, "app.json"));
+      const targetId = target.id?.toLowerCase();
+      roots.push(...tests.dependencies.filter((d) => d.id.toLowerCase() !== targetId));
+    }
+    const scope =
+      testsDir === undefined
+        ? "the target only (pass --tests to include the test app)"
+        : "the target and the test app";
+    const cached: CachedPackage[] = [];
+    const unread: string[] = [];
+    for (const rel of walked?.files ?? []) {
+      if (!rel.toLowerCase().endsWith(".app")) continue;
+      try {
+        cached.push(
+          readCachedPackage(await readFile(walked?.resolved.get(rel) ?? join(cachePath, rel))),
+        );
+      } catch {
+        unread.push(rel);
+      }
+    }
+    const closure = dependencyClosure(roots, cached);
+    const noSymbols = closure
+      .filter((p) => p.fields === undefined)
+      .map((p) => `${p.name} ${p.version}`);
+    const found: TextSearchApp[] = closure.flatMap((p) =>
+      p.fields !== undefined && p.fields.length > 0 ? [{ ...p, fields: p.fields }] : [],
+    );
+    const verifier =
+      found.length === 0 || opts.installedVersions !== undefined
+        ? undefined
+        : await harnessVerifierFor();
+    const read =
+      opts.installedVersions ??
+      (async (id: string) => (verifier as HarnessVerifier).fetchInstalledVersions(id));
+    const apps: (TextSearchApp & { installed: readonly string[] })[] = [];
+    for (const app of found) {
+      try {
+        apps.push({ ...app, installed: await read(app.id) });
+      } catch (err) {
+        if (err instanceof ApiBaseUnsetError || err instanceof UnfilteredExtensionsQueryError) {
+          throw err;
+        }
+        throw new Error(
+          `cannot read the installed versions of ${app.name} (${app.id}) on the server: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    return { cachePath, apps, unread, noSymbols, scope };
+  };
+
   // R1086: the variable NAMES and whether each is set; never a value.
   const credentialsEnvCheck =
     configFile.bcdev?.credentialsEnv === undefined
@@ -5687,6 +6164,7 @@ export async function buildDoctorDeps(
       ...(alcRuntime !== undefined ? { alcRuntime } : {}),
       dependencies,
       serverDependencies,
+      textSearchDependencies,
       ...(credentialsEnvCheck !== undefined ? { credentialsEnv: credentialsEnvCheck } : {}),
       ...(v3Check !== undefined ? { alRunnerV3: v3Check } : {}),
       ...(v3EnvCheck !== undefined ? { alRunnerV3Environment: v3EnvCheck } : {}),
@@ -6033,6 +6511,37 @@ export async function doctorFromCli(
  * `MalformedReportError`'s own message. There is no "explained what it could" path, deliberately —
  * see `assertExplainableReport`.
  */
+/** PR-171: read one report file for `confirm-merge`; its bytes' sha256 is the join the merge checks. */
+async function readConfirmFile(path: string): Promise<{ value: unknown; sha256: string }> {
+  const bytes = await readFile(path);
+  try {
+    return { value: JSON.parse(bytes.toString("utf8")), sha256: sha256Hex(bytes) };
+  } catch (err) {
+    throw new ConfirmInputNotReportError(
+      `${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * PR-171 (R1122): `lethal confirm-merge <v3.json> <bc.json> --out <file>`. Every join refusal is
+ * made before the output is written, so a refused merge leaves no artifact behind.
+ */
+export async function confirmMergeFromCli(parsed: ConfirmMergeCliConfig): Promise<number> {
+  const v3 = await readConfirmFile(parsed.v3Path);
+  const bc = await readConfirmFile(parsed.bcPath);
+  const confirmation: Confirmation = mergeConfirmation({
+    v3: v3.value,
+    v3Sha256: v3.sha256,
+    bc: bc.value,
+    bcSha256: bc.sha256,
+  });
+  await writeFile(parsed.outPath, `${JSON.stringify(confirmation, null, 2)}\n`, "utf8");
+  console.log(`wrote ${parsed.outPath}`);
+  for (const line of renderConfirmation(confirmation)) console.log(line);
+  return 0;
+}
+
 /**
  * R178: `lethal export`. Projects a finished report into the Stryker interchange schema and,
  * optionally, the self-contained HTML a CI system renders.
@@ -6577,7 +7086,45 @@ export async function dryRunFromCli(parsed: DryRunCliConfig): Promise<number> {
         `--tests ${parsed.testDir}: no such folder (a dry run runs no test, but checks the folder it names)`,
       );
     }
-    console.log(`tests: ${parsed.testDir} (the real run tests with this app; a dry run runs none)`);
+    for (const line of dryRunTestsLines(parsed.backendKind, parsed.testDir)) console.log(line);
+    // PR-197 (R1113 fix 2): over the whole suite; the dry run applies no test filter.
+    try {
+      // Discovery's tree finder (R420/R424) parses a file whose [Test] tokens and regex disagree: start the parser first.
+      await initNativeParser();
+      const summary = await httpPolicyOf(parsed.testDir, await discoverTests(parsed.testDir));
+      for (const line of httpPolicyLines(summary, "a real run's events file lists all"))
+        console.log(line);
+      console.log(
+        "  (a dry run checks the whole test suite; the real run checks only the tests it selects)",
+      );
+    } catch (err) {
+      console.log(
+        `outbound HTTP check failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    // PR-212 (R1113): BC backends only, over the whole suite. Prints nothing when no method writes a company.
+    if (parsed.backendKind !== "al-runner-v3") {
+      try {
+        const all = await discoverTests(parsed.testDir);
+        const found = companyWriteMethods(
+          buildTestAppModel(await readTestAppSources(parsed.testDir)),
+          all,
+        );
+        for (const line of companyWriteLines(
+          found,
+          parsed.keepCompanyTests === true,
+          all.length,
+          "a real run's report lists all",
+        ))
+          console.log(line);
+      } catch (err) {
+        console.log(
+          `company writes check failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  } else {
+    console.log("outbound HTTP: not checked (no test project; pass --tests)");
   }
   if (parsed.timeBudgetSeconds !== undefined) {
     console.log(
@@ -6587,6 +7134,19 @@ export async function dryRunFromCli(parsed: DryRunCliConfig): Promise<number> {
   const dryRunExclude = resolveExclude(dryRunConfig ?? {}, parsed.exclude);
   // R205: one snapshot for the lines and the listing, as `runFromCli` does for a run.
   const dryRunSource = await readTargetSource(parsed.projectDir);
+  // PR-194 (R1133): the refusals the real run makes from the config before it executes anything.
+  // Only with a config AND a named backend: a dry run must still work before any config exists
+  // (issue #21), and without `--backend` there is no backend to judge. With an `envTool` section the
+  // bcdev fields come from provisioning, so the bcdev section is left to the real run.
+  if (dryRunConfig !== undefined && parsed.backendKind !== undefined) {
+    await preflightRunConfig({
+      parsed: { backendKind: parsed.backendKind, projectDir: parsed.projectDir },
+      configFile: dryRunConfig,
+      selectorIds: resolveSelectorIds({}, validateSelectorIdsConfig(dryRunConfig.selectorIds)),
+      source: dryRunSource,
+      deferBcdevSection: dryRunConfig.envTool !== undefined,
+    });
+  }
   const dryRunLines = await resolveLineRanges(parsed, defaultSpawn, dryRunSource);
   await printDryRun(parsed.projectDir, parsed.only, {
     dbPath: parsed.dbPath,
@@ -6683,6 +7243,9 @@ async function main(): Promise<number> {
   }
   if (parsed.mode === "export") {
     return await exportFromCli(parsed);
+  }
+  if (parsed.mode === "confirm-merge") {
+    return await confirmMergeFromCli(parsed);
   }
   if (parsed.mode === "campaign") {
     return await campaignFromCli(parsed);

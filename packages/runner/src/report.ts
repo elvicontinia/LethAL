@@ -2,6 +2,8 @@ import { tier1Operators } from "@lethal/builtin-tier1";
 import { tier2Operators } from "@lethal/builtin-tier2";
 import { CARRIER_KINDS, IDENTITY_SCHEME } from "@lethal/schemata";
 import type { MutantManifestEntry, ReachGrain } from "@lethal/schemata";
+import { V3_NOT_RUN_SUFFIX } from "./al-runner-v3-backend";
+import { RECHECK_UNEXERCISED, RECHECK_WARNING } from "./al-runner-v3-config";
 import {
   ASSERTION_SCREEN_DIAGNOSIS,
   ASSERTION_SCREEN_DISCRIMINATION_NOTES,
@@ -12,6 +14,7 @@ import {
 } from "./assertion-screen";
 import { isBcdev } from "./backend";
 import type { BackendCapabilities, CoverageMode, StopEvidence, TestMethodRef } from "./backend";
+import type { ConfirmRecord } from "./confirm";
 import type { DependencyReportSourceRecord } from "./dependency-report-source";
 import {
   EQUIVALENCE_MARKS_FILENAME,
@@ -28,16 +31,34 @@ import type { ChangedSinceSource, LineRange } from "./line-filter";
 import { type PermissionCanaryResult, permissionCanaryWarnings } from "./permission-canary";
 import {
   PLATFORM_ARTIFACT_KILL_DIAGNOSIS,
+  PLATFORM_FAILURE_TEXT_MECHANISMS,
   PLATFORM_KILL_MECHANISM_EXPLANATIONS,
+  failureTextMechanisms,
 } from "./platform-artifact-kills";
 import { type FoldStatics, foldEvents } from "./report-fold";
 import { RESTRICTIVE_DEFAULT_DIAGNOSIS } from "./restrictive-default";
 import type { CoverageAttribution } from "./selection";
 import { identityKeyOf, isCarryDisabled, memberGroupNameOf, serializeKey } from "./selection";
 import type { BatchArtifact, MutantVerdict, RunnerKind } from "./store";
-import { TESTPAGE_DIAGNOSIS, TESTPAGE_REFUSED_DIAGNOSIS } from "./testpage-unsupported";
+import {
+  REQUEST_PAGE_ALSO_SENTENCE,
+  REQUEST_PAGE_DIAGNOSIS,
+  TESTPAGE_DIAGNOSIS,
+  TESTPAGE_REFUSED_DIAGNOSIS,
+} from "./testpage-unsupported";
 
 export type { BatchArtifact };
+
+/**
+ * PR-144: on a row the recheck recovered. `withheldFailure` and `afterTest` are what the main pass
+ * withheld (`withheldKillOf`). `killerGreenInMainBaseline` is whether the killing test passed in the main
+ * pass's baseline; `false` means the recheck killed with a test the main pass never trusted.
+ */
+export interface IsolatedRecheck {
+  readonly withheldFailure: string;
+  readonly afterTest?: string;
+  readonly killerGreenInMainBaseline: boolean;
+}
 
 /**
  * Internal accumulation record produced while `runSession` walks batches and
@@ -84,6 +105,8 @@ export interface SessionOutcome {
    * match.
    */
   readonly cause?: MutantErrorCause;
+  /** PR-144: set by a `mutant-rechecked` event that recovered this row. See `IsolatedRecheck`. */
+  readonly isolatedRecheck?: IsolatedRecheck;
   /**
    * Summed duration of the test runs this mutant was scored by, in ms — the same value
    * `record()` already persists to `mutants.duration_ms`. 0 for a mutant nothing ran against
@@ -263,7 +286,12 @@ export type Caveat =
   | "al-runner-v3-serve-default-fallback-warmup"
   | "al-runner-v3-coverage-off"
   | "time-budget-reached"
-  | "nondebuggable-no-coverage";
+  | "nondebuggable-no-coverage"
+  | "withheld-kills"
+  // PR-144: the recheck recovered at least one withheld kill.
+  | "isolated-recheck-kills"
+  // R1131: at least one row was not scored because its start WorkDate moved from the batch's baseline.
+  | "workdate-changed";
 
 /**
  * R403 phase C: one test the arm filter dealt with, as `SessionReport.excludedTests` lists it.
@@ -274,7 +302,8 @@ export interface ExcludedTestRecord {
   readonly test: string;
   readonly file: string;
   /** R745: `exclude-test` = left out by `--exclude-test`, never run; raises `tests-narrowed`. */
-  readonly reason: "compiled-out" | "preproc-undecided-kept" | "exclude-test";
+  /** PR-212 (R1113): `company-write` = a BC run left it out by default because it writes the Company table; same effect. */
+  readonly reason: "compiled-out" | "preproc-undecided-kept" | "exclude-test" | "company-write";
 }
 
 /**
@@ -314,7 +343,8 @@ export const CAVEAT_INTERPRETATIONS: Record<Caveat, Interpretation> = {
   },
   narrowed: {
     meaning:
-      "The run was scoped by `--only`. `mutationScore` covers what was RUN, and a narrowed " +
+      "The run was scoped by `--only` (or `--exclude`, or `--confirm-from`, which deploys only the " +
+      "mutants a v3 report selected: see `confirm`). `mutationScore` covers what was RUN, and a narrowed " +
       "run's score describes the chosen slice, not the project.",
     entailedNegative:
       "`only` selects which mutants run and cannot itself change a verdict — unlike " +
@@ -516,8 +546,9 @@ export const CAVEAT_INTERPRETATIONS: Record<Caveat, Interpretation> = {
     entailedNegative:
       "Does NOT mean those verdicts are wrong, and does not change one: they stay `killed` and " +
       "they stay in `mutationScore`. Nor does its absence mean every other kill was earned by an " +
-      "assertion — only `lethal.remove-commit` tags sites today, so the screen's reach is one " +
-      "operator wide.",
+      "assertion: only a few operators tag sites (`remove-commit`, `swap-modify-flag`, " +
+      "`flip-boolean-literal`), and the one failure-text mechanism (`linux-rdlc-stub`, any " +
+      "operator) knows one message of BC for Linux.",
     basis: "R72",
   },
   "kills-without-assertion": {
@@ -726,7 +757,112 @@ export const CAVEAT_INTERPRETATIONS: Record<Caveat, Interpretation> = {
       "coverage record cannot tell. Not a wrong verdict on any other mutant.",
     basis: "R1049",
   },
+  "withheld-kills": {
+    meaning:
+      "At least one `error` mutant is a withheld kill. A covering test failed under it, but " +
+      "al-runner v3 did not trust the failure, because an earlier test of its codeunit was refused, " +
+      "failed or ran out of time and the state it left is not BC's. Such a mutant is outside " +
+      "`mutationScore`, so the score leaves out a kill candidate. Each such mutant carries " +
+      "`withheldKill` (the withheld failure, and the earlier test when v3 names it). The count is a " +
+      "lower bound: some are hidden behind a direct refusal met first. Per-test isolation runs each " +
+      "test in its own session, where the earlier test is never sent. Under a config that forces " +
+      '`"alRunnerV3.isolation": "test"`, the default `"auto"` moves to method the codeunits whose ' +
+      "baseline passes strictly more tests so, or ties with a test v3 refused by name. On DO it " +
+      "scored 450 of 451 such errors, at about 21 min more baseline and about 3x the time per mutant " +
+      'in moved codeunits (R1102). Under `"auto"`, the ones left are in codeunits auto kept on ' +
+      '"test". `"method"` runs every codeunit one test per session, which moves other baseline ' +
+      "outcomes (R1102 measured 156 on DO). al-runner's own rule is asked about in #8218.",
+    entailedNegative:
+      "Not a kill LethAL counts, not a wrong verdict, and not a claim that BC would kill each one: " +
+      "the earlier test's effect on the state is unknown, and a trusted failure would still be " +
+      "confirmed and reproduced.",
+    basis: "R1108",
+  },
+  "isolated-recheck-kills": {
+    meaning:
+      "At least one `killed` mutant was recovered by the recheck (`alRunnerV3.recheckWithheldKills`, on by default, " +
+      "`false` opts out; PR-144, PR-182): the main pass withheld its kill, and a second step re-ran it under method isolation, " +
+      "one test per session, and the kill reproduced. Each such mutant carries `isolatedRecheck`. " +
+      `${RECHECK_WARNING} ${RECHECK_UNEXERCISED} ` +
+      "Method isolation removes the state an earlier test left; it does not give BC's state back. " +
+      "A kill is recovered only if every test of the killing test's codeunit that passed in the main baseline " +
+      "still passes alone. That check cannot judge tests v3 refused at baseline, so it does not answer " +
+      "whether a refused test's state mattered; only a BC comparison does. " +
+      "A row the recheck does not recover stays `error`, unmeasured, never a kill. " +
+      "Evidence (PR-170): of 58 sampled recovered kills, BC confirmed 42 and found 0 false; 16 could not be measured " +
+      "(9 TestPage-only killers, 7 killers red at BC's baseline). " +
+      "The count of `withheld-kills` rows is the ones still withheld.",
+    entailedNegative:
+      "Not a wrong verdict, and not a claim that BC would kill each one: no kill in this report has been run on BC. " +
+      "Not a change to any kill or survivor the main pass scored.",
+    basis: "R1108",
+  },
+  "workdate-changed": {
+    meaning:
+      "At least one mutant is `error` / `workdate-changed`: an answer started on another WorkDate than its " +
+      "batch's baseline (`baselineWorkDate` is the first batch's), so it was not scored, and neither was " +
+      "anything after it in that batch. In a demo company a posting during the run moves the start date. " +
+      "The affected rows are outside `mutationScore`. Re-run them (a resume re-runs the first batch's baseline and reads the new date) on a quiet company (R1131).",
+    entailedNegative:
+      "Not a wrong kill and not a wrong survivor: no verdict was taken under a moved date. Not a claim that " +
+      "the baseline was wrong, and not a measure of how many rows a date move would have changed.",
+    basis: "R1131",
+  },
 };
+
+/**
+ * R1108: the "withheld kill" shape of an error row. al-runner v3 reports a covering test that FAILED
+ * as `NotRun: out-of-scope: ...; this failure is not trusted: <failure>` when an earlier test of its
+ * codeunit was refused, failed or ran out of time. Derived from the recorded fields only, so it moves
+ * no verdict. Undercounting is the safe direction: confirm/reproduce notes carry another prefix and
+ * are not matched, and the manual-binding cascade (R1019) is al-runner's own artifact.
+ */
+const WITHHELD_PREFIX = "NotRun: out-of-scope: ";
+const WITHHELD_PHRASE = "this failure is not trusted: ";
+const WITHHELD_AFTER = [
+  "an earlier test of this codeunit was refused while it ran (",
+  "a test before this one in the codeunit did not pass (",
+];
+// The v3 backend appends V3_NOT_RUN_SUFFIX to every refused row (`v3RowVerdict`), and LethAL's own notes (PR-51's held
+// note, PR-108's cap note) come after the whole row, so the suffix ends the failure. Only a note without the suffix
+// falls back to LethAL's note texts: those words could occur inside a failure message itself.
+const WITHHELD_SUFFIX = ` ${V3_NOT_RUN_SUFFIX}`;
+const WITHHELD_FALLBACK_CUTS = [
+  " the timeout of ",
+  " a timeout of ",
+  " after the timeout: ",
+  " the walk stopped after ",
+];
+
+export function withheldKillOf(
+  verdict: string,
+  cause: string | undefined,
+  failureNote: string | undefined,
+): { readonly failure: string; readonly afterTest?: string } | undefined {
+  if (verdict !== "error" || cause !== "runner-refused" || failureNote === undefined)
+    return undefined;
+  if (!failureNote.startsWith(WITHHELD_PREFIX)) return undefined;
+  if (failureNote.includes("left a manual event subscription bound")) return undefined;
+  const at = failureNote.lastIndexOf(WITHHELD_PHRASE);
+  if (at < 0) return undefined;
+  let rest = failureNote.slice(at + WITHHELD_PHRASE.length);
+  const end = rest.indexOf(WITHHELD_SUFFIX);
+  if (end >= 0) rest = rest.slice(0, end);
+  else
+    for (const cut of WITHHELD_FALLBACK_CUTS) {
+      const i = rest.indexOf(cut);
+      if (i >= 0) rest = rest.slice(0, i);
+    }
+  const tail = failureNote.slice(WITHHELD_PREFIX.length);
+  let afterTest: string | undefined;
+  for (const p of WITHHELD_AFTER) {
+    if (!tail.startsWith(p)) continue;
+    const name = tail.slice(p.length);
+    const end = name.indexOf(": ");
+    if (end > 0) afterTest = name.slice(0, end);
+  }
+  return { failure: rest.trim(), ...(afterTest !== undefined ? { afterTest } : {}) };
+}
 
 /**
  * The closed set of STRUCTURAL reasons an `error` verdict can name — see `MutantOutcome.cause`.
@@ -773,7 +909,12 @@ export type MutantErrorCause =
   | "confirm-stopped"
   // R688: under the mutant BC's suite discovery listed no methods for a covering test codeunit, and
   // with no mutant active its test ran; the other covering tests ran and none killed it.
-  | "test-discovery-failed";
+  | "test-discovery-failed"
+  // R1131: an answer's start WorkDate differed from the batch's baseline date (or an earlier answer of the
+  // batch had), so the row is not scored.
+  | "workdate-changed"
+  // PR-212 (R1113): no remaining test covers this mutant, and it sits in an object a left-out company-writing test names.
+  | "left-out-test-reach";
 
 /**
  * What each `MutantErrorCause` MEANS for a reader, and — because both are facts about LethAL's OWN
@@ -1075,6 +1216,32 @@ export const ERROR_CAUSE_INTERPRETATIONS: Record<MutantErrorCause, Interpretatio
       "failed under it. Not `unstable`: the test passed with no mutant active. It does not say " +
       "the tests that did not run would miss the mutant.",
     basis: "R688",
+  },
+  "workdate-changed": {
+    meaning:
+      "An answer for this mutant (a covering test, its unmutated confirmation, its reproduction or its " +
+      "replay) started on a different WorkDate than this batch's baseline, or an earlier answer of the " +
+      "same batch had. In a demo company the start date is the last G/L posting date, so a posting during " +
+      "the run moves it; so does midnight in a company with no demo data, for a fresh session. The row is " +
+      "not scored, and neither is the rest of the batch (R1131). The note names both dates. Re-run: " +
+      "a resume re-executes an `error` outcome and re-runs the first batch's baseline, so it reads the new date.",
+    entailedNegative:
+      "Not `killed`, not `survived`, not `unstable`: a start date that moved can change a test's " +
+      "verdict, so no test ran under the same conditions as the baseline. A date move can cost a " +
+      "verdict here, never invent one.",
+    basis: "R1131",
+  },
+  "left-out-test-reach": {
+    meaning:
+      "This run left out test methods that write the Company table (`excludedTests`, reason `company-write`), and no test " +
+      "that ran covers this mutant (under coverage `none`: none that ran killed it). It sits in an object one of the left-out methods names (a variable type or an " +
+      "object reference, in the method or in one test-app procedure it calls), so one of them might cover it. It is NOT " +
+      "MEASURED: not survived, not no-coverage. Over-approximate on purpose: an object only NAMED by such a method may " +
+      "still be untested. Run with `--keep-company-tests` on a server you can restart to measure it (R1113).",
+    entailedNegative:
+      "Not `survived` and not `no-coverage`: no verdict was taken. Not a claim that a left-out test covers it, and not a " +
+      "claim that none does. A mutant in an object no left-out method names keeps its own `no-coverage`.",
+    basis: "R1113",
   },
 };
 
@@ -1456,6 +1623,14 @@ export interface SessionReport {
     readonly changedSince?: ChangedSinceSource;
   };
   /**
+   * PR-171 (R1122): the `--confirm-from` narrowing, if any. The run deployed only the mutants whose
+   * identity key is in `selected` (the noted v3 survivors, v3's R609 no-coverage rows, and a seeded
+   * sample of unnoted survivors), so its score covers those ONLY. `lethal confirm-merge` joins this
+   * report to the v3 one on those keys. Absent on every other run, so an older report validates
+   * unchanged. Raises the `narrowed` caveat.
+   */
+  readonly confirm?: ConfirmRecord;
+  /**
    * R45: the `--tests-only` narrowing, if any. Absent means the whole suite ran at baseline. See
    * `CAVEAT_INTERPRETATIONS["tests-narrowed"]` for what this means to a reader.
    *
@@ -1495,7 +1670,9 @@ export interface SessionReport {
   };
   /**
    * R69: baseline tests refused because they open a `TestPage`, which the fenced session
-   * (`GuiAllowed=No`, `ClientType=ODataV4`) cannot create a test service for. Also a strict subset
+   * (`GuiAllowed=No`, `ClientType=ODataV4`) cannot create a test service for. R909 added Linux BC's
+   * plain-CLR page refusal, and R1135 (PR-215) a report request page ("cannot be used in background
+   * or server sessions"); `diagnosis` names whichever kinds are present. Also a strict subset
    * of `unsupportedTests`. See `CAVEAT_INTERPRETATIONS["tests-testpage-unsupported"]` for what
    * this means to a reader.
    *
@@ -1555,14 +1732,15 @@ export interface SessionReport {
     readonly budgetMs: number;
   };
   /**
-   * R72: KILLED mutants whose site carries a recognised platform kill mechanism — a SCREEN over the
+   * R72: KILLED mutants whose site carries a recognised platform kill mechanism, or (R1121) whose
+   * killing failure text matches a `PLATFORM_FAILURE_TEXT_MECHANISMS` entry — a SCREEN over the
    * kills, not a classification of them. See `CAVEAT_INTERPRETATIONS["platform-artifact-kills"]`
    * for what this means to a reader, and `platform-artifact-kills.ts` for what it deliberately
-   * cannot see.
+   * cannot see. A mutant can be listed under two mechanisms; `killedCount` counts it once.
    *
    * Absent when no killed mutant carries one. That is NOT the statement "every kill was earned by
-   * an assertion": only `lethal.remove-commit` tags sites today, and R82's arm E is a live example
-   * of a platform-produced kill from a different operator that nothing here screens.
+   * an assertion": only a few operators tag sites, the text table knows one message, and R82's arm
+   * E is a live example of a platform-produced kill that nothing here screens.
    *
    * The verdicts do not move and `mutationScore` is unchanged — deliberately, per design §6.7's
    * timeout precedent. Re-scoring on a diagnosis would invalidate every frozen gate figure and
@@ -1576,7 +1754,8 @@ export interface SessionReport {
       /** R231 `<batchIndex>/<mutantCode>` ids (`mutantRef`), sorted by batch then code: a
        *  stable list a gate can assert on. */
       readonly mutants: readonly string[];
-      /** What this mechanism IS, from `PLATFORM_KILL_MECHANISM_EXPLANATIONS`, or a bare marker when
+      /** What this mechanism IS, from `PLATFORM_FAILURE_TEXT_MECHANISMS` or
+       *  `PLATFORM_KILL_MECHANISM_EXPLANATIONS`, or a bare marker when
        *  the run's manifest carried a tag this build has no explanation for (an older/newer engine
        *  wrote it). Naming the unknown tag beats dropping the mutant from the screen silently. */
       readonly explanation: string;
@@ -1775,6 +1954,14 @@ export interface SessionReport {
    * Absent on a report from before R565.
    */
   readonly dependencySourceSha256?: string;
+  /**
+   * R1131: the start WorkDate (an ISO date) the FIRST batch's baseline ran under, as control app 1.0.0.28
+   * returns it. Every later answer on a bcdev run is compared with its batch's baseline date, and a
+   * mismatch is an `error` / `workdate-changed` row. Written on every bcdev run outside hub mode; absent on
+   * al-runner, in hub mode (`coverageMode: "procedure"`, whose baseline answers carry no date), and on a
+   * report from before R1131. In a demo company it is the last G/L posting date; otherwise today.
+   */
+  readonly baselineWorkDate?: string;
   /**
    * R443: sha256 of this run's identity numbering OUTPUT (`numberingDigestOf`, selection.ts): every
    * numbered site with its ordinal. Two runs with equal digests give every key to the same mutant.
@@ -2180,6 +2367,17 @@ export interface MutantOutcome {
    * `failureNote` is their only account, and it is free text.
    */
   readonly cause?: MutantErrorCause;
+  /**
+   * R1108: on an `error` row, the covering test FAILED under the mutant but al-runner v3 did not
+   * trust the failure (see `withheldKillOf`). Derived from `cause` and `failureNote`; absent on
+   * every other row and on older reports. Not a kill, and outside `mutationScore`.
+   */
+  readonly withheldKill?: { readonly failure: string; readonly afterTest?: string };
+  /**
+   * PR-144: present on a `killed` row the recheck recovered from a withheld kill (caveat
+   * `isolated-recheck-kills`). Not measured against BC. Absent on every other row.
+   */
+  readonly isolatedRecheck?: IsolatedRecheck;
   /**
    * R72: a syntactic property of this mutant's SITE saying the platform is known to refuse the
    * mutated program here, so a kill can be BC rather than an assertion. Carried verbatim from
@@ -2853,6 +3051,7 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
         break;
     }
     const identity = identityKeyOf(o.mutant);
+    const wk = withheldKillOf(o.verdict, o.cause, o.failureNote);
     const row: MutantOutcome = {
       mutantCode: o.mutant.mutantId,
       file: o.mutant.file,
@@ -2899,6 +3098,8 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
       ...(o.killReproduced === true ? { killReproduced: true as const } : {}),
       ...(o.reproducedFailure !== undefined ? { reproducedFailure: o.reproducedFailure } : {}),
       ...(o.cause !== undefined ? { cause: o.cause } : {}),
+      ...(wk !== undefined ? { withheldKill: wk } : {}),
+      ...(o.isolatedRecheck !== undefined ? { isolatedRecheck: o.isolatedRecheck } : {}),
       // R72: a SITE property, so it comes off the manifest entry and never off the outcome — it is
       // true of this mutant whatever happened when it ran.
       ...(o.mutant.platformKillMechanism !== undefined
@@ -3093,16 +3294,26 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
   // R844 - see CAVEAT_INTERPRETATIONS["some-errors"]. Some rows errored and some did not: the
   // errored ones are outside `mutationScore`. Never together with "all-errors".
   if (counts.errors > 0 && !allErrors) caveats.push("some-errors");
+  // R1108 - see CAVEAT_INTERPRETATIONS["withheld-kills"].
+  if (mutants.some((m) => m.withheldKill !== undefined)) caveats.push("withheld-kills");
+  // PR-144 - see CAVEAT_INTERPRETATIONS["isolated-recheck-kills"].
+  if (mutants.some((m) => m.isolatedRecheck !== undefined)) caveats.push("isolated-recheck-kills");
+  // R1131 - see CAVEAT_INTERPRETATIONS["workdate-changed"]; the count is in the banner's error breakdown.
+  if (mutants.some((m) => m.cause === "workdate-changed")) caveats.push("workdate-changed");
   // R221: `--exclude` narrows the measured scope exactly as `--only` does, so it raises the same
   // caveat. Pushed once even when both flags are used -- the caveat says "this is not a project
   // score", and that is one fact however many flags produced it.
-  if (input.only !== undefined || input.exclude !== undefined) caveats.push("narrowed");
+  // PR-171: `--confirm-from` narrows to a chosen slice of mutants, which is the same fact.
+  if (input.only !== undefined || input.exclude !== undefined || input.confirm !== undefined)
+    caveats.push("narrowed");
   // See CAVEAT_INTERPRETATIONS["operator-narrowed"] for what this caveat means to a reader.
   if (input.operators !== undefined) caveats.push("operator-narrowed");
   if (input.lines !== undefined) caveats.push("line-narrowed");
   // See CAVEAT_INTERPRETATIONS["tests-narrowed"] for what this caveat means to a reader.
   // R745: also raised by any test `--exclude-test` left out.
-  const testsExcludedByName = (input.excludedTests ?? []).some((t) => t.reason === "exclude-test");
+  const testsExcludedByName = (input.excludedTests ?? []).some(
+    (t) => t.reason === "exclude-test" || t.reason === "company-write",
+  );
   if ((input.testsOnly !== undefined && input.testsOnly.length > 0) || testsExcludedByName)
     caveats.push("tests-narrowed");
   if (notInstrumented.files.length > 0) caveats.push("uninstrumentable-files");
@@ -3138,6 +3349,10 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
   // reader.
   const testPageUnsupportedTests = input.testPageUnsupportedTests ?? [];
   if (testPageUnsupportedTests.length > 0) caveats.push("tests-testpage-unsupported");
+  // R1135: how many of those are request-page refusals (a subset by construction).
+  const requestPageCount = testPageUnsupportedTests.filter((t) =>
+    (input.requestPageTests ?? []).includes(t),
+  ).length;
   // See CAVEAT_INTERPRETATIONS["tests-testpage-refused"].
   const testPageRefusedTests = input.testPageRefusedTests ?? [];
   if (testPageRefusedTests.length > 0) caveats.push("tests-testpage-refused");
@@ -3211,11 +3426,16 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
   const platformKillsByMechanism = new Map<string, MutantOutcome[]>();
   for (const m of mutants) {
     if (m.verdict !== "killed") continue;
-    const mechanism = m.platformKillMechanism;
-    if (mechanism === undefined) continue;
-    const list = platformKillsByMechanism.get(mechanism);
-    if (list === undefined) platformKillsByMechanism.set(mechanism, [m]);
-    else list.push(m);
+    // R72's site tag, then R1121's failure-text mechanisms (PR-143); a mutant can be listed under both.
+    const mechanisms = [
+      ...(m.platformKillMechanism !== undefined ? [m.platformKillMechanism] : []),
+      ...failureTextMechanisms(m.killingTestFailure),
+    ];
+    for (const mechanism of mechanisms) {
+      const list = platformKillsByMechanism.get(mechanism);
+      if (list === undefined) platformKillsByMechanism.set(mechanism, [m]);
+      else list.push(m);
+    }
   }
   if (platformKillsByMechanism.size > 0) caveats.push("platform-artifact-kills");
   // R172: survivors whose OPERATOR declares an elevated equivalence risk, looked up by operator NAME
@@ -3247,7 +3467,8 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
     platformKillsByMechanism.size === 0
       ? undefined
       : {
-          killedCount: [...platformKillsByMechanism.values()].reduce((n, l) => n + l.length, 0),
+          // Distinct mutants: one listed under two mechanisms (PR-143) counts once.
+          killedCount: new Set([...platformKillsByMechanism.values()].flat()).size,
           byMechanism: [...platformKillsByMechanism.entries()]
             .sort(([a], [b]) => a.localeCompare(b))
             .map(([mechanism, list]) => ({
@@ -3258,11 +3479,13 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
               // mutant because a string is unrecognised is the empty-vs-empty failure this repo is
               // named for.
               explanation:
-                mechanism in PLATFORM_KILL_MECHANISM_EXPLANATIONS
+                PLATFORM_FAILURE_TEXT_MECHANISMS.find((t) => t.mechanism === mechanism)
+                  ?.explanation ??
+                (mechanism in PLATFORM_KILL_MECHANISM_EXPLANATIONS
                   ? PLATFORM_KILL_MECHANISM_EXPLANATIONS[
                       mechanism as keyof typeof PLATFORM_KILL_MECHANISM_EXPLANATIONS
                     ]
-                  : `no explanation is registered in this build for the site tag "${mechanism}" — it was written by a different engine version`,
+                  : `no explanation is registered in this build for the site tag "${mechanism}" — it was written by a different engine version`),
             })),
           diagnosis: PLATFORM_ARTIFACT_KILL_DIAGNOSIS,
         };
@@ -3349,6 +3572,7 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
     input.exclude !== undefined ||
     input.operators !== undefined ||
     input.lines !== undefined ||
+    input.confirm !== undefined ||
     (input.testsOnly !== undefined && input.testsOnly.length > 0) ||
     testsExcludedByName ||
     // R307: a refused file's sites were never mutated, so the score is not a whole-project score.
@@ -3397,6 +3621,9 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
       : fileScope) +
     (input.lines !== undefined
       ? `, ${input.lines.ranges.length} line range(s) only (${input.lines.excludedSiteCount} site(s) on other lines excluded)`
+      : "") +
+    (input.confirm !== undefined
+      ? `, ${input.confirm.selected.length} mutant(s) selected by --confirm-from (${input.confirm.excludedSiteCount} site(s) excluded)`
       : "");
   const refusedFilesText =
     refusedRows.length > 0
@@ -3461,7 +3688,13 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
       ? {
           testPageUnsupported: {
             tests: [...testPageUnsupportedTests].sort(),
-            diagnosis: TESTPAGE_DIAGNOSIS,
+            // R1135: the diagnosis follows which kinds of test are present.
+            diagnosis:
+              requestPageCount === 0
+                ? TESTPAGE_DIAGNOSIS
+                : requestPageCount === testPageUnsupportedTests.length
+                  ? REQUEST_PAGE_DIAGNOSIS
+                  : `${TESTPAGE_DIAGNOSIS} ${REQUEST_PAGE_ALSO_SENTENCE}`,
           },
         }
       : {}),
@@ -3527,6 +3760,7 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
     ...(input.dependencySourceSha256 !== undefined
       ? { dependencySourceSha256: input.dependencySourceSha256 }
       : {}),
+    ...(input.baselineWorkDate !== undefined ? { baselineWorkDate: input.baselineWorkDate } : {}),
     // R443: the recorded numbering facts a mark's proof is made from (`lethal explain`).
     ...(input.numbering !== undefined
       ? {
@@ -3553,6 +3787,7 @@ export function buildReport(statics: FoldStatics, events: readonly RunEvent[]): 
     ...(input.exclude !== undefined ? { exclude: input.exclude } : {}),
     ...(input.operators !== undefined ? { operators: input.operators } : {}),
     ...(input.lines !== undefined ? { lines: input.lines } : {}),
+    ...(input.confirm !== undefined ? { confirm: input.confirm } : {}),
     ...(input.testsOnly !== undefined ? { testsOnly: input.testsOnly } : {}),
     ...(input.staleTestApp !== undefined ? { staleTestApp: input.staleTestApp } : {}),
     ...(input.resumedFrom !== undefined ? { resumedFrom: input.resumedFrom } : {}),
@@ -3633,7 +3868,7 @@ function summarizeRunnerContexts(
  * `error N [unstable 0]`. R-204b adds `stop-outcome-unconfirmed`, the error a stop leaves behind
  * when its group's answer arrived but could not be used (R665). R514 adds `reused-budget-stale`, R516 `timeout-unconfirmed`,
  * R534 `runner-test-error` and `runner-refused`, R577 `kill-not-reproduced`, R658 `confirm-stopped`,
- * R688 `test-discovery-failed`.
+ * R688 `test-discovery-failed`, R1131 `workdate-changed`.
  */
 function errorBreakdown(r: SessionReport): string {
   const named: MutantErrorCause[] = [
@@ -3649,6 +3884,8 @@ function errorBreakdown(r: SessionReport): string {
     "kill-not-reproduced",
     "confirm-stopped",
     "test-discovery-failed",
+    "workdate-changed",
+    "left-out-test-reach",
   ];
   const parts: string[] = [];
   for (const cause of named) {
@@ -3759,6 +3996,24 @@ export function renderConsole(r: SessionReport): string {
       `${n} mutant(s) errored${inside} and are not in the score; had they run, it would read ${pct(kills / (denom + n))} to ${pct((kills + n) / (denom + n))}.`,
     );
   }
+  // R1108: error rows whose covering test failed, but v3 withheld the failure. A lower bound.
+  const withheld = r.mutants.filter((m) => m.withheldKill !== undefined).length;
+  if (withheld > 0) {
+    const remedy =
+      r.isolation === undefined
+        ? ' Isolation "auto" scores most of them (R1102).'
+        : ' They are in codeunits isolation "auto" kept on "test"; "method" runs them one test per session (R1102, #8218).';
+    lines.push(
+      `at least ${withheld} of the ${r.counts.errors} error mutant(s) are withheld kills: a covering test failed under the mutant, but al-runner v3 did not trust the failure after an earlier test of its codeunit was refused, failed or ran out of time. The score leaves them out (validity.caveats "withheld-kills").${remedy}`,
+    );
+  }
+  // R1131: rows not scored because the start WorkDate moved from the batch's baseline (ruling A).
+  const dateMoved = r.mutants.filter((m) => m.cause === "workdate-changed").length;
+  if (dateMoved > 0) {
+    lines.push(
+      `${dateMoved} mutant(s) were not scored: their start WorkDate moved from the batch's baseline${r.baselineWorkDate !== undefined ? ` (${r.baselineWorkDate})` : ""}, and so did the rest of that batch. They are outside the score. Re-run (validity.caveats "workdate-changed", R1131).`,
+    );
+  }
   // R206: warm kills are a fact about HOW the kills were measured, stated beside the score.
   if ((r.warmKills ?? 0) > 0) {
     lines.push(
@@ -3833,6 +4088,12 @@ export function renderConsole(r: SessionReport): string {
       `TESTS EXCLUDED: ${testsLeftOut.length} test(s) left out by --exclude-test and never run: ${testsLeftOut.map((t) => t.test).join(", ")}. A mutant only they kill reads survived or no-coverage. See excludedTests.`,
     );
   }
+  const companyLeftOut = (r.excludedTests ?? []).filter((t) => t.reason === "company-write");
+  if (companyLeftOut.length > 0) {
+    lines.push(
+      `COMPANY-WRITING TESTS LEFT OUT: ${companyLeftOut.length} test(s) write the Company table and were not run (BC default, R1113; --keep-company-tests runs them): ${companyLeftOut.map((t) => t.test).join(", ")}. A mutant only they cover reads error / left-out-test-reach (not measured), never survived. See excludedTests.`,
+    );
+  }
   const testsCompiledOut = (r.excludedTests ?? []).filter((t) => t.reason === "compiled-out");
   if (testsCompiledOut.length > 0) {
     lines.push(
@@ -3873,8 +4134,16 @@ export function renderConsole(r: SessionReport): string {
   // test. Deliberately NOT folded into the permissions block above — see `testPageUnsupported`.
   if (r.testPageUnsupported !== undefined) {
     const n = r.testPageUnsupported.tests.length;
+    // R1135: the diagnosis text says which kinds are present (it is chosen from the same data).
+    const d = r.testPageUnsupported.diagnosis;
+    const opened =
+      d === REQUEST_PAGE_DIAGNOSIS
+        ? "a report request page"
+        : d.endsWith(REQUEST_PAGE_ALSO_SENTENCE)
+          ? "a TestPage or a report request page"
+          : "a TestPage";
     lines.push(
-      `TESTPAGE UNSUPPORTED ON THIS PATH: ${n} baseline test(s) were refused for opening a TestPage. ${r.testPageUnsupported.diagnosis}`,
+      `TESTPAGE UNSUPPORTED ON THIS PATH: ${n} baseline test(s) were refused for opening ${opened}. ${d}`,
     );
     for (const t of r.testPageUnsupported.tests.slice(0, 10)) lines.push(`  ${t}`);
     if (n > 10) lines.push(`  ... ${n - 10} more`);
@@ -3960,7 +4229,7 @@ export function renderConsole(r: SessionReport): string {
   }
   if (r.platformArtifactKills !== undefined) {
     lines.push(
-      `PLATFORM-ARTIFACT KILL SCREEN: ${r.platformArtifactKills.killedCount} killed mutant(s) sit at a site BC is measured to refuse. ${r.platformArtifactKills.diagnosis}`,
+      `PLATFORM-ARTIFACT KILL SCREEN: ${r.platformArtifactKills.killedCount} killed mutant(s) may be the platform rather than the suite; read them. ${r.platformArtifactKills.diagnosis}`,
     );
     for (const g of r.platformArtifactKills.byMechanism) {
       lines.push(`  ${g.mechanism} (${g.mutants.length}): ${g.explanation}`);
@@ -4161,6 +4430,12 @@ export function renderConsole(r: SessionReport): string {
     const more = r.lines.ranges.length > 5 ? ` and ${r.lines.ranges.length - 5} more` : "";
     lines.push(
       `NARROWED (lines): ${shown.join(", ")}${more} — ${r.lines.excludedSiteCount} mutation site(s) on other lines were excluded. The score above covers those lines ONLY, it is not a project score.`,
+    );
+  }
+  // PR-171: the confirm axis. The score covers the selected mutants only; the merge joins it to v3's.
+  if (r.confirm !== undefined) {
+    lines.push(
+      `NARROWED (--confirm-from): ${r.confirm.selected.length} mutant(s) selected from ${r.confirm.inputPath} (sha256 ${r.confirm.inputSha256.slice(0, 12)}) — ${r.confirm.excludedSiteCount} mutation site(s) were excluded. The score above covers those mutants ONLY, it is not a project score. Join it to the v3 report with \`lethal confirm-merge\`.`,
     );
   }
   // Same reasoning as NOT INSTRUMENTED above: a qualifier on the score belongs next to the score.

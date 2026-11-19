@@ -186,7 +186,9 @@ for a person: [Your first week with LethAL](docs/first-week.md).
 **1. Write `lethal.config.json` next to your AL app.** `lethal init --project path/to/your-al-app`
 writes one for you, including the three injected object ids picked from your own app.json id ranges
 (the one field nobody can guess, and the one whose absence fails at publish time). Fill in the
-server and credentials it leaves as placeholders. `lethal init --project ... --backend al-runner-v3`
+server it leaves as a placeholder. For the login, prefer `--credentials-env <USER_VAR>,<PASS_VAR>`, so the
+file names two environment variables and holds no secret (see "Keep the login out of the file" below);
+otherwise fill in the placeholders. `lethal init --project ... --backend al-runner-v3`
 writes the offline `alRunnerV3` section instead (its `bcVersion` is a placeholder you must replace).
 
 To write it by hand instead, every field below is required; LethAL refuses to start and names any
@@ -318,7 +320,7 @@ codeunit 50100 "Pricing"
 ```
 
 **2. Your test code** (`--tests`). LethAL discovers the tests inside it and asks the server to run
-them; publishing the test app stays your own workflow.
+them; publishing the test app stays your own workflow (see "Publishing your test app" below).
 
 ```al
 codeunit 50101 "Pricing Tests"
@@ -476,6 +478,86 @@ Two more fields worth knowing. `operatorName` names the rule that produced a cha
 entry under [`docs/roadmap/`](docs/roadmap/) holding the evidence for a claim, so nothing in the
 output asserts something you cannot go and check.
 
+### When an `al-runner-v3` survivor is a good lead
+
+The `al-runner-v3` backend is not authoritative (see [Limits](#limits)), but most of its survivors
+are still worth acting on. One note tells you which ones are not.
+
+**The note.** A v3 survivor's `failureNote` can start with `[v3-refused-test-nearby]`, followed by
+test names. It means al-runner refused one or more tests at baseline in the same test codeunit as a
+test that covers the mutant. Those refused tests never ran under the mutant, so a kill one of them
+would make on BC was **not measured**. For example:
+
+```text
+[v3-refused-test-nearby] Invoice Send Tests.Post_WhenRenderedAsPdf_SendsOnce: refused by v3 at
+baseline in a covering test's codeunit, so a kill it might make on BC is not measured here
+```
+
+**What to do with a survivor:**
+
+| v3 survivor | Read it as | Do this |
+|---|---|---|
+| no `[v3-refused-test-nearby]` note | survived | act on it: add or strengthen a test |
+| with the note | not measured | confirm it on BC (`--backend bcdev`) before acting |
+
+**How this was measured** (coord PR-137, 2026-11-18): three scopes of one private customer project,
+1,494 mutants, each run on al-runner v3 and on BC (`bcdev`), compared mutant by mutant.
+- **Without the note:** 947 survivors. BC agreed on 945 (99.8%). The other 2 are one mutant counted
+  in two runs, and its cause is an al-runner wrong answer: `Evaluate` of an empty text into an
+  Option field whose `OptionCaption` has empty entries returns true on al-runner and false on BC.
+- **With the note:** 78 survivors. BC killed 10 of them with a real failure (12.8%). Each of those
+  10 killing tests was one al-runner had refused at baseline.
+
+**Limits of that measurement:**
+- It is one project. Another project's code may reach al-runner differences this one did not.
+- The note marks the test **codeunit**, not the test. A noted survivor whose real killer is in
+  another, unrefused codeunit is still measured. You cannot tell which from the note alone.
+- The BC side ran on BC on Linux. There, a test that renders an RDLC report fails with "RDLC report
+  rendering is not implemented on Linux BC", so a mutant that sends a test into a report render is
+  scored killed by the server, not by your test ([R1121](docs/roadmap/R1121.md)). 11 more of the 78
+  noted survivors were killed that way, and they are not counted as real kills above. When you
+  confirm on BC, read the killing failure before crediting the kill.
+
+**Confirm only the noted survivors on BC** (`--confirm-from`, `lethal confirm-merge`). You do not
+have to run the whole project on BC. Run v3 first, then ask BC about the mutants the note marks:
+
+```text
+lethal run --backend al-runner-v3 ... --out v3.json
+lethal run --backend bcdev ... --confirm-from v3.json [--confirm-sample 30] [--confirm-seed <text>] --out bc.json
+lethal confirm-merge v3.json bc.json --out confirmed.json
+```
+
+The BC run deploys only: the noted survivors, the `no-coverage` rows whose note says v3 refused the
+covering tests, and a seeded sample (default 30) of unnoted survivors. The sample re-measures, for
+your project, how often an unnoted survivor is wrong. `--confirm-sample 0` turns it off. The merge
+writes a separate `lethal-confirmation` file ([schema](schemas/confirmation-v1.schema.json)), not a
+report. Each mutant is marked with who measured it: BC, or v3. A BC `error` is not a measurement, so
+that mutant keeps v3's verdict. A kill on the Linux RDLC stub stays a kill but is counted apart. The
+merge prints "N survivors, M of them measured on BC" beside every score, and refuses by name when the
+two runs do not belong together (different source, flags, suite or identity scheme). "Source" is
+the `.al` files and `app.json` without its `version`, so a version bump alone is not a difference.
+The two runs often read different dependency symbols (v3 and BC are different builds). That is not a
+refusal: the file records both hashes, sets the flag `dependency-symbols-differ`, and the merge
+prints one line about it.
+
+**Limits:**
+- **A mutant v3 killed is never re-checked.** A false v3 kill stays in the final score.
+- **A refused test can hide a survivor from the note.** A refused test in a codeunit that has no
+  passing covering test of the mutant leaves that mutant unnoted. Only the sample can catch it.
+- **The note marks a codeunit, not a test,** so some noted mutants cost BC time and change nothing.
+- **Unnoted survivors outside the sample keep v3's verdict.** The sample bounds that error; it does
+  not remove it. When fewer survivors were drawn than there are unnoted survivors, the merge prints
+  a one-sided 95% upper bound on the unnoted kill rate (3 divided by the number BC scored `killed`
+  or `survived`, printed beside it, when BC killed none). When every unnoted survivor was drawn, it
+  says "all unnoted survivors measured" instead. The BC run must be `--backend bcdev`, and the merge
+  recomputes the selection from the v3 report and refuses if the BC report recorded another. If BC kills any sampled survivor, the merge
+  prints `unnoted-disagreement`: run the whole scope on BC.
+- **Same source, same build.** Run both from one commit. The two runs must agree on source hash,
+  `--only`, `--exclude`, `--operator`, `--lines`, preprocessor symbols, `--tests-only` and
+  `--exclude-test`. An edit that changes behaviour but keeps every identity key is not caught.
+- **Not allowed with `--confirm-from`:** `--resume`, `--resume-run`, `--skip-known-survivors`,
+  `--dry-run`.
+
 ## Commands
 
 Each command in one line, then the detail. [Quick start](#quick-start) has the first-run sequence.
@@ -544,7 +626,10 @@ lethal campaign compare --manifest docs/campaign/2026-08-03-do/campaign.json \
 uncommitted, modified or simply missing is refused. The whole point is that you cannot write down
 what you expected after seeing the answer.
 
-Recovery, when a session died mid-run and left the container held:
+Recovery, when a session died mid-run and left the container held. A quarantined run prints these
+steps with its own server, instance and config. If its message says the lease must not be trusted
+until an NST restart (R658: a test hung and BC never confirmed LethAL's stop), restart the BC
+service tier first; the commands below assume it answers again.
 
 ```bash
 # clears the SERVER-side lease and operation marker
@@ -649,6 +734,7 @@ as described above, and it publishes to a BC server, so use a sandbox.
 | `--only <glob>` | *(all files)* | Only these files contribute mutants. Repeatable. Cannot change a verdict, because every file is still parsed, compiled and published |
 | `--tests-only <glob>` | *(whole suite)* | Only these test files run at baseline. Repeatable. **Can change a verdict**: excluding a killing test manufactures a survivor. Flagged `tests-narrowed` in the report |
 | `--exclude-test <Codeunit.Method>` | *(none)* | Leave one test method out of the run (bcdev only; al-runner-v3 runs whole codeunits and refuses). Repeatable. A name that matches no test is refused. **Can change a verdict**: a mutant only that test kills reads survived or no-coverage. Flagged `tests-narrowed`; the report lists it in `excludedTests` |
+| `--keep-company-tests` | off | A bcdev or envtool run LEAVES OUT every test method that writes the Company table (`Insert`, `Delete` or `Rename` on a `Record Company`, in the method or in one test-app procedure it calls; a write two calls away is not seen), by name, reason `company-write` in `excludedTests`, flagged `tests-narrowed` (R1113: on BC 29 such a test broke the server's tier). A no-coverage mutant in an object those methods name reads `error` / `left-out-test-reach` (not measured), never survived. This flag runs them: use it on a server you can restart. `--dry-run` reads it. al-runner-v3 leaves nothing out |
 | `--skip-known-survivors` | `false` | Skip mutants a prior finished run recorded as survivors |
 | `--dry-run` | `false` | Plan mutants without executing them |
 
@@ -810,6 +896,32 @@ the assignment leaves the field's **value correct** and deletes only the `OnVali
 so a test that checks the field still passes and a test that checks the side effect does not. It is
 the only operator that separates those two.
 
+## Publishing your test app
+
+LethAL publishes the changed build of your app itself, but never your test app: it must already be
+installed on the server when a run starts. `lethal doctor --config <path> --project <app> --tests <test app>`
+says so by name (`test-app-present`) when it is missing.
+
+1. **Put your app on the server first.** The test app depends on it, so BC refuses the test app while
+   your app is missing. Publish your own build of the app (any way you normally do). After a run, LethAL's
+   changed build is on the server at a higher version, and it also satisfies the test app's dependency.
+2. **Compile the test app against your app's symbols.** Its `.alpackages` needs your app's `.app` (or
+   its symbols), as well as the packages your app's `.alpackages` holds (the platform, the base app, test
+   libraries such as Library Assert, and any third-party dependencies). Keep this cache separate from your
+   app's own `packageCachePath`: your app's cache must not contain your app.
+3. **Publish it** the way you publish any app to that server:
+   - from VS Code, with the test project open (its `launch.json` names the server);
+   - with `altool publishapp <test-app.app> --project <test project folder>`, which reads the connection
+     from that project's `launch.json`;
+   - on a BcContainerHelper container, with `Publish-BcContainerApp`.
+4. **Check it** with `lethal doctor ... --tests <test app>`. `test-app-present` passes, and
+   `server-dependencies` lists each direct dependency of your app and the test app with its installed version.
+   If a dependency's tables use a text-optimized index, `text-search-dependencies` says the server's SQL
+   Server needs Full-Text Search before you publish it.
+
+Whenever you change your app's AL, rebuild the test app against the new symbols and publish it again.
+LethAL refuses a run against a test app built for older symbols (`StaleTestAppError`).
+
 ## Restoring your app after a run
 
 LethAL publishes the changed build under a version ABOVE your `app.json` version, of the form
@@ -920,7 +1032,7 @@ a LethAL feature or a mode.
   on [docs/gates/alrunner.md](docs/gates/alrunner.md).
 - **`al-runner-v3` (the Rust al-runner, R586) is not authoritative.** A gated build only (R586c, R814), and
   configured in an `alRunnerV3` section (`packagesDir` and the four-number `bcVersion` required, and `environment` (`"onprem"` or `"saas"`) unless the target's `.vscode/launch.json` names one, R938;
-  `coverage`, `path`, `alcPath`, `cacheDir`, `downloadDemoData` optional (R885: al-runner downloads the CRONUS demo data of `bcVersion` into `cacheDir` unless `downloadDemoData` is `false`; with it on, the feed's copy replaces an older Microsoft app in `.alpackages`), `dotnetSidecar` optional (R886: a path to al-runner's .NET helper, passed as `--dotnet-sidecar`; absent: the pinned build's own, when the update script built one; `false`: none), `license` optional (R956: a path to a `.bclicense` file, passed as al-runner's license switch on every al-runner call that runs tests, one-shot and serve; refused by name when the file is missing; its path and sha256 (never its contents) are in the report's `executionContexts[]` and its hash is in the run fingerprint, so a run under another license is not resumed; a test al-runner refuses with "no license file loaded" is reported with a pointer to this setting), `memoryHeadroomGb` optional (R948: default 4, `0` = off; no new test call starts while the container's memory, read from its cgroup, is over `memory.max` less this many GiB; if it stays over for five minutes the run stops by name and the report says `timeBudget.stoppedByMemory`). A serve-entries session also records ` baseline-daemon` in its lending build (its baseline comes from one serve daemon), so runs stored before R948 are not lent to or resumed by a new serve-entries session, nor the other way round: start a fresh run; the section alone is a complete config, see
+  `coverage`, `path`, `alcPath`, `cacheDir`, `downloadDemoData` optional (R885: al-runner downloads the CRONUS demo data of `bcVersion` into `cacheDir` unless `downloadDemoData` is `false`; with it on, the feed's copy replaces an older Microsoft app in `.alpackages`), `dotnetSidecar` optional (R886: a path to al-runner's .NET helper, passed as `--dotnet-sidecar`; absent: the pinned build's own, when the update script built one; `false`: none), `license` optional (R956: a path to a `.bclicense` file, passed as al-runner's license switch on every al-runner call that runs tests, one-shot and serve; refused by name when the file is missing; its path and sha256 (never its contents) are in the report's `executionContexts[]` and its hash is in the run fingerprint, so a run under another license is not resumed; a test al-runner refuses with "no license file loaded" is reported with a pointer to this setting), `memoryHeadroomGb` optional (R948: default 4, `0` = off; no new test call starts while the container's memory, read from its cgroup, is over `memory.max` less this many GiB; if it stays over for five minutes the run stops by name and the report says `timeBudget.stoppedByMemory`), `recheckWithheldKills` optional (PR-144: ON by default since PR-182; `false` opts out and saves about 10% of a run with many withheld rows, nothing when a run has none. Evidence (PR-170): of 58 sampled recovered kills, BC confirmed 42 and found 0 false; 16 could not be measured (9 TestPage-only killers, 7 killers red at BC's baseline). A row the recheck does not recover stays `error`, unmeasured, never a kill. The recheck re-runs the "withheld kill" `error` rows (a covering test failed, but v3 did not trust the failure after an earlier test of its codeunit was refused) alone, one test per session, after the main pass, as its own step with its own `recheckBudgetSeconds` (default 3600). Serve transport only, and not with `"isolation": "method"`. A row becomes `killed` only when the kill reproduced, the killing test passed alone at the recheck baseline, the same al-runner binary and source ran, and every test of the killing test's codeunit that passed in the main baseline still passes alone in the recheck (the recheck runs them all; one that fails, is refused or has no result keeps `error`). That rule cannot judge tests v3 refused at baseline, so it does not answer whether a refused test's state mattered; only a BC comparison does. Every other outcome keeps `error`. Warning: kills recovered this way are not measured against BC; they may be false where an earlier test that al-runner refused would have set state on BC. The recheck is exercised live by the al-runner-v3 gate's leg RC (PR-162) on a fixture built to withhold a kill, and measured against BC on a DO sample (PR-170: 42 of 58 recovered kills confirmed, 0 false). The report names them in the caveat `isolated-recheck-kills` and each row's `isolatedRecheck`; `--resume` does not carry them), `recheckBudgetSeconds` optional (PR-144: whole seconds, default 3600). A serve-entries session also records ` baseline-daemon` in its lending build (its baseline comes from one serve daemon), so runs stored before R948 are not lent to or resumed by a new serve-entries session, nor the other way round: start a fresh run; the section alone is a complete config, see
   [Running without a BC server](#running-without-a-bc-server-the-al-runner-v3-backend)). Measured on alpha.2 and re-read on alpha.5 and its edge build (the same readings), it
   differs from BC in ways that change
   verdicts:

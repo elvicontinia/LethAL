@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { IDENTITY_SCHEME } from "@lethal/schemata";
 import type { MutantManifest, MutantManifestEntry } from "@lethal/schemata";
 import { verdictFromRunnerTest } from "../src/al-runner-rows";
+import { V3_NOT_RUN_SUFFIX } from "../src/al-runner-v3-backend";
 import { reserveAppVersion } from "../src/app-version";
 import type { CompiledArtifact } from "../src/artifact";
 import type {
@@ -31,7 +32,7 @@ import {
   runSession as runSessionRaw,
 } from "../src/orchestrator";
 import type { AttestationLedger } from "../src/orchestrator";
-import { ERROR_CAUSE_INTERPRETATIONS, renderConsole } from "../src/report";
+import { ERROR_CAUSE_INTERPRETATIONS, renderConsole, withheldKillOf } from "../src/report";
 import type { SessionReport } from "../src/report";
 import {
   CARRYABLE_VERDICTS,
@@ -48,6 +49,8 @@ import { RUNNER_DISAGREEMENT_NOTE } from "../src/runner-disagreement";
 import { serializeKey } from "../src/selection";
 import { ResultsStore } from "../src/store";
 import type { MutantVerdictRow } from "../src/store";
+import { recheckTargetsOf } from "../src/withheld-recheck";
+import { BaselineWorkDateUnstableError, WorkDateGuard } from "../src/workdate-guard";
 import { characterize, recording, traceEvents } from "./helpers/characterize";
 import type { Trace } from "./helpers/characterize";
 import { buildFakeAppWithEntries } from "./helpers/fake-app";
@@ -1642,6 +1645,8 @@ describe("runSession --resume (R47)", () => {
     expect(batch0After.map((m) => m.mutantCode).sort()).toEqual(
       batch0Before.map((m) => m.mutantCode).sort(),
     );
+    // PR-147: the attribution compare below is not undefined vs undefined throughout
+    expect(batch0Before.some((m) => m.coverageAttribution !== undefined)).toBe(true);
     for (const after of batch0After) {
       const before = batch0Before.find((m) => m.mutantCode === after.mutantCode);
       if (before === undefined) throw new Error(`no prior verdict for ${after.mutantCode}`);
@@ -1653,6 +1658,75 @@ describe("runSession --resume (R47)", () => {
     expect(report.quarantined).toBeUndefined();
     // And the batch that DID have work still ran its baseline and mutants normally.
     expect(report.counts.survived + report.counts.killed).toBeGreaterThan(batch0Before.length);
+  });
+
+  test("PR-185: --resume re-scores a stored withheld-kill error row (never carries it), and the recheck takes it as a target", async () => {
+    // Every mutant run answers as v3's withheld kill: a refused row whose note carries the withheld phrase.
+    const withheld = `NotRun: out-of-scope: a test before this one in the codeunit did not pass (T2: failed with X) and left state; this failure is not trusted: Expected 1 got 2 ${V3_NOT_RUN_SUFFIX}`;
+    class WithheldBackend extends CountingBackend {
+      /** The first run withholds only its 2nd mutant run: a run of errors alone is not resumable at all. */
+      onlySecond = false;
+      private seen = 0;
+      override async run(ref: TestMethodRef, opts: RunOpts): Promise<TestVerdict> {
+        const r = await super.run(ref, opts);
+        const isMutantRun = r.coverage === undefined && r.operation !== "in-flight-unknown";
+        if (isMutantRun) this.seen += 1;
+        return !isMutantRun || (this.onlySecond && this.seen !== 2)
+          ? r // the baseline, the base class's abort, or a plain row
+          : {
+              ...r,
+              outcome: "error",
+              runnerRow: "runner-refused",
+              failureMessage: withheld,
+            };
+      }
+    }
+    const dirs = await makeProject({ secondFile: true });
+    const store = new ResultsStore(":memory:");
+    const firstBackend = new WithheldBackend("pass", undefined, 2); // batch 0 scored, then batch 1 aborts
+    firstBackend.onlySecond = true;
+    const first = await runSession({
+      backend: firstBackend,
+      store,
+      ...dirs,
+      selectorIds,
+      maxGuardsPerBatch: 1,
+    });
+    const stored = first.mutants.filter((m) => withheldKillOf(m.verdict, m.cause, m.failureNote));
+    expect(stored.length).toBeGreaterThan(0); // the control: the first run really stored withheld rows
+
+    const events: RunEvent[] = [];
+    await runSession({
+      backend: new WithheldBackend("pass"),
+      store,
+      ...dirs,
+      selectorIds,
+      maxGuardsPerBatch: 1,
+      resume: "last",
+      emit: [(e) => events.push(e)],
+    });
+    // Mutant ids are minted per session, so a site is matched by file, line and operator.
+    const site = (m: { file: string; operatorName: string }, line: number) =>
+      `${m.file}|${line}|${m.operatorName}`;
+    const carriedSites = new Set(
+      events.flatMap((e) =>
+        e.type === "mutant-carried" ? [site(e.mutant, e.mutant.startLine)] : [],
+      ),
+    );
+    const scoredSites = new Set(
+      events.flatMap((e) =>
+        e.type === "mutant-scored" ? [site(e.mutant, e.mutant.startLine)] : [],
+      ),
+    );
+    const targetSites = new Set(
+      recheckTargetsOf(events).map((t) => site(t.mutant, t.mutant.startLine)),
+    );
+    for (const s of stored) {
+      const k = site(s, s.line);
+      expect(carriedSites.has(k)).toBe(false);
+      expect(scoredSites.has(k)).toBe(true);
+      expect(targetSites.has(k)).toBe(true);
+    }
   });
 
   test("R192 (second half): a batch with work left is deployed but its baseline is NOT re-run when nothing it measured changed", async () => {
@@ -1719,6 +1793,172 @@ describe("runSession --resume (R47)", () => {
         .sort();
     expect(verdictsOf(report)).toEqual(verdictsOf(control));
     expect(report.validity.baselineTests).toEqual(control.validity.baselineTests);
+  });
+
+  // R1131 (PR-196): a snapshot is reused only on an equal start WorkDate. `Dated` is a CountingBackend whose answers
+  // carry `date` and go through the real guard, as bcdev's do; `seenBefore` plays "an earlier answer of this session".
+  // `fresh` is what HarnessInfo reads at each deploy (default: `date`; `null`: the read is missing).
+  class Dated extends CountingBackend {
+    readonly guard = new WorkDateGuard(true);
+    private pendingFresh: string | undefined;
+    constructor(
+      private readonly date: string | undefined | (() => string),
+      abortFromDeploy?: number,
+      private readonly fresh: string | null = typeof date === "string" ? date : null,
+    ) {
+      super("pass", undefined, abortFromDeploy);
+    }
+    override async deploy(dir: string) {
+      this.pendingFresh = this.fresh ?? undefined;
+      return super.deploy(dir);
+    }
+    override async run(ref: TestMethodRef, opts: RunOpts): Promise<TestVerdict> {
+      const v = await super.run(ref, opts);
+      if (this.date === undefined) return v;
+      const workDate = typeof this.date === "function" ? this.date() : this.date;
+      return this.guard.check({ ...v, workDate });
+    }
+    baselinePhase(on: boolean): void {
+      this.guard.baselinePhase(on);
+    }
+    batchWorkDate(): string | undefined {
+      return this.guard.batchWorkDate();
+    }
+    refuseReusedBaselineDate(d: string | undefined): string | undefined {
+      const fresh = this.pendingFresh;
+      this.pendingFresh = undefined;
+      return this.guard.refuseReuse(d, fresh);
+    }
+    noteReusedBaseline(): void {
+      this.guard.noteReused();
+    }
+  }
+  const resumeWith = async (first: CountingBackend, second: Dated) => {
+    const dirs = await makeProject({ secondFile: true });
+    const store = new ResultsStore(":memory:");
+    await runSession({ backend: first, store, ...dirs, selectorIds, maxGuardsPerBatch: 1 });
+    const events: RunEvent[] = [];
+    await runSession({
+      backend: second,
+      store,
+      ...dirs,
+      selectorIds,
+      maxGuardsPerBatch: 1,
+      resume: "last",
+      emit: [(e) => events.push(e)],
+    });
+    const codes = (code: string) =>
+      events.filter((e) => e.type === "warning" && e.code === code).length;
+    return {
+      events,
+      reused: codes("resume-baseline-reused"),
+      notReused: codes("resume-baseline-not-reused"),
+    };
+  };
+
+  test("R1131: a snapshot whose date equals the fresh read is reused, batch 0 and a later batch", async () => {
+    const second = new Dated("2026-11-19");
+    const r = await resumeWith(new Dated("2026-11-19", 2), second);
+    expect(second.baselineRuns).toBe(0);
+    expect(r.reused).toBe(2);
+    expect(r.notReused).toBe(0);
+  });
+
+  test("R1131: a missing fresh date refuses reuse, by name", async () => {
+    const second = new Dated("2026-11-19", undefined, null);
+    const r = await resumeWith(new Dated("2026-11-19", 2), second);
+    expect(r.reused).toBe(0);
+    expect(second.baselineRuns).toBeGreaterThan(0);
+    expect(
+      r.events.some(
+        (e) =>
+          e.type === "warning" &&
+          e.code === "resume-baseline-not-reused" &&
+          e.message.includes("no fresh start WorkDate"),
+      ),
+    ).toBe(true);
+  });
+
+  test("R1131: two baseline dates inside one baseline abort the session by name", async () => {
+    let n = 0;
+    const flapping = new Dated(() => (n++ % 2 === 0 ? "2026-11-19" : "2026-11-20"));
+    const dirs = await makeProject({ secondFile: true });
+    // Two tests, so one baseline makes two calls.
+    await Bun.write(
+      join(dirs.testDir, "SandboxTests.Codeunit.al"),
+      TEST_AL.replace(
+        "    end;\n}",
+        "    end;\n\n    [Test]\n    procedure Second()\n    begin\n    end;\n}",
+      ),
+    );
+    await expect(
+      runSession({
+        backend: flapping,
+        store: new ResultsStore(":memory:"),
+        ...dirs,
+        selectorIds,
+        maxGuardsPerBatch: 1,
+      }),
+    ).rejects.toBeInstanceOf(BaselineWorkDateUnstableError);
+  });
+
+  test("R1131: a snapshot measured on another start WorkDate is not reused; the baseline runs again", async () => {
+    const second = new Dated("2026-11-20");
+    const r = await resumeWith(new Dated("2026-11-19", 2), second);
+    expect(r.reused).toBe(0);
+    expect(r.notReused).toBeGreaterThan(0);
+    expect(second.baselineRuns).toBeGreaterThan(0);
+    expect(
+      r.events.some(
+        (e) =>
+          e.type === "warning" &&
+          e.code === "resume-baseline-not-reused" &&
+          e.message.includes("2026-11-19") &&
+          e.message.includes("2026-11-20"),
+      ),
+    ).toBe(true);
+  });
+
+  test("R1131: a snapshot with no start WorkDate (stored before control 1.0.0.28) is never reused", async () => {
+    const second = new Dated("2026-11-19");
+    const r = await resumeWith(new CountingBackend("pass", undefined, 2), second);
+    expect(r.reused).toBe(0);
+    expect(second.baselineRuns).toBeGreaterThan(0);
+    expect(
+      r.events.some(
+        (e) =>
+          e.type === "warning" &&
+          e.code === "resume-baseline-not-reused" &&
+          e.message.includes("records no start WorkDate"),
+      ),
+    ).toBe(true);
+  });
+
+  test("R1131: the baseline's start WorkDate travels on baseline-batch-finished into the report", async () => {
+    const dirs = await makeProject({ secondFile: true });
+    const events: RunEvent[] = [];
+    const report = await runSession({
+      backend: new Dated("2026-11-19"),
+      store: new ResultsStore(":memory:"),
+      ...dirs,
+      selectorIds,
+      maxGuardsPerBatch: 1,
+      emit: [(e) => events.push(e)],
+    });
+    const finished = events.filter((e) => e.type === "baseline-batch-finished");
+    expect(finished.length).toBeGreaterThan(0);
+    for (const e of finished)
+      expect(e.type === "baseline-batch-finished" && e.workDate).toBe("2026-11-19");
+    expect(report.baselineWorkDate).toBe("2026-11-19");
+    // A backend that reports no date (al-runner, hub mode) leaves the field absent.
+    const plain = await runSession({
+      backend: new CountingBackend("pass"),
+      store: new ResultsStore(":memory:"),
+      ...(await makeProject({ secondFile: true })),
+      selectorIds,
+      maxGuardsPerBatch: 1,
+    });
+    expect("baselineWorkDate" in plain).toBe(false);
   });
 
   test("R678: a session whose every batch reuses its snapshot hands the reused baseline to the backend, so a stored refusal still notes a survivor", async () => {
@@ -5400,7 +5640,7 @@ describe("R514: a reused baseline's durations set today's budgets", () => {
     expect(stale).toHaveLength(1);
     expect(renderConsole(report)).toContain(", reused-budget-stale 1])");
     const out = explain(report);
-    expect(out.explainSchemaVersion).toBe(29);
+    expect(out.explainSchemaVersion).toBe(33);
     const rows = out.notMeasured.filter((n) => n.cause === "reused-budget-stale");
     expect(rows).toHaveLength(1);
     for (const r of rows) {

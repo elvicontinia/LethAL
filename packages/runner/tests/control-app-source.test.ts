@@ -224,6 +224,61 @@ const at = (body: string, needle: string): number => {
   return i;
 };
 
+describe("R1127: each method starts on the client's default WorkDate", () => {
+  // The Test Runner's Initialize (130453) stores the WorkDate set before RunTests and restores it after the codeunit,
+  // so the set must come after the run's positioning FindFirst and before the reset/note pair, with no other
+  // WorkDate( write in between.
+  test("LC Run Many: GetDefaultWorkDate once per call, WorkDate set before each method's run", () => {
+    const body = codeOnly(procedureBody(read("RunMany.Codeunit.al"), "RunAll"));
+    const computed = at(body, "StartWorkDate := LogInMgt.GetDefaultWorkDate();");
+    const loop = at(body, "foreach Entry in Methods do begin");
+    const find = at(body, "RunLine.FindFirst();");
+    const set = at(body, "WorkDate(StartWorkDate);");
+    const reset = at(body, "State.ResetObservedActive();");
+    expect(computed).toBeLessThan(loop);
+    expect(loop).toBeLessThan(find);
+    expect(find).toBeLessThan(set);
+    expect(set).toBeLessThan(reset);
+    expect(body.match(/\bWorkDate\(/g)?.length).toBe(1); // \b: GetDefaultWorkDate( is not a set
+    expect(body.match(/StartWorkDate :=/g)?.length).toBe(1);
+  });
+  test("LC Run Method: WorkDate set from GetDefaultWorkDate after the positioning FindFirst, before the note", () => {
+    const body = codeOnly(procedureBody(read("RunMethod.Codeunit.al"), "RunOneMethod"));
+    const set = at(body, "WorkDate(LogInMgt.GetDefaultWorkDate());");
+    const note = at(body, "State.NoteTestMethodRun();");
+    const run = at(body, "Mgt.RunAllTests(Line);");
+    expect(body.lastIndexOf("Line.FindFirst();", set)).toBeGreaterThan(0);
+    expect(body.lastIndexOf("Line.FindFirst();", set)).toBeGreaterThan(
+      body.lastIndexOf('Line.SetRange("Test Suite", RunSuiteName);', set),
+    );
+    expect(set).toBeLessThan(note);
+    expect(note).toBeLessThan(run);
+    expect(body.match(/\bWorkDate\(/g)?.length).toBe(1); // \b: GetDefaultWorkDate( is not a set
+  });
+  test("R1131: each answer that ran a method returns the start WorkDate it set, as ISO text", () => {
+    // RunMany: one `workDate` per per-method object, from the date it set before that method.
+    const many = codeOnly(procedureBody(read("RunMany.Codeunit.al"), "RunAll"));
+    expect(many).toContain("One.Add('workDate', Format(StartWorkDate, 0, 9));");
+    // RunMethod: read back right after the set, before the run, and handed out through a getter.
+    const method = codeOnly(procedureBody(read("RunMethod.Codeunit.al"), "RunOneMethod"));
+    const set = at(method, "WorkDate(LogInMgt.GetDefaultWorkDate());");
+    const text = at(method, "StartWorkDateText := Format(WorkDate, 0, 9);");
+    expect(set).toBeLessThan(text);
+    expect(text).toBeLessThan(at(method, "Mgt.RunAllTests(Line);"));
+    expect(read("RunMethod.Codeunit.al")).toContain("procedure StartWorkDate(): Text");
+    // BuildStatus adds it only when a method ran (a blank date is a fail-closed answer).
+    const status = codeOnly(procedureBody(read("ControlApi.Codeunit.al"), "BuildStatus"));
+    expect(status).toContain("if WorkDateText <> '' then");
+    expect(status).toContain("Obj.Add('workDate', WorkDateText);");
+    expect(read("ControlApi.Codeunit.al")).toContain("Runner.StartWorkDate()));");
+  });
+  test("R1131 amendment 2: HarnessInfo returns the fresh start WorkDate the same way, with no test run", () => {
+    const info = codeOnly(procedureBody(read("ControlApi.Codeunit.al"), "HarnessInfo"));
+    expect(info).toContain("Obj.Add('workDate', Format(LogInMgt.GetDefaultWorkDate(), 0, 9));");
+    expect(info.match(/\bWorkDate\(/g)).toBeNull(); // reads only, never sets the session's WorkDate
+  });
+});
+
 describe("GH-24: ObservedActive, reset per method and read after ProgressBetween", () => {
   test("LC Run Many resets ObservedActive right before each method runs", () => {
     const body = procedureBody(read("RunMany.Codeunit.al"), "RunAll");

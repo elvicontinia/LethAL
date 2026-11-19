@@ -709,7 +709,7 @@ const SAFE_TAIL = `(?!.*(?:${V3_TAIL_UNSAFE_WORDS.map(anyCase).join("|")}))`;
  * measured type (`DOTNET_CLEAN_EXCEPTIONS`), a call on a variable that holds no object, an assembly that
  * is not there at all, a member or overload not found, a stream never created, and the one policy member
  * `System.TimeZoneInfo.Local`. Never measured, so still closing: an
- * unassigned Variant used as a stream, an unassigned XmlElement, and every other wording. The two
+ * unassigned Variant used as a stream, and every other wording (an unassigned XmlElement was kept later, by PR-191). The two
  * free-text tails take `SAFE_TAIL`, and no entry spans a line break. Not in the update gate's
  * `serve-keep-reasons` fact (it runs without the .NET helper): a reworded text stops matching and the
  * daemon closes again, the safe direction, counted in `v3DaemonCloses`.
@@ -769,8 +769,17 @@ const PR56_SLOTS: Readonly<Record<string, string>> = {
   DATETEXT: "(?:-1M|-2026-09-01)",
   // PR-105 added C10000 (t12/t13), and the Evaluate whitespace widths (runs of NUL characters, 4 to 6) and the two
   // Integer texts (`=18`, `1=18`) the same way: measured, by name.
-  BIGCODE: "(?:GL00000000|GU00000001|C10000)",
-  NULS: String.raw`\x00{4,6}`,
+  // PR-133 added C\* (the regex-escaped text `C*`), measured by family `x2-refusals`, census CLEAN at
+  // /coord/handoff/PR-133/census2/ with two refusers: a plain SetFilter, and one that unwinds through a TryFunction,
+  // an OnValidate, a ModalPageHandler and an open TestPage (the state DO reaches it in).
+  BIGCODE: String.raw`(?:GL00000000|GU00000001|C10000|C\*)`,
+  // PR-139 added every NUL width M28736's DO requests hold (3, 7, 9-14, 16, 21, 25, 27, 30, 37, 40), each by name: x3 closed on
+  // 7 of them, and the rest share those requests, which a daemon keeps only if every refusal in it is kept. Family
+  // `x3-refusals` measured every width CLEAN (/coord/handoff/PR-139/census2/; the width-10 class with an array, a TryFunction,
+  // a nested modal-page and an OnInsert refuser). Direct checks on DO: a daemon kept through 207 refusals gave the same 443
+  // rows as fresh daemons, and its next request with no mutant matched fresh ones too.
+  // Spec (with amendment 1): docs/superpowers/specs/2026-11-18-pr139-x3-restarts-precommitment.md.
+  NULS: String.raw`(?:\x00{3}|\x00{4,6}|\x00{7}|\x00{9}|\x00{10}|\x00{11}|\x00{12}|\x00{13}|\x00{14}|\x00{16}|\x00{21}|\x00{25}|\x00{27}|\x00{30}|\x00{37}|\x00{40})`,
   INTTEXT: "(?:=18|1=18)",
   // PR-93: the two writer states t10/t11 met for WritePropertyName, both measured.
   ARRAYSTATE: "(?:ArrayStart|Array)",
@@ -780,7 +789,24 @@ const PR56_SLOTS: Readonly<Record<string, string>> = {
   // PR-74 review M2: the measured path `a`, plus t9's three paths by name (the path is the writer's own
   // nesting, not engine state; a widening by name, not a measurement).
   // PR-105 added the path t12/t13 met, measured by its own cell.
-  JSONPATH: String.raw`(?:a|message|message\.ccRecipients\[0\]|message\.toRecipients\[0\]|message\.body\.ccRecipients\[0\]\.emailAddress)`,
+  // PR-159 added message.body.toRecipients[0].emailAddress, measured by family `y1-refusals`, census CLEAN at
+  // /coord/handoff/PR-159/census/. Not measured: DO's `CDO Microsoft Graph Rest Api`, reached from
+  // `CDO Send Mail Management.SendMSGraphMail`, can reach the same text in a deeper state (spec L4; no DO test reaches it
+  // today, and the kept ccRecipients[0] path has the same exposure).
+  JSONPATH: String.raw`(?:a|message|message\.ccRecipients\[0\]|message\.toRecipients\[0\]|message\.body\.ccRecipients\[0\]\.emailAddress|message\.body\.toRecipients\[0\]\.emailAddress)`,
+  // PR-159: the Integer values the GetTable keep covers, each by name: 123 (PR-133) and 12345 (family `y1-refusals`, census
+  // CLEAN at /coord/handoff/PR-159/census/, a plain call and one behind an `IsRecord` guard). No integer pattern.
+  GETTABLEINT: "(?:123|12345)",
+  // PR-191 (spec 2026-11-19-pr191-y2-xml-keeps-precommitment.md, amendment 1 LOW-1): the XML element names DO's M36754 passes
+  // (an inner text made the name: base64 of a blob, a MIME type) hold random test data, so this slot is a bounded character
+  // class, not names. Its ends and classes are each measured by family `y2-xml` (census CLEAN, /coord/handoff/PR-191/census3/):
+  // `+`, a leading digit, `/` (`image/jpeg`, `application/pdf`), a trailing `=`, and 16, 76, 1,336 and 2,000 characters. The
+  // bound is the longest y2 name (1,336) plus about 50%. A longer name, or any other character, closes. The empty name is
+  // PR-56's `xml-name-empty`.
+  XMLNAME: "[A-Za-z0-9+/=]{1,2000}",
+  // PR-195 (spec 2026-11-19-pr195-y2-collation-keep-precommitment.md): the two code points DO's codeunit 68986 meets under the
+  // four toggle-blank-string mutants of `IsAsciiAlphaNumeric`, each by name (U+516C CJK, U+041A Cyrillic). No code-point pattern.
+  COLLCHAR: "(?:516C|041A)",
 };
 /** PR-56: an anchored entry from a text (after "NotRun: out-of-scope: ") with `%SLOT%` placeholders. */
 const pr56Entry = (template: string): RegExp =>
@@ -1108,6 +1134,46 @@ const PR56_KEPT: ReadonlyArray<readonly [string, string]> = [
     "report-saveas2-untouched-handle",
     "Report.SaveAs#2 to an untouched handle, which is not an OutStream",
   ],
+  // PR-133 (coord PR-133, spec 2026-11-17-pr133-x2-restarts-precommitment.md): two of the texts DO's x2 window
+  // still closed its daemon on, each driven by an invented cell of family `x2-refusals` to the exact text and
+  // measured CLEAN by PR-54's strict census (`--refusers 7`, `/coord/handoff/PR-133/census2/`): `C*` joins BIGCODE
+  // above, and the GetTable entry below is new.
+  // Not kept: Report.RunRequestPage (DO reaches it with no request-page handler, on a BaseApp report, inside an
+  // open write transaction, and nothing measured what report code runs before the refusal: spec r2 H1/H2), the
+  // SaveAs-with-layout errors and the placeholder Pdf read (they need BaseApp's own reports). Pinned by `al-runner-serve-pr133.test.ts`.
+  // PR-159 (spec 2026-11-18-pr159-y1-sibling-keeps-precommitment.md): 12345 joins 123 by name (slot %GETTABLEINT%).
+  ["recordref-gettable-integer-123", "RecordRef.GetTable of Integer %GETTABLEINT%"],
+  // PR-191 (spec 2026-11-19-pr191-y2-xml-keeps-precommitment.md, with amendment 1): the five XML texts DO's y2 window closed
+  // its daemon on 30 times (8 mutants in DO's XML wrapper codeunits), each driven by invented cells of family `y2-xml` and
+  // measured CLEAN by the strict census with three extra readers that see a leftover subscriber binding, a SingleInstance
+  // global and XML engine state (`--refusers 7`, /coord/handoff/PR-191/census3/). The refusers: a never-set wrapper global
+  // reached through a `var` wrapper parameter, a value copied through a by-value one, a list child never fetched; an
+  // unassigned element's SetAttribute and HasAttributes; XmlDocument.Add and the second argument of a multi-content Add; an
+  // unassigned collection's Get; at depth 2 to 6, the deep cells after a Commit, a Blob OutStream write, a bound manual
+  // subscriber and a set SingleInstance codeunit. Passing control cells show where each refuses: the by-var and by-value
+  // setters alone pass (the refusal is at the use), and the deep setup runs (subscriber hit once, SingleInstance set, blob
+  // row written) before the deep refusers' last call. Not measured (one text can come from other builtins too): every other
+  // builtin that meets an unassigned XmlNode, XmlElement or XmlAttributeCollection; the two-argument SetAttribute DO's M36708
+  // reaches (it fails in the cell, so the three-argument form is the measured refuser); and every builtin other than
+  // XmlElement.Create that gives the XML-name text (attribute names, for one). The next DO window's P4 is what would catch
+  // one. Pinned by `al-runner-serve-pr191.test.ts`.
+  ["xml-unassigned-node", "use of an unassigned XmlNode"],
+  ["xml-unassigned-element", "use of an unassigned XmlElement"],
+  ["xml-node-as-content", "XmlNode as XML content (only XML nodes and text are pinned)"],
+  ["xml-attribute-collection-other", "XmlAttributeCollection method on something else"],
+  [
+    "xml-name-measured-chars",
+    "XML name `%XMLNAME%` (only plain names without a prefix are pinned)",
+  ],
+  // PR-195 (spec 2026-11-19-pr195-y2-collation-keep-precommitment.md, with amendment 1): y2's collation refusal (4 closes,
+  // 214.2 s), an unmodelled sort weight, not a state question (BC's answer reported on upstream #8203). Family `y2-collation`
+  // (a SingleInstance refuser with a global set, a TextBuilder filled in a loop, depth 3; after an insert or a SingleInstance
+  // value) measured CLEAN by the strict census with readers for that global, a SingleInstance value and text ordering
+  // (`--refusers 7`, /coord/handoff/PR-195/census/), AND a direct DO check (P5, /coord/handoff/PR-195/p5/): the 4 mutants'
+  // requests, then no mutant, then 3 other mutants of the file, on ONE daemon, every row equal to fresh daemons. Not measured:
+  // the same code points from another operation (a key or record ordering); in DO only codeunit 68986 holds such characters.
+  // Pinned by `al-runner-serve-pr195.test.ts`.
+  ["collation-no-weight-measured", "ordering of the character U+%COLLCHAR% (no collation weight)"],
 ];
 export const V3_SERVE_SAFE_REFUSALS: Readonly<Record<string, RegExp>> = {
   ...Object.fromEntries(PR56_KEPT.map(([name, text]) => [name, pr56Entry(text)])),

@@ -18,6 +18,7 @@ import {
   evaluateArms,
   formatRefusal,
   initParser,
+  normalizeAlName,
   parseAL,
   procedureLikeNameNode,
   startsInInactiveArm,
@@ -40,6 +41,7 @@ import {
   type TierResolver,
   assignMutantIds,
   canCarryMutationSelectorVar,
+  clipMutationText,
   coarseIdentityTupleOf,
   dedupeSpecs,
   describeObjectKinds,
@@ -131,6 +133,15 @@ import {
   resumableTestApp,
   sameClosedWorld,
 } from "./closed-world";
+import { companyWriteLines, companyWriteMethods } from "./company-writes";
+import {
+  V3_NOCOV_REFUSAL_LEAD,
+  assertSameScope,
+  narrowToConfirmed,
+  planConfirm,
+  scopeOfReport,
+  scopeOfRun,
+} from "./confirm";
 import { rewriteControlAddInPaths } from "./controladdin-paths";
 import {
   type DependencyReportSourceRecord,
@@ -173,6 +184,7 @@ import type { HangRefusedFile, PreprocExcludedFile } from "./excluded-sites";
 import { ActivationFailure } from "./failure-classes";
 import { UnfilteredExtensionsQueryError } from "./harness";
 import { homeDir } from "./home";
+import { type HttpPolicySummary, httpPolicyOf } from "./http-policy";
 import {
   IsolationChoiceChangedError,
   type IsolationChoiceRow,
@@ -354,6 +366,7 @@ import {
 } from "./testpage-scan";
 import {
   type FrameSourceLookup,
+  REQUEST_PAGE_DIAGNOSIS,
   describeTestPageRefusal,
   frameSourceLookup,
   isTestPageNotRunMessage,
@@ -362,6 +375,12 @@ import {
 import { AlRunnerV2RetiredError, RETIRED_V2_BACKEND, v2RetiredRun } from "./v2-retired";
 import { onSkippedLinks, refuseProjectLinks, walkFiles } from "./walk";
 import { describeWebServiceHttpText } from "./webservice-http-text";
+import {
+  type RecheckRunner,
+  recheckSiteKey,
+  runWithheldRecheck,
+  shouldRunRecheck,
+} from "./withheld-recheck";
 
 // C02-04b: named-mutants.ts is not part of the package's `export *` barrel (index.ts), so its
 // public types are re-exported one by one from here, the module the barrel does list.
@@ -717,6 +736,12 @@ export interface MutationSetOptions {
    * so does a filter that keeps nothing.
    */
   readonly lines?: readonly LineRange[];
+  /**
+   * PR-144: exact sites, as `recheckSiteKey` values (file, span, operator, mutated text). When present, only
+   * a spec with one of these keys is kept, after `lines`. Used by the withheld-kill recheck, which re-runs
+   * those mutants and no other on their lines.
+   */
+  readonly exactSites?: ReadonlySet<string>;
   /**
    * When present, this function's four `console.warn` calls emit `{ type: "warning" }` events on
    * it instead — `runSession` always passes one (defaulting to a no-op emitter). Absent for the
@@ -1376,6 +1401,24 @@ export async function generateMutationSet(
       }
       fileSpecs = selected;
     }
+    // PR-144: the withheld-kill recheck keeps exactly its own sites, after the line filter (which has
+    // already reduced to dedup survivors); the others on those lines are numbered nothing, as above.
+    if (options.exactSites !== undefined) {
+      const exact = options.exactSites;
+      const selected: MutationSpec[] = [];
+      for (const spec of fileSpecs) {
+        const key = recheckSiteKey({
+          file: rel,
+          startIndex: spec.before.startIndex,
+          endIndex: spec.before.endIndex,
+          operatorName: spec.operatorName,
+          mutatedText: clipMutationText(spec.after.text),
+        });
+        if (exact.has(key)) selected.push(spec);
+        else hiddenTuples.push(coarseOf(spec));
+      }
+      fileSpecs = selected;
+    }
     if (fileSpecs.length === 0) continue;
     for (const spec of fileSpecs) producedAnywhere.add(spec.operatorName);
     if (!canCarryMutationSelectorVar(root)) {
@@ -1713,6 +1756,40 @@ export interface SessionConfig {
    * `survived` or `no-coverage`; the report says so (`tests-narrowed`, `excludedTests`).
    */
   readonly excludeTests?: readonly string[];
+  /**
+   * PR-212 (R1113): run the test methods that write the Company table. By default a bcdev run (envtool too) LEAVES
+   * THEM OUT by name (`excludedTests`, reason `company-write`; `tests-narrowed`), and a no-coverage mutant in an
+   * object they name is `error` / `left-out-test-reach`. al-runner-v3 never leaves them out.
+   */
+  readonly keepCompanyTests?: boolean;
+  /**
+   * PR-144, the withheld-kill recheck's nested session only: `Codeunit.Method` names; the suite is cut to
+   * exactly these, after `--tests-only`. Sound only where each test runs alone, so it is refused unless the
+   * backend runs method isolation. A name matching no test is refused.
+   */
+  readonly keepOnlyTests?: readonly string[];
+  /** PR-144, the nested session only: see `MutationSetOptions.exactSites`. */
+  readonly exactSites?: ReadonlySet<string>;
+  /**
+   * PR-171 (R1122, `--confirm-from`): deploy only the mutants a v3 report selected (its noted
+   * survivors, its R609 no-coverage rows, and a seeded sample of unnoted survivors). The CLI reads the
+   * file; this holds its parsed JSON and the sha256 of its bytes. The filter runs after identity
+   * ordinals are numbered over the full set (see `narrowToConfirmed`), and every refusal is made
+   * before anything is deployed. Refused beside `skipKnownSurvivors`, `resume` and `exactSites`.
+   */
+  readonly confirm?: {
+    readonly inputPath: string;
+    readonly input: unknown;
+    readonly inputSha256: string;
+    readonly sample?: number;
+    readonly seed?: string;
+  };
+  /**
+   * PR-144 (`alRunnerV3.recheckWithheldKills`): after the main pass, re-run this session's withheld-kill
+   * rows through `runner` (a nested session on a method-isolation backend) as its own step, with its own
+   * budget, and replace each by a `mutant-rechecked` event. Absent: no recheck.
+   */
+  readonly recheck?: { readonly budgetSeconds: number; readonly runner: RecheckRunner };
   /**
    * R44: maximum injected guards per published artifact — see `PlanOptions.maxGuardsPerBatch`.
    * Absent means one artifact for everything, which is not publishable for a real app.
@@ -3407,7 +3484,10 @@ async function singleStep(
         ? { cause: out.verdict.stopRefusal }
         : out.verdict.runnerRow !== undefined
           ? { cause: out.verdict.runnerRow }
-          : {}),
+          : // R1131: the bcdev backend's start-WorkDate refusal, taken as a step cause like R198's.
+            out.verdict.workDateRefusal !== undefined
+            ? { cause: out.verdict.workDateRefusal }
+            : {}),
     testBudgetMs: ms,
     testBudgetSource: source,
     groupBudgetMs: ms,
@@ -3448,9 +3528,13 @@ async function* coveringRuns(args: {
   readonly group: GroupRunSettings | undefined;
   readonly mutantId: string;
   readonly skip: ReadonlySet<number>;
+  /** PR-81 (L1): runs just before each test is sent (a held confirm's re-activation). */
+  readonly beforeRun?: () => Promise<void>;
 }): AsyncGenerator<CoveringStep, void, undefined> {
-  const single = (ref: TestMethodRef): Promise<CoveringStep> =>
-    singleStep(args, ref, args.budgetOf(ref));
+  const single = async (ref: TestMethodRef): Promise<CoveringStep> => {
+    await args.beforeRun?.();
+    return singleStep(args, ref, args.budgetOf(ref));
+  };
   const skipped = (ref: TestMethodRef) => args.skip.has(ref.codeunitId);
   const group = args.group;
   if (group === undefined || args.backend.runMany === undefined) {
@@ -3515,6 +3599,7 @@ async function* coveringRuns(args: {
       stopGraceMs: group.stopGraceMs,
     };
     const groupBudgetMs = group.requestCeilingMs + group.stopGraceMs;
+    await args.beforeRun?.();
     const out = await runFencedMany(
       args.backend,
       args.safety,
@@ -4996,7 +5081,10 @@ function handNotify(backend: ExecutionBackend, emit: RunEmitter): () => void {
   backend.setRequestSizedSink?.((s) => emit({ type: "serve-request-sized", ...s }));
   // PR-100: each serve request's wall time and al-runner's own timings (events stream only).
   backend.setRequestTimedSink?.((t) => emit({ type: "serve-request-timed", ...t }));
+  // PR-113: each baseline one-shot call's wall time (events stream only).
+  backend.setBaselineOneShotSink?.((t) => emit({ type: "baseline-one-shot-timed", ...t }));
   return () => {
+    backend.setBaselineOneShotSink?.(undefined);
     backend.setRequestTimedSink?.(undefined);
     backend.setNotify?.(undefined);
     backend.setDaemonCloseSink?.(undefined);
@@ -5998,6 +6086,19 @@ async function scoreBatch(scope: BatchScope, input: ScoreBatchInput): Promise<Sc
           reused = undefined;
         }
       }
+      // R1131: a bcdev snapshot is reused only on an equal start WorkDate. A snapshot without one (stored
+      // before control app 1.0.0.28) is never reused; this batch's baseline runs again.
+      if (reused !== undefined && backend.refuseReusedBaselineDate !== undefined) {
+        const why = backend.refuseReusedBaselineDate(reused.workDate);
+        if (why !== undefined) {
+          emit({
+            type: "warning",
+            code: "resume-baseline-not-reused",
+            message: `[lethal] resume-baseline-not-reused: run ${reused.runId}'s batch ${reused.batchIndex} baseline is not reused, because ${why}; batch ${batchIdx}'s baseline runs again (R1131).`,
+          });
+          reused = undefined;
+        }
+      }
       // R-236c: a snapshot is found by its two hashes from ANY run of this identity scheme (R318), so
       // it can come from a run with a wider --tests-only. The TestPage scan read only this session's
       // tests, so a saved row for any other test is DROPPED: it must not come back green and be
@@ -6191,7 +6292,7 @@ async function scoreBatch(scope: BatchScope, input: ScoreBatchInput): Promise<Sc
   // all-red path in the caller's `select` callback (`greenTests.length === 0`) rather than only
   // on the happy path.
   // Classification is computed directly against `describeTestPermissionsRefusal`/
-  // `describeTestPageUnsupported`/the stale-test-app sentinel — the SAME pure checks the
+  // `describeTestPageRefusal` (TestPage, Linux page, request page)/the stale-test-app sentinel — the SAME pure checks the
   // `refusedThisBatch`/`testPageThisBatch` loop in the caller's `select` callback also runs,
   // over the SAME domain: the permission/testpage regexes are gated on
   // `didNotPassAtBaseline(b.verdict.outcome)` here for
@@ -6207,6 +6308,7 @@ async function scoreBatch(scope: BatchScope, input: ScoreBatchInput): Promise<Sc
   // one. This is also the ONLY place `unsupportedTests`/`staleTestApp`/`testPageUnsupported` are
   // now sourced from — report-fold.ts folds them from `classification` here, not from a
   // session-level accumulator in this function (event-stream refactor, spec 2026-08-05 §A).
+  const batchWorkDate = backend.batchWorkDate?.();
   emit({
     type: "baseline-batch-finished",
     batchIndex: batchIdx,
@@ -6215,6 +6317,8 @@ async function scoreBatch(scope: BatchScope, input: ScoreBatchInput): Promise<Sc
     ...(baseline.some((b) => stoppedByUs(b.verdict))
       ? { stoppedBudgetMs: scope.baselineTimeoutMs }
       : {}),
+    // R1131: the start WorkDate this batch's baseline ran under (bcdev outside hub mode).
+    ...(batchWorkDate !== undefined ? { workDate: batchWorkDate } : {}),
     verdicts: baseline.map((b) => {
       const classification: BaselineClassification[] = [];
       // R139: a line-count answer is the transport reporting that RunMutant did not return one
@@ -6595,9 +6699,20 @@ async function runSessionBody(
   // report treat it as the same scope as naming them all.
   const admittedForRun = admittedOperatorNames(cfg, [...operatorTiers.keys()]);
   const resolvedOperators = admittedForRun === undefined ? undefined : [...admittedForRun].sort();
+  // PR-171: every refusal that needs only the flags and the v3 file, before the run is announced.
+  const confirmPlan =
+    cfg.confirm === undefined
+      ? undefined
+      : planConfirm({
+          ...cfg.confirm,
+          skipKnownSurvivors: cfg.skipKnownSurvivors === true,
+          resume: cfg.resume !== undefined,
+          exactSites: cfg.exactSites !== undefined,
+        });
   emit({
     type: "run-configured",
     caps,
+    ...(confirmPlan !== undefined ? { confirm: confirmPlan.given } : {}),
     ...(cfg.only !== undefined ? { only: { patterns: cfg.only } } : {}),
     ...(cfg.exclude !== undefined ? { exclude: { patterns: cfg.exclude } } : {}),
     ...(resolvedOperators !== undefined ? { operators: { names: resolvedOperators } } : {}),
@@ -6751,9 +6866,14 @@ async function runSessionBody(
   // the test-app identity). A name matching no test in THIS run's suite is refused here, before the
   // lease and any deploy.
   let tests = chosen.tests;
+  // PR-212: one parse of the test app, read before the suite is narrowed (the company-write check needs it) and
+  // shared with the TestPage scan and the digests below.
+  const testFiles = await readTestAppSources(cfg.testDir);
+  const testModel = buildTestAppModel(testFiles);
   const excludeTestRecords: { test: string; file: string; reason: "exclude-test" }[] = [];
   // R759: the same tests by `testKeyOf`, recorded on the run row for `lethal verify`.
   const excludeTestKeys: string[] = [];
+  const companyWriteKeys: string[] = [];
   if (cfg.excludeTests !== undefined && cfg.excludeTests.length > 0) {
     const split = excludeNamedTests(chosen.tests, cfg.excludeTests);
     if (split.unmatched.length > 0) {
@@ -6777,6 +6897,61 @@ async function runSessionBody(
       excludeTestKeys.push(testKeyOf(t));
     }
   }
+  // PR-212 (R1113): on a BC backend, the test methods that write the Company table are left out by name, through
+  // the same records as `--exclude-test`, unless `--keep-company-tests`. al-runner-v3 opens no BC tier: untouched.
+  const companyWrites = isBcdev(caps.kind) ? companyWriteMethods(testModel, tests) : [];
+  const companyLeftOut = cfg.keepCompanyTests === true ? [] : companyWrites;
+  const companyRecords: { test: string; file: string; reason: "company-write" }[] = [];
+  if (companyLeftOut.length > 0) {
+    const out = new Set(companyLeftOut.map((m) => testKeyOf(m.test)));
+    if (tests.every((t) => out.has(testKeyOf(t)))) {
+      throw new Error(
+        "every test in this run's suite writes the Company table and would be left out; nothing would run. Refusing rather than reporting every mutant as no-coverage. Pass --keep-company-tests to run them.",
+      );
+    }
+    tests = tests.filter((t) => !out.has(testKeyOf(t)));
+    for (const { test: t } of companyLeftOut) {
+      if (t.file === undefined) {
+        throw new Error(
+          `company-write: discovery gave no file for ${qualifiedTestName(t)}; refusing to record an exclusion without one.`,
+        );
+      }
+      companyRecords.push({ test: qualifiedTestName(t), file: t.file, reason: "company-write" });
+      companyWriteKeys.push(testKeyOf(t));
+    }
+  }
+  // §2c (i): the objects the left-out methods name. A no-coverage mutant in one is not measured (see `record`).
+  // Set on every session, so a store reused by a later session never keeps an earlier one's set.
+  setLeftOutReach(
+    cfg.store,
+    new Set(companyLeftOut.flatMap((m) => [...m.reach])),
+    caps.coverage === "none",
+  );
+  // PR-144: the recheck's nested session runs exactly its targets' covering tests. Each runs alone under
+  // method isolation, so leaving the others out cannot change what a kept test sees; under any other mode it
+  // could, so it is refused. A name with no test is refused: a smaller suite than asked for is a wrong baseline.
+  if (cfg.keepOnlyTests !== undefined) {
+    if (cfg.backend.methodIsolation !== true) {
+      throw new Error(
+        "keepOnlyTests (the withheld-kill recheck, PR-144) needs a backend running method isolation: under any other mode a test left out could change what a kept test sees.",
+      );
+    }
+    const want = new Set(cfg.keepOnlyTests);
+    const kept = tests.filter((t) => want.has(qualifiedTestName(t)));
+    const found = new Set(kept.map((t) => qualifiedTestName(t)));
+    const missing = [...want].filter((n) => !found.has(n));
+    if (missing.length > 0) {
+      throw new Error(
+        `keepOnlyTests (PR-144) matched no test for ${missing
+          .slice(0, 5)
+          .map((n) => `"${n}"`)
+          .join(
+            ", ",
+          )}${missing.length > 5 ? ` and ${missing.length - 5} more` : ""} in this run's suite. Refusing rather than running a smaller suite than asked for.`,
+      );
+    }
+    tests = kept;
+  }
   // R488: the UNFILTERED list, every arm read: a look-alike al-runner would also select must be
   // excluded whether or not this session runs it. Given again to every worker below.
   cfg.backend.useDiscoveredTests?.(discovery.unfiltered);
@@ -6798,14 +6973,27 @@ async function runSessionBody(
     .filter((x) => armPolicyApplied || x.reason === "preproc-undecided-kept")
     .map((x) => ({ test: qualifiedTestName(x.test), file: x.file, reason: x.reason }));
   // R745: the tests `--exclude-test` left out ride the same list, reason `exclude-test`.
-  excludedTests.push(...excludeTestRecords);
+  excludedTests.push(...excludeTestRecords, ...companyRecords);
   const unverifiedTestFiles = testArmEvidence.kind === "none" ? [...testArmEvidence.files] : [];
+  // PR-197 (R1113 fix 2): the TestHttpRequestPolicy of every codeunit in the FINAL list, the one the baseline runs.
+  // A nested recheck session (keepOnlyTests) does not repeat it; a failure never stops the run.
+  let httpPolicy: HttpPolicySummary | undefined;
+  let httpPolicyFailed: string | undefined;
+  if (cfg.keepOnlyTests === undefined) {
+    try {
+      httpPolicy = await httpPolicyOf(cfg.testDir, tests);
+    } catch (err) {
+      httpPolicyFailed = err instanceof Error ? err.message : String(err);
+    }
+  }
   emit({
     type: "tests-discovered",
     tests,
     ...(testBuildSymbols.length > 0 ? { testBuildSymbols } : {}),
     ...(excludedTests.length > 0 ? { excludedTests } : {}),
     ...(unverifiedTestFiles.length > 0 ? { unverifiedTestFiles } : {}),
+    ...(httpPolicy !== undefined ? { httpPolicy } : {}),
+    ...(httpPolicyFailed !== undefined ? { httpPolicyFailed } : {}),
   });
   if (cfg.testsOnly !== undefined && cfg.testsOnly.length > 0) {
     emit({
@@ -6821,6 +7009,20 @@ async function runSessionBody(
       message: `[lethal] --exclude-test left ${excludeTestRecords.length} test(s) out of the run and they never run: ${excludeTestRecords.map((r) => r.test).join(", ")}. A mutant only they kill is reported SURVIVED or NO-COVERAGE.`,
     });
   }
+  // PR-212 (R1113): names each method, its path and `commits`, and the opt-in. The main session only (a recheck repeats it).
+  if (cfg.keepOnlyTests === undefined) {
+    // Two codes: `company-write-tests-left-out` (they were left out) and `company-write-tests-kept`
+    // (--keep-company-tests: they run). R736: no fixture under fixtures/ writes a company (parse and grep, PR-212), so
+    // no BC gate leg sees either code.
+    const kept = cfg.keepCompanyTests === true;
+    const lines = companyWriteLines(companyWrites, kept, chosen.tests.length);
+    if (lines.length > 0)
+      emit({
+        type: "warning",
+        code: kept ? "company-write-tests-kept" : "company-write-tests-left-out",
+        message: lines.join("\n"),
+      });
+  }
   if (tests.length === 0) throw new Error("no tests discovered");
   // R-236c: before the run row and before any test is sent (status and quarantine checks run
   // earlier). In every bcdev coverage mode, since a hub-mode baseline would make the test green and
@@ -6830,8 +7032,6 @@ async function runSessionBody(
   // the per-test digests `lethal verify` compares against, recorded on the run row below.
   // (The parser was initialised before discovery, R403.)
   // R-371: ONE parse of the test sources, shared by the scan and the digests.
-  const testFiles = await readTestAppSources(cfg.testDir);
-  const testModel = buildTestAppModel(testFiles);
   const testPageRefused: ReadonlyMap<string, string> = isBcdev(caps.kind)
     ? scanTestPageModel(testModel, tests)
     : new Map();
@@ -7025,8 +7225,8 @@ async function runSessionBody(
     ...(cfg.lines !== undefined ? { lines: cfg.lines } : {}),
     ...(cfg.testsOnly !== undefined ? { testsOnly: cfg.testsOnly } : {}),
     // R745: the tests actually left out (matched, discovered spelling), only when non-empty.
-    ...(excludeTestRecords.length > 0
-      ? { excludeTests: excludeTestRecords.map((r) => r.test) }
+    ...(excludeTestRecords.length + companyRecords.length > 0
+      ? { excludeTests: [...excludeTestRecords, ...companyRecords].map((r) => r.test) }
       : {}),
     // C02-06, R214: the EFFECTIVE symbols (config plus app.json), so an app.json change also
     // breaks a resume.
@@ -7080,7 +7280,11 @@ async function runSessionBody(
     testScope: sessionTestScope,
     // R759: and what it was narrowed by, always written (empty lists mean "nothing left out"), so
     // `lethal verify` can tell a test this run left out from a new one.
-    testNarrowing: { testsOnly: cfg.testsOnly ?? [], excludeTests: excludeTestKeys },
+    testNarrowing: {
+      testsOnly: cfg.testsOnly ?? [],
+      excludeTests: excludeTestKeys,
+      ...(companyWriteKeys.length > 0 ? { companyWrites: companyWriteKeys } : {}),
+    },
     // R586: a v3 run records its build; `runMayLend` lends it only to that build.
     ...(lendingSession.runnerBuild !== undefined
       ? { runnerBuild: lendingSession.runnerBuild }
@@ -7155,7 +7359,7 @@ async function runSessionBody(
   emit({ type: "phase-entered", phase: "generate" });
   const generateStartedMs = Date.now();
   const {
-    files: allFiles,
+    files: generatedFiles,
     duplicateObjects,
     skipped: notInstrumentedFiles,
     totalFiles: totalAlFiles,
@@ -7181,6 +7385,7 @@ async function runSessionBody(
         ? { operators: resolvedOperators }
         : {}),
     ...(cfg.lines !== undefined ? { lines: cfg.lines } : {}),
+    ...(cfg.exactSites !== undefined ? { exactSites: cfg.exactSites } : {}),
     ...(sourceSnapshot !== undefined ? { source: sourceSnapshot } : {}),
     preprocessorSymbols: sourceSymbols,
     backend: buildBackend,
@@ -7195,7 +7400,7 @@ async function runSessionBody(
   // R826: a warning only, once per session, and only for a BC tier: it changes no deploy decision.
   // R875: from the real emitted text; the list also names a batch's suspect in a quarantine.
   const largeMethods = isBcdev(caps.kind)
-    ? largeMethodsOf(allFiles, (name) => operatorTiers.get(name))
+    ? largeMethodsOf(generatedFiles, (name) => operatorTiers.get(name))
     : [];
   const foldWarning = largeMethodWarning(largeMethods);
   if (foldWarning !== undefined) {
@@ -7208,8 +7413,43 @@ async function runSessionBody(
   // R374: numbered once over the whole run, here and not inside `generateMutationSet`'s file loop,
   // which then held one entry per mutant until its end (R400). Still inside the generate phase.
   // `identityOrdinalsOf`'s numbering, from entries kept long enough to read the twins below.
-  const identityEntries = runIdentityEntries(allFiles, operatorTiers, reservedIdentityEntries);
+  const identityEntries = runIdentityEntries(
+    generatedFiles,
+    operatorTiers,
+    reservedIdentityEntries,
+  );
   const identityOrdinals = numberIdentityOrdinals(identityEntries);
+  // PR-171 (R1122): the confirm filter runs HERE, after the ordinals above were numbered over the
+  // FULL generated set, so a twin keeps the ordinal the v3 report holds. Never before the numbering
+  // (that is `exactSites`' place, and the two are refused together). Every refusal is made before
+  // anything is deployed.
+  let excludedByConfirm = 0;
+  let allFiles = generatedFiles;
+  if (confirmPlan !== undefined) {
+    assertSameScope(
+      scopeOfReport(confirmPlan.report),
+      scopeOfRun({
+        only: cfg.only,
+        exclude: cfg.exclude,
+        operators: resolvedOperators,
+        lines: cfg.lines,
+        preprocessorSymbols: cfg.preprocessorSymbols,
+        testsOnly: cfg.testsOnly,
+        excludeTests: cfg.excludeTests,
+        sourceSha256: sourceHashAtGeneration,
+        dependencySourceSha256,
+        identityScheme: IDENTITY_SCHEME,
+      }),
+    );
+    const narrowed = narrowToConfirmed(
+      generatedFiles,
+      identityOrdinals,
+      tierOf,
+      confirmPlan.given.selected,
+    );
+    allFiles = narrowed.files;
+    excludedByConfirm = narrowed.excluded;
+  }
   // R391: which tuples have a twin in their FILE, from exactly the set the ordinals number. A fact
   // of the run, written before any mutant row (known-survivor and stranded rows included): an
   // interrupted run's rows undercount it. `carryCurrent` is this session's side of every carry.
@@ -7318,6 +7558,7 @@ async function runSessionBody(
     excludedByExclude,
     excludedByOperator,
     ...(cfg.lines !== undefined ? { excludedByLines } : {}),
+    ...(confirmPlan !== undefined ? { excludedByConfirm } : {}),
     // R307: no looseTuples in the stream: they are a carry detail, not report data.
     ...(refusedFiles.length > 0
       ? {
@@ -7371,7 +7612,11 @@ async function runSessionBody(
   assertRunSizeAcceptable({
     mutantCount: siteCount,
     fileCount: allFiles.length,
-    narrowed: cfg.only !== undefined || resolvedOperators !== undefined || cfg.lines !== undefined,
+    narrowed:
+      cfg.only !== undefined ||
+      resolvedOperators !== undefined ||
+      cfg.lines !== undefined ||
+      confirmPlan !== undefined,
     allowLargeRun: cfg.allowLargeRun ?? false,
   });
   const artifacts = planArtifacts(allFiles, {
@@ -9358,6 +9603,27 @@ async function runSessionBody(
   // ordering still never depends on which worker finished first regardless of arrival order.
   // R654 removed three .NET al-runner readers here (R129's BC build, R148's missing
   // implementation, R583's dependency drops): no remaining backend reports any of them.
+  // PR-144: the withheld-kill recheck (on by default), its own step after the main pass and its own budget. Never on a
+  // quarantined session (its verdicts are not trusted), and never changes a row except through its events.
+  if (
+    cfg.recheck !== undefined &&
+    shouldRunRecheck({ recheck: cfg.recheck, unsafe: safety.isUnsafe })
+  ) {
+    await runWithheldRecheck({
+      events: [...collectedEvents],
+      emit: (e) => emit(e),
+      main: {
+        ...(v3Build !== undefined
+          ? { version: v3Build.version, binarySha256: v3Build.binarySha256 }
+          : {}),
+        sourceSha256: sourceHashAtGeneration,
+        dependencySourceSha256,
+      },
+      budgetSeconds: cfg.recheck.budgetSeconds,
+      runner: cfg.recheck.runner,
+      backend: cfg.backend,
+    });
+  }
   const totalMs = Date.now() - sessionStartedMs;
   emit({ type: "session-finished", elapsedMs: totalMs });
   // buildReport(statics, events) (spec 2026-08-05 §A): the closed statics set this run was GIVEN —
@@ -9390,6 +9656,7 @@ async function runSessionBody(
           },
         }
       : {}),
+    ...(confirmPlan !== undefined ? { confirm: confirmPlan.given } : {}),
     ...(cfg.testsOnly !== undefined && cfg.testsOnly.length > 0
       ? { testsOnly: cfg.testsOnly }
       : {}),
@@ -10434,7 +10701,10 @@ export function unsupportedCoverageNote(
   // R69: the platform cannot run these tests on this path at all — a fact about the SESSION TYPE,
   // not about the test. Named separately from the generic wording below, which sends a reader to
   // debug a test that is already correct.
-  const testPage = qualified.filter((n) => testPageThisBatch.has(n));
+  // R1135: the shared describer also returns the request-page text; split by its diagnosis prefix.
+  const isRequestPage = (n: string): boolean =>
+    testPageThisBatch.get(n)?.startsWith(REQUEST_PAGE_DIAGNOSIS) ?? false;
+  const testPage = qualified.filter((n) => testPageThisBatch.has(n) && !isRequestPage(n));
   const testPageFirst = testPage[0];
   const testPageText =
     testPageFirst === undefined ? undefined : testPageThisBatch.get(testPageFirst);
@@ -10444,6 +10714,20 @@ export function unsupportedCoverageNote(
       testPage,
       testPageText,
       "that cannot run on this session type",
+    );
+  }
+
+  // R1135: tests that open a report request page, which this session type cannot show.
+  const requestPage = qualified.filter(isRequestPage);
+  const requestPageFirst = requestPage[0];
+  const requestPageText =
+    requestPageFirst === undefined ? undefined : testPageThisBatch.get(requestPageFirst);
+  if (requestPageText !== undefined) {
+    return describe(
+      "request page unsupported on this path",
+      requestPage,
+      requestPageText,
+      "that open a report request page, which this session type cannot show",
     );
   }
 
@@ -10468,7 +10752,7 @@ export function unsupportedCoverageNote(
   const v3 = qualified.filter((n) => v3RefusedThisBatch.has(n));
   if (v3.length > 0) {
     return describe(
-      "al-runner v3 refusal",
+      V3_NOCOV_REFUSAL_LEAD,
       v3,
       "the test reaches this code (or its object, for a trigger mutant) before v3 refused it; v3 refused it, so the mutant is not measured here, and this is not evidence of a gap in your suite",
       "al-runner v3 refused at baseline",
@@ -12557,6 +12841,44 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
     let budgetCut = false;
     const clockSpent = (): boolean =>
       args.timeBudget?.exhausted === true && args.timeBudget.memory === undefined;
+    // PR-81 (R1066): the mutant-level fields now; one copy per step start and one per held error.
+    type WalkSnap = HeldTimeout["snap"];
+    const snapNow = (): WalkSnap => ({
+      verdict,
+      cause,
+      failureNote,
+      permissionRefusedTest,
+      runnerDisagreement,
+      runnerDisagreementTest,
+      notReproduced,
+      refusedPending,
+      transportErrorRef,
+      abortAfterRecord,
+    });
+    const restoreWalk = (s: WalkSnap): void => {
+      verdict = s.verdict;
+      cause = s.cause;
+      failureNote = s.failureNote;
+      permissionRefusedTest = s.permissionRefusedTest;
+      runnerDisagreement = s.runnerDisagreement;
+      runnerDisagreementTest = s.runnerDisagreementTest;
+      notReproduced = s.notReproduced;
+      refusedPending = s.refusedPending;
+      transportErrorRef = s.transportErrorRef;
+      abortAfterRecord = s.abortAfterRecord;
+    };
+    // The FIRST non-terminal error met (its own fields and its test); later ones are only named.
+    let heldErr: { readonly test: string; readonly snap: WalkSnap } | undefined;
+    const notedErr: string[] = [];
+    const afterErr: string[] = []; // the tests a later step answered, names only
+    let stepSnap: WalkSnap = snapNow();
+    let stepDeactivated = false; // this step ran a confirm and left the mutant NOT active
+    let stepTerminal = false; // this step's cold confirm did not FAIL: its `unstable` is not holdable
+    let needsReactivate = false; // a held confirm left the mutant inactive; `feed` re-activates it
+    let stepRef: TestMethodRef | undefined;
+    let heldRounds = 0;
+    let errNoted = false; // the held error is already named in the note
+    let errNote: string | undefined;
     const walker = coveringRuns({
       backend: args.backend,
       safety: args.safety,
@@ -12568,6 +12890,11 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
       group: args.groupRuns,
       mutantId: m.mutantId,
       skip,
+      beforeRun: async () => {
+        if (!needsReactivate) return;
+        needsReactivate = false;
+        await activateOnce(args.backend, args.safety, m.mutantId);
+      },
     });
     const feed = async function* (): AsyncGenerator<CoveringStep, void, undefined> {
       if (replayStep !== undefined) {
@@ -12581,6 +12908,8 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
           budgetCut = true;
           return;
         }
+        // PR-81 (L1): the re-activation is sent by `beforeRun`, inside this pull, so it comes after
+        // the clock check above and only when a covering test is really about to run.
         const next = await walker.next();
         if (next.done === true) return;
         yield next.value;
@@ -12604,9 +12933,15 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
           testBudgetMs: budget,
           groupBudgetMs,
         } = step;
+        // PR-81: this step's start state, so a held error leaves none of its fields on a later kill.
+        stepSnap = snapNow();
+        stepDeactivated = false;
+        stepTerminal = false;
+        stepRef = ref;
         // PR-51: the replay of the held step was counted when it was first met.
         if (!replaying) {
           if (held !== undefined) afterHeld.push(qualifiedTestName(ref));
+          if (heldErr !== undefined) afterErr.push(qualifiedTestName(ref));
           testResultBuffer.push({
             mutantCode: m.mutantId,
             ref,
@@ -12668,18 +13003,20 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
             `covering loop: mutant ${m.mutantId}'s ${ref.method} is marked alone at group position ${step.groupPosition} — caller-contract violation (an alone request runs one test, so its position is 1) (PR-55)`,
           );
         }
-        const reproduce = (): Promise<ReproDecision | undefined> =>
-          args.backend.killsMustReproduce === true
-            ? reproduceKill({
-                args,
-                m,
-                step,
-                leaseSession,
-                resyncOpSeq,
-                testResultBuffer,
-                ...(aloneKill ? { alone: true as const } : {}),
-              })
-            : Promise.resolve(undefined);
+        const reproduce = async (): Promise<ReproDecision | undefined> => {
+          if (args.backend.killsMustReproduce !== true) return undefined;
+          const r = await reproduceKill({
+            args,
+            m,
+            step,
+            leaseSession,
+            resyncOpSeq,
+            testResultBuffer,
+            ...(aloneKill ? { alone: true as const } : {}),
+          });
+          stepDeactivated = false; // reproduceKill re-activates the mutant first
+          return r;
+        };
         // R577: a kill that did not reproduce. `true`: the covering loop goes on (I4).
         const notKilled = (r: KillErrorDecision): boolean => {
           if (r.cause === "kill-not-reproduced") {
@@ -12695,8 +13032,9 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
         // R639: v3's refusal that follows a timeout in the same call is a cascade of that stop. The
         // next covering test's row is one it would get were it first in the order, so the loop goes
         // on; the refusal stays pending and ends the mutant as an error if nothing else decides it.
-        // Here and not in `classifyNonVerdictStep`: a refused row in a reproduction or a confirm
-        // (which share it) must still end the mutant.
+        // Here and not in `classifyNonVerdictStep`: a refused row in a CONFIRM (which shares it) must
+        // still end the mutant. PR-81: a `runner-refused` in a kill's REPRODUCTION no longer ends it
+        // either: it is in N, so the walk holds it and goes on (spec, section N).
         if (step.cause === "runner-refused" && v.refusedAfterStop !== undefined) {
           refusedPending ??= v.failureMessage ?? `${step.cause} running ${ref.method}`;
           continue;
@@ -12723,6 +13061,7 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
             v.operation === undefined &&
             isRunMutantFoundNone(v.failureMessage)
           ) {
+            stepDeactivated = true;
             const d = await confirmFoundNone({
               args,
               m,
@@ -12798,18 +13137,7 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
           const entry: HeldTimeout = {
             step,
             cut: args.backend.cutState?.(m.mutantId),
-            snap: {
-              verdict,
-              cause,
-              failureNote,
-              permissionRefusedTest,
-              runnerDisagreement,
-              runnerDisagreementTest,
-              notReproduced,
-              refusedPending,
-              transportErrorRef,
-              abortAfterRecord,
-            },
+            snap: snapNow(),
           };
           if (held === undefined) held = entry;
           else noted.push(entry);
@@ -12824,6 +13152,7 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
         }
         if (v.outcome === "timeout") {
           if (step.groupPosition > 1) {
+            stepDeactivated = true;
             const warm = await confirmWarm({
               args,
               m,
@@ -12864,6 +13193,7 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
         if (v.outcome === "fail" && step.groupPosition > 1) {
           // R206 §2.2: a kill at group position k > 1 was measured WARM. Confirm it by replaying
           // methods 1..k of the SAME call unmutated, in another fresh session.
+          stepDeactivated = true;
           const warm = await confirmWarm({
             args,
             m,
@@ -12925,6 +13255,7 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
               message: `[lethal] alone-confirm: ${ref.method} (mutant ${m.mutantId}) was measured alone under the mutant (${v.outcome}); its unmutated confirm and its reproduction run alone too, and no kill pair is sent (R1067)`,
             });
           }
+          stepDeactivated = true;
           await activateOnce(args.backend, args.safety, null);
           // Layer 5C-B2: `runFenced` here too — the confirm rerun earns the same single fresh
           // attempt after a proven-complete lost ack, so an intermittent unreadable answer during
@@ -13063,6 +13394,12 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
               // about whether a strand has a cause.
               cause = "stranded";
             }
+          } else if (confirm.workDateRefusal !== undefined) {
+            // R1131: the confirmation started on another WorkDate than the batch's baseline (or the batch
+            // had already moved). Its pass or fail says nothing about the killer: `error`, never `unstable`.
+            verdict = "error";
+            cause = confirm.workDateRefusal;
+            failureNote = `${confirm.failureMessage ?? "workdate-changed"} (confirming ${ref.method}; the kill is unconfirmed)`;
           } else if (sessionWasReused(confirm)) {
             // R206 §2.1: the confirmation ran in a session another call had run tests in, so it
             // did not measure the killer cold. Not a kill.
@@ -13211,6 +13548,9 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
               disagreement !== undefined ? ` — ${disagreement}` : ""
             }`;
             cause = "unstable";
+            // PR-81 (M2): only a confirm that FAILED says the test is unstable. An `error` confirm (a
+            // rejected dispatch, a v3 `runner-test-error` row) or anything else is terminal, as before.
+            stepTerminal = confirm.outcome !== "fail";
           }
           break;
         }
@@ -13227,6 +13567,52 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
             "the time budget was used up (or a stop signal spent it)",
           );
         break mutantLoop;
+      }
+      // PR-81 (R1066): a step that ended the mutant as a non-terminal error is HELD, like a timeout:
+      // the walk goes on from the next covering test, with the fields as this step found them.
+      // L4 reliance: a `runner-refused` not after a stop is held although R639 once stopped there.
+      // A refusal is `notRun`: the refused test never executed, so it left no state, and a later
+      // test's plain FAIL in the same call is as trustworthy as any (R637 already scores it as a kill,
+      // with a note, when the walk meets it first). What can NOT be trusted is a row after an
+      // UNFINISHED test: v3 marks it (upstream #5776) and R-435 maps it to `runner-test-error`, which
+      // is terminal (never held). Leg C pins those markings: `refusal-cascade` and
+      // `dependent-fail-after-timeout-is-notrun` (al-runner-v3-contract.ts). DO's store count (0
+      // unmarked fail rows) is NOT evidence: those walks broke at the refusal (spec addendum A).
+      if (
+        !replaying &&
+        stepRef !== undefined &&
+        verdict === "error" &&
+        cause !== undefined &&
+        HELD_ERROR_CAUSES.has(cause) &&
+        !stepTerminal &&
+        transportErrorRef === undefined &&
+        // Redundant today (the abort branch sets no `cause`, so `cause !== undefined` rejects it); kept so an
+        // abort can never be held if that branch ever gains a cause. No test can go red on it alone.
+        abortAfterRecord === undefined &&
+        !args.safety.isUnsafe // checked first: a latched session is terminal, nothing re-activated
+      ) {
+        // Each hold consumes a step the walker had not yielded before, so a walk holds at most
+        // once per covering test. More means the fields were not restored and the walk would loop.
+        heldRounds += 1;
+        if (heldRounds > ordered.length + noted.length + 1) {
+          throw new Error(
+            `covering loop: mutant ${m.mutantId} held ${heldRounds} errors for ${ordered.length} covering test(s) — the walk is not advancing (PR-81)`,
+          );
+        }
+        const name = qualifiedTestName(stepRef);
+        if (heldErr === undefined) heldErr = { test: name, snap: snapNow() };
+        else notedErr.push(name);
+        restoreWalk(stepSnap);
+        if (stepDeactivated) {
+          // Only a step that deactivated the mutant (a confirm) re-activates it. An error met on the
+          // covering row leaves it active, and re-activating would throw away v3's prefetched rows.
+          // The pair a failed cold confirm left pending is dropped first, or `activateOn` would read
+          // this activation as the pair's reproduction. The re-activation itself waits for `feed`,
+          // after its clock check, so a spent clock or an empty tail sends none.
+          args.backend.dropPendingPair?.(m.mutantId);
+          needsReactivate = true;
+        }
+        continue;
       }
       // PR-51: the walk ended. With nothing held, or after the held step's replay, that is final.
       const h: HeldTimeout | undefined =
@@ -13271,10 +13657,11 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
       transportErrorRef = h.snap.transportErrorRef;
       abortAfterRecord = h.snap.abortAfterRecord;
       if (wasFirst) {
-        heldNote =
-          afterHeld.length > 0
-            ? `after the timeout: ${[...new Set(afterHeld)].join(", ")}`
-            : undefined;
+        // PR-81: a held error's test (and a later one's) is named here too, names only.
+        const errNames = heldErr !== undefined ? [heldErr.test, ...notedErr] : [];
+        const names = [...new Set([...errNames, ...afterHeld])];
+        errNoted = heldErr !== undefined;
+        heldNote = names.length > 0 ? `after the timeout: ${names.join(", ")}` : undefined;
       }
       // v3: the cut state this step met, so its reproduction routes as it did in the old walk.
       args.backend.restoreCutState?.(m.mutantId, h.cut);
@@ -13283,6 +13670,22 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
       replayStep = h.step;
     }
     await walker.return(undefined);
+    // PR-81: the held error becomes the outcome when nothing else decided the mutant. It goes
+    // BEFORE the two resolutions below, so a pending `kill-not-reproduced` or R639 refusal does not
+    // outrank an error met earlier; after a held timeout's replay, that replay's result stands.
+    const adoptHeldError = (): void => {
+      if (heldErr === undefined) return;
+      verdict = heldErr.snap.verdict;
+      cause = heldErr.snap.cause;
+      failureNote = heldErr.snap.failureNote;
+      permissionRefusedTest = heldErr.snap.permissionRefusedTest;
+      runnerDisagreement = heldErr.snap.runnerDisagreement;
+      runnerDisagreementTest = heldErr.snap.runnerDisagreementTest;
+      const later = [...new Set(afterErr)];
+      errNote = later.length > 0 ? `after the error: ${later.join(", ")}` : undefined;
+      errNoted = true;
+    };
+    if (verdict === "survived" && !replaying) adoptHeldError();
     // R577 (I4): the loop ended with no other verdict after a kill that did not reproduce, so the
     // mutant is that error, never `survived`. Before R198's check below, which guards survivors
     // only: a group timeout's earlier methods are never in `attempted`, and this is no survivor.
@@ -13296,9 +13699,20 @@ async function runMutantsOnBackend(args: RunMutantsArgs): Promise<void> {
       cause = "runner-refused";
       failureNote = refusedPending;
     }
+    // PR-81 (L5), the safety net: a mutant with a held error is never a survivor.
+    if (verdict === "survived") adoptHeldError();
+    if (heldErr !== undefined && !errNoted) {
+      // A kill (names only, never the error's diagnosis) or a terminal answer ended the walk.
+      const names = [...new Set([heldErr.test, ...notedErr])].join(", ");
+      errNote =
+        verdict === "killed" || verdict === "timeout-killed"
+          ? `the error of ${names} was not scored: ${killingTestRef !== undefined ? qualifiedTestName(killingTestRef) : "a later test"} failed under the mutant and the failure reproduced`
+          : `an error of ${names} was held earlier in this walk and not scored`;
+    }
     // PR-51: names only, after any strand prefix (`--resume` reads it) and any other note.
-    if (heldNote !== undefined) {
-      failureNote = failureNote !== undefined ? `${failureNote} ${heldNote}` : heldNote;
+    for (const note of [heldNote, errNote]) {
+      if (note !== undefined)
+        failureNote = failureNote !== undefined ? `${failureNote} ${note}` : note;
     }
     // PR-108: a walk the 3rd hang ended says so, even with nothing left to run (k = 0). `k`: the
     // ordered covering refs after the 3rd hang's ref, minus the skipped codeunits. A ref that is not in
@@ -13564,6 +13978,8 @@ async function runMutantsParallel(
       needsLiveCall?: (mutantId: string) => boolean;
       laneDaemonStarts?: () => number;
       noteLanes?: (message: string) => void;
+      /** PR-151: test seam, called under the split with the size of each window `cutWindows` made. */
+      noteWindows?: (sizes: readonly number[]) => void;
       /**
        * PR-99 (the split prefetch): the batch setup, once per batch. An owner with it splits the prefetch
        * across the lanes (each lane prefetches the unit it takes); one without keeps the owner's window prefetch.
@@ -13608,11 +14024,18 @@ async function runMutantsParallel(
   // PR-99 (§10.7): under the split R785's pacing is off; the barrier callback is the only launcher.
   const paced = !split && laneWarmupMs !== undefined && needsLiveCall !== undefined;
   let widest: Awaited<ReturnType<typeof runScopeQueue>> | undefined;
-  for (const [wi, window] of windows.entries()) {
+  // PR-151: under the split ONE queue and ONE commit run the whole batch (no window barrier); each unit
+  // carries the window of its first mutant for the look-ahead bound. Otherwise one group per window.
+  // An empty batch has no window: keep `windows` (no group) so no "1 of N lanes started" notice prints.
+  const groups = split && windows.length > 0 ? [windows.flat()] : windows;
+  if (split) owner.noteWindows?.(windows.map((w) => w.length)); // test seam: the window cut
+  const windowOfMutant = new Map<string, number>();
+  for (const [wi, w] of windows.entries()) for (const m of w) windowOfMutant.set(m.mutantId, wi);
+  for (const [wi, window] of groups.entries()) {
     if (args.safety.isUnsafe) break;
     const spent = (): boolean => {
       if (args.timeBudget?.exhausted !== true) return false;
-      const left = windows
+      const left = groups
         .slice(wi)
         .flat()
         .filter((x) => args.perMutantTests.get(x.mutantId) !== undefined).length;
@@ -13683,6 +14106,15 @@ async function runMutantsParallel(
             },
           }
         : {}),
+      ...(split
+        ? {
+            lookAhead: {
+              windowOf: (unit: readonly MutantManifestEntry[]) =>
+                windowOfMutant.get(unit[0]?.mutantId ?? "") ?? 0,
+              budgetSpent: () => args.timeBudget?.exhausted === true,
+            },
+          }
+        : {}),
       mayStart: (k) => owner.laneMayStart?.(k) ?? true,
       commit,
       isUnsafe: () => args.safety.isUnsafe,
@@ -13716,7 +14148,7 @@ async function runMutantsParallel(
         args.perMutantTests.get(x.mutantId) !== undefined;
       const left =
         commit.unrecorded(window.filter(covered).map((x) => x.mutantId)).length +
-        windows
+        groups
           .slice(wi + 1)
           .flat()
           .filter(covered).length;
@@ -14244,6 +14676,23 @@ function nearestAlDir(alDirs: ReadonlySet<string>, rel: string): string | undefi
 }
 
 /**
+ * PR-81 (R1066): the closed whitelist N of error causes the covering walk HOLDS (goes on past)
+ * instead of ending the mutant. Each is an error whose code's own notes say the server is clean
+ * and the answer is not about the mutant. A cause not listed here is terminal. NOT
+ * `runner-test-error` (it covers contract violations, a missing row, an echo mismatch and
+ * R-435's untrusted timeout, which must never let the walk go on). `op-stopped`,
+ * `stopped-after-completion` and `confirm-stopped` are terminal conservatively.
+ */
+const HELD_ERROR_CAUSES: ReadonlySet<MutantErrorCause> = new Set<MutantErrorCause>([
+  "session-reused",
+  "unstable",
+  "warm-prefix-unstable",
+  "warm-timeout-unconfirmed",
+  "warm-confirmation-incomplete",
+  "runner-refused",
+]);
+
+/**
  * One activation attempt. Retries ONLY a `pre-dispatch-rejected` failure (provably never reached
  * the server). An `in-flight-unknown` failure latches the session unsafe and rethrows — retrying
  * an activation that may still be executing is the death-spiral trigger (spec §12). A
@@ -14500,6 +14949,23 @@ function carriedReproduction(
   return c.reproducedFailure !== undefined ? { reproducedFailure: c.reproducedFailure } : {};
 }
 
+// PR-212: per store, the normalised object names a session's left-out company-writing tests name (§2c).
+// `alsoSurvived`: coverage "none" runs every test against every mutant and records no `no-coverage`, so a
+// `survived` mutant there is the same unmeasured case (a left-out test might have killed it).
+const leftOutReach = new WeakMap<
+  ResultsStore,
+  { readonly names: ReadonlySet<string>; readonly alsoSurvived: boolean }
+>();
+// Exported ONLY for tests/pr212-company-writes.test.ts, which drives `record()` directly.
+export function setLeftOutReach(
+  store: ResultsStore,
+  names: ReadonlySet<string>,
+  alsoSurvived: boolean,
+): void {
+  if (names.size === 0) leftOutReach.delete(store);
+  else leftOutReach.set(store, { names, alsoSurvived });
+}
+
 export function record(
   store: ResultsStore,
   runId: number,
@@ -14587,6 +15053,25 @@ export function record(
   stopEvidence?: StopEvidence,
 ): number {
   const key = identityKeyOf(m);
+  // PR-212 §2c (i): no remaining test covers this mutant, and a left-out company-writing test names its object,
+  // so it is not measured: `error` / `left-out-test-reach`, never `no-coverage` and never `survived`. Here, because
+  // `no-coverage` is recorded from many places. A carried verdict keeps what its own run recorded.
+  const leftOut = leftOutReach.get(store);
+  if (
+    leftOut !== undefined &&
+    (verdict === "no-coverage" || (verdict === "survived" && leftOut.alsoSurvived)) &&
+    carried !== true &&
+    leftOut.names.has(normalizeAlName(key.codeunitName))
+  ) {
+    const why = `not measured: ${verdict === "survived" ? "no test that ran killed it" : "no test that ran covers it"}, and ${key.codeunitName} is named by a test method this run left out because it writes the Company table (--keep-company-tests runs them)`;
+    // An existing note (R298's refused object, R69's TestPage-only) stays; this one is appended.
+    // biome-ignore lint/style/noParameterAssign: one rewrite of three positional arguments; a wrapper would re-spell 28
+    failureNote = failureNote === undefined ? why : `${failureNote}; ${why}`;
+    // biome-ignore lint/style/noParameterAssign: see above
+    verdict = "error";
+    // biome-ignore lint/style/noParameterAssign: see above
+    cause = "left-out-test-reach";
+  }
   const reproduced =
     reproduction !== undefined
       ? {

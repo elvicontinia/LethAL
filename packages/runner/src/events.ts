@@ -27,11 +27,14 @@ import type {
   StopEvidence,
   TestMethodRef,
   TestOutcome,
+  V3BaselineOneShotTimed,
   V3RequestSized,
   V3RequestTimed,
 } from "./backend";
+import type { ConfirmGiven } from "./confirm";
 import type { DependencyReportSourceRecord } from "./dependency-report-source";
 import type { HangRefusedFile, PreprocExcludedFile, RefusedExcludedFile } from "./excluded-sites";
+import type { HttpPolicySummary } from "./http-policy";
 import type { IsolationChoiceRow } from "./isolation-auto";
 import type { ChangedSinceSource, LineRange } from "./line-filter";
 import type { PermissionCanaryResult } from "./permission-canary";
@@ -104,6 +107,11 @@ export type BaselineClassification = (typeof BASELINE_CLASSIFICATIONS)[number];
 interface Base {
   /** Monotonic, starting at 1. A gap means the stream was truncated. */
   readonly seq: number;
+  /**
+   * PR-121: milliseconds since the `--progress-out` file was opened, stamped by that sink when it
+   * writes the line (the emit time). Absent on events held in memory.
+   */
+  readonly atMs?: number;
 }
 
 export type RunEventInput =
@@ -145,6 +153,9 @@ export type RunEventInput =
         /** GH-25: present exactly when `--changed-since` was given. */
         readonly changedSince?: ChangedSinceSource;
       };
+      /** PR-171: the `--confirm-from` narrowing this run was GIVEN. Present only when the flag was
+       *  used. The site count it excluded is LEARNED and rides `mutation-set-generated.excludedByConfirm`. */
+      readonly confirm?: ConfirmGiven;
       readonly testsOnly?: readonly string[];
       readonly stopHungSessions?: boolean;
     }
@@ -205,6 +216,9 @@ export type RunEventInput =
       /** Issue #19: post-dedup sites the line filter excluded. Present exactly when a line filter
        *  was given, so a measured 0 and "no filter" do not look alike. */
       readonly excludedByLines?: number;
+      /** PR-171: post-dedup sites the `--confirm-from` narrowing left out. Present exactly when the
+       *  flag was used. The LEARNED half of `run-configured.confirm`. */
+      readonly excludedByConfirm?: number;
       /** R307: files the instrumentation trial refused whole. Present only when non-empty, so a
        *  stream from before R307 stays valid and folds to the same report bytes. */
       readonly refusedFiles?: readonly RefusedExcludedFile[];
@@ -245,6 +259,14 @@ export type RunEventInput =
       readonly testBuildSymbols?: readonly string[];
       readonly excludedTests?: readonly ExcludedTestRecord[];
       readonly unverifiedTestFiles?: readonly string[];
+      /**
+       * PR-197 (R1113 fix 2): the TestHttpRequestPolicy of every codeunit in `tests` (`http-policy.ts`). Absent on a
+       * nested recheck session, and when the check itself failed (then a stderr line says so). Never read by the
+       * report fold.
+       */
+      readonly httpPolicy?: HttpPolicySummary;
+      /** PR-197: why the check above failed; the run goes on. */
+      readonly httpPolicyFailed?: string;
     }
   | {
       /**
@@ -305,6 +327,12 @@ export type RunEventInput =
       /** R658: the `--baseline-timeout-ms` a `baseline-test-stopped` test ran past. Present only
        *  when this batch has one. */
       readonly stoppedBudgetMs?: number;
+      /**
+       * R1131: the start WorkDate this batch's baseline ran under (control app 1.0.0.28), an ISO date, on bcdev
+       * outside hub mode. The report's `baselineWorkDate` is the first batch's. Absent on every other backend,
+       * in hub mode and in older streams.
+       */
+      readonly workDate?: string;
       readonly verdicts: readonly {
         readonly name: string;
         readonly outcome: TestOutcome;
@@ -536,6 +564,43 @@ export type RunEventInput =
     }
   | {
       /**
+       * PR-144: the recheck's own baseline (the targets' covering tests, one per session), once. It is
+       * NOT `baseline-batch-finished`: the fold never reads it into the session's baseline figures
+       * (`baselineGreen`, unsupported tests, timings). `tests` is how many ran; `elapsedMs` its wall time.
+       */
+      readonly type: "recheck-baseline-finished";
+      readonly tests: number;
+      readonly elapsedMs: number;
+      readonly verdicts: readonly { readonly name: string; readonly outcome: TestOutcome }[];
+    }
+  | {
+      /**
+       * PR-144: the recheck's answer for ONE withheld-kill row of this session's main pass. The only event
+       * that replaces an earlier row (matched by `batchIndex` and `mutant.mutantId`); the row must be a
+       * withheld kill, or the fold throws. Without `recovery` the row stays `error` and `keptNote` is
+       * appended to its note AFTER `V3_NOT_RUN_SUFFIX`, so it is still a withheld kill. With `recovery`
+       * (rules (a) to (e) all held) the row becomes `killed`.
+       */
+      readonly type: "mutant-rechecked";
+      readonly mutant: MutantManifestEntry;
+      readonly batchIndex: number;
+      readonly durationMs: number;
+      readonly keptNote?: string;
+      readonly recovery?: {
+        readonly killingTest: string;
+        readonly killingTestFailure?: string;
+        readonly killPosition?: number;
+        readonly reproducedFailure?: string;
+        readonly coveringTests: readonly string[];
+        readonly isolatedRecheck: {
+          readonly withheldFailure: string;
+          readonly afterTest?: string;
+          readonly killerGreenInMainBaseline: boolean;
+        };
+      };
+    }
+  | {
+      /**
        * R198: one `RunMutantMany` call was made (whatever it answered). Folded into
        * `SessionReport.groupedCalls`, which the gates pin to a NUMBER derived from their frozen
        * baselines, so a feature that silently stopped grouping fails a gate instead of reading
@@ -585,6 +650,13 @@ export type RunEventInput =
        */
       readonly type: "serve-request-timed";
     } & V3RequestTimed)
+  | ({
+      /**
+       * PR-113: one baseline one-shot call (a fresh process during the daemon baseline) and its wall time;
+       * `reason` is `cross-check`, `too-slow` or `other`. Events stream only, not the report.
+       */
+      readonly type: "baseline-one-shot-timed";
+    } & V3BaselineOneShotTimed)
   | {
       /**
        * PR-56: the request after a kept refusal (a `V3_SERVE_SAFE_REFUSALS` row) on one al-runner-v3

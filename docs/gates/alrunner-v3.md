@@ -23,8 +23,18 @@ The legs:
   keyed by the binary sha256, LethAL's probe code, bcVersion, the packages folder, alc, the cache dir and the `.gated`
   commit. This gate never does: it sets `LETHAL_V3_FRESH_PROBE=1` for every session it starts, and leg C calls
   `runV3ContractProbe` directly, so the figures below are always measured fresh. The update gate runs this gate.
-- C: the contract probe, 28 facts (`runV3ContractProbe`, `V3_LEG_C_FACTS`) of three kinds: 9 defect, 18 contract
-  and 1 warn (r9, below). Since r13
+- C: the contract probe, 36 facts (`runV3ContractProbe`, `V3_LEG_C_FACTS`) of four kinds: 9 defect, 18 contract,
+  1 warn and 8 capability (r9, below; capability since PR-114a). The 8 capability facts
+  (`V3_CAPABILITY_FACTS`, spec `docs/superpowers/specs/2026-11-17-pr114a-batching-capability-facts.md`) are what
+  baseline batching (PR-114b) will rest on, each one made of 1, 2 or 3 serve requests of LethAL's batch body over its own
+  invented app (ids 50700-50779): `batch-no-cross-singleinstance`, `-library-global`, `-row` and `-subscriber` (no state
+  crosses test codeunits in one plain request), `batch-onrun-excluded-no-carry` (an excluded OnRun writer carries
+  nothing), `batch-onrun-included-duplicates` (an included one reaches later codeunits, which stream a second row),
+  `batch-lane-hint-only` (the SingleInstance lane only hints without `strictOrder`) and `batch-lane-strict-reruns`
+  (with it, the reader is re-run). Each must read `matches`: anything else is `gate-fail` in leg C
+  (`unmeasurable`: `infra-fail`). **In a session a capability fact never refuses;** it only feeds
+  `baselineBatchingFor`, which is false on every build (no pin carries `baselineBatching`) and is printed in the
+  session details as `baseline batching: allowed | off (<reason>)`. Since r13
   (`docs/superpowers/specs/2026-10-23-r586-alrunner-v3-precommitment-r13-dependency-skip.md`, [[R590]]), the 18th
   contract fact is `dependency-skip-line`: a tests app that declares a dependency no package holds must make v3
   write a stderr line starting `dependency skipped:` that names it. The backend refuses a session on that line
@@ -132,6 +142,21 @@ The legs:
   - A whole-codeunit entry must show the writer's date reach the reader: that control proves the probe can see a leak. Then each test as its own entry, with `runSelectedOnly`: the reader must not see it.
   - A build that accepted the field and ignored it would still give one row per entry, so `--isolate-tests` would read clean: this leg is what catches that. Any other reading is `gate-fail`.
   - It is a default leg, outside `V3_GATE_LEGS`, so a build gated before it stays gated. On a build with no serve path it reads "not applicable".
+- DBM (PR-114a; pre-commitment `docs/superpowers/specs/2026-11-17-pr114a-batching-capability-facts.md`):
+  - What it runs: `fixtures/sandbox-optin` and `-tests` (4 test codeunits, no OnRun) twice under serve-entries, once
+    with `daemonBaseline` and once with the one-shot baseline. No fixture file is edited (R-307's golden list).
+  - Asserts: per mutant the two sessions agree (verdict, `killingTest`, note), a self-relative check with no new
+    frozen baseline file; the daemon baseline is not dropped; `requests === codeunits` (4); the sample count equals
+    `baselineSampleIds(4).length`; `judgeDaemonBaseline("DBM", ...)` names every skip.
+  - PR-119: the daemon session's memory reader is fixed (1 GiB used of 32 GiB, as in DBI), and so is the sample size it
+    admits on (`sampleRss`, 1 GiB). The session sets `concurrentSamples` to true itself. So the admission of a
+    concurrent cross-check sample is the same on every host and every build, and the leg asserts `samplesOverlapped >= 1` (samples at
+    index 1 and 3; codeunit 2 always needs a request of its own). `DBM_FIGURES` and `GATE_WARNINGS` do not change.
+  - Batching is off, so these are today's counts. PR-114b turns batching on for this leg (batch size 2): requests 4 -> 2.
+  - Warning sets (`GATE_WARNINGS`, keys `dbm-daemon` and `dbm-oneshot`, one per session), observed: daemon `al-runner-v3-memory-guard` and `al-runner-v3-serve-flagged-unknown`; one-shot `[]`.
+    Selector ids 77249/77248/77247 lie inside the target's id range (outside it alc rejects the app and all mutants read `error`).
+    First live reading: 15 killed / 3 survived / 104 no-coverage over 122, identical in both sessions; daemon baseline 4 requests for 4 codeunits, 2 sampled.
+  - It is a default leg, outside `V3_GATE_LEGS`, as DB and DBI are.
 - O1 (R784; pre-commitment `docs/superpowers/specs/2026-10-25-r784-order-probe-leg-precommitment.md`, master 6aa7700c):
   - What it runs: ONE `al-runner serve` daemon takes five requests, each entry one codeunit of
     `fixtures/sandbox-order-tests` (Writer sets, Reader reports): `[R]`, `[W,R]`, `[R,W]`, `[W1,R1,W2,R2,R3]`, then a
@@ -312,6 +337,26 @@ Both run as the other legs do (`runSession`, the v3 backend, one-shot, coverage 
 
 **agentflow.** `scripts/agentflow/gate-table.ts` selects the `alrunner-v3` leg wherever it selected the retired `alrunner` leg (R654). A challenged run (the four `LETHAL_GATE_*` variables) writes a receipt whose sublegs must equal the default legs, with no corpus and no tables leg (`V3_AGENTFLOW_LEGS`).
 
+### Leg RC: the withheld-kill recheck (PR-144)
+
+Pre-committed in `docs/superpowers/specs/2026-11-18-pr144-withheld-kill-recheck.md` §0f (amendment 6, PR-162) and §0g (amendment 7; §0b is the leg's design and §0c its warning set `[]`), before it was built or run. It is a default itest leg, after WRE, and it is NOT in `V3_GATE_LEGS` (a build gated before it stays gated). Its baseline, `al-runner-v3.recheck.baseline.json`, was recorded on 2026-11-18 on edge-4ebfe7913 by the R849 pinned-record route: its 8 rows were pre-committed in §0h (amendment 8) as an expected file, the record equalled it, and the confirm run passed (`/coord/handoff/PR-162/rc-record4.log`, `rc-confirm.log`). The 4 `Sevens` mutants are `killed` by `A1_OneSeven`; the 4 `SevensB` mutants are `error` (`runner-refused`).
+
+- **Fixture:** `fixtures/sandbox-recheck` and `fixtures/sandbox-recheck-tests` (runtime 17, invented code, ids 76000-76099).
+  - Codeunit "Recheck Logic": `Sevens(N)` and `SevensB(N)`, each a loop of `C := '7'; T += Format(C);`. Table "Recheck Row" (76001) is only the record handed to `Page.RunModal`.
+  - "Recheck A Tests", in order: `A0_RefusedWithUnknownReach` (builds its own 10-NUL text from a `Char` 0 loop, `Evaluate`s it into a Decimal, which al-runner refuses, then `if D < 0 then Page.RunModal(0, R)`, which is after the refusal point and holds a construct al-runner cannot know; it never calls `Sevens`, so it covers no mutant), `A1_OneSeven` (asserts `Sevens(1) = '7'`; the only covering test of the `Sevens` mutant).
+  - "Recheck B Tests", in order: `B0_RefusedWithUnknownReach` (as A0), `B1_OneSevenAndMarks` (sets the global Boolean `Marked`, then asserts `SevensB(1) = '7'`), `B2_SeesTheMark` (asserts `Marked`: passes after B1 in one codeunit run, fails alone).
+- **Session:** al-runner v3 on the gate's pinned build, `"isolation": "test"` (explicit, so `auto` cannot move the codeunits), serve transport, `"recheckWithheldKills": true`, `--workers 1`. The recheck is built by `v3RecheckOf`, the CLI's own code.
+- **Pre-committed figures, per mutant** (the `lethal.remove-assignment` mutant of `C := '7'` in each procedure):
+  - `Sevens`: main pass `error` with `withheldKill` (afterTest `A0_RefusedWithUnknownReach`); after the recheck `killed` by `A1_OneSeven`, with `killReproduced` and `isolatedRecheck`.
+  - `SevensB`: main pass `error` with `withheldKill` (afterTest `B0_RefusedWithUnknownReach`); after the recheck it stays `error`, its note naming rule (e) and `B2_SeesTheMark`, which passed in the main baseline and fails alone.
+  - Other mutants of the two procedures are recorded in the leg's baseline and are not predicted.
+  - Caveats: `isolated-recheck-kills` for the `Sevens` mutant, `withheld-kills` for the `SevensB` one.
+- **The leg fails by name** (`judgeRecheckLeg`, checked BEFORE the own-baseline compare): when the main pass has 0 withheld kills, when the `Sevens` mutant is not recovered, or when the `SevensB` mutant is recovered. It also fails on a `SevensB` note that does not name rule (e) and `B2_SeesTheMark`, a wrong afterTest, or a missing caveat.
+- **The baseline is 3 of 5 passing by design** (§0g, amendment 7): A0 and B0 are refused at every baseline, so the session carries the `baseline-red` caveat. The leg checks, by name (`judgeRecheckBaseline`), that exactly those two tests are refused and no other. A0 and B0 cover no mutant; that is why a covering test's failure after them is the mutant's first non-pass row, and so a withheld kill.
+- **Warning set** `[]` (`GATE_WARNINGS["al-runner-v3/RC"]`, amendment 3).
+- **Symbols:** the two projects are in the re-pinned fixture symbol tar (`165b17dd…`, which also adds R1128's six projects); until the tar swap reaches CI and its compile is green, RC is recorded but not counted as proven.
+- Every other leg's frozen figures stay exactly as they are.
+
 ## `--workers N` (R766 step b)
 
 `lethal run --backend al-runner-v3 --workers N` (N 2 to 8) runs the mutants on N serve lanes of one backend. No gate
@@ -490,6 +535,23 @@ after the whole baseline (R927). No gate figure counts it, since no leg sets the
   the outcome on each gate run: `<time> <tag>: fixture .alpackages: extracted|verified|marked`.
 - Every leg selection needs the two fixture folders or the tar, CDO-only legs (`D1`, `D1c`) included: the itest
   prepares them before any leg.
+- **Other fixture `.alpackages` never reach v3 (PR-165).** al-runner v3 reads a test project's own `.alpackages`
+  besides `packagesDir`. A full tar extraction (`compile:fixtures`, kraken's lane setup) leaves one in test projects
+  such as `sandbox-names-tests`, and its Base Application 28.0 made v3 turn test data off for N1, N1E, N1S, WR and WRE.
+  A fresh worktree passed (`/coord/handoff/PR-162/gate-n1-master-fresh.log`, `gate-n1-master-fulltar.log`,
+  `gate-n1-no-namestests.log`). So:
+  - **Backends built by `backendCfg`:** each gets its test dir through `v3GateTestDir`. A test dir under `fixtures/`
+    with its own `.alpackages` is copied, once per run, to a temp folder without it. Used as they are:
+    - the dirs of the gate's two prepared folders;
+    - dirs without an `.alpackages`;
+    - dirs outside `fixtures/`, such as a leg's scratch copy, which leg X (c2) edits after building its backend.
+  - **The legs that copy a fixture test dir to scratch** (N1S, and the two order legs) copy it with
+    `copyTestDirForV3`, without a stray `.alpackages`.
+  - **The CLI leg** builds its backend through the CLI's own code from `sandbox-tests`, a gate dir, so it is not
+    affected.
+  - **A fresh worktree** has none of these folders, so its legs read the same inputs as before.
+  - **With the whole tar extracted,** the full gate's default legs pass (`/coord/handoff/PR-165/gate-full-fulltar2.log`),
+    so `compile:fixtures` and the gate can share a worktree.
 - Re-pinning the symbol tar (a new `FIXTURE_SYMBOLS_TAR_SHA256`) refuses EVERY worktree whose two folders came
   from the old tar, not only the gate worktree: its marker names the old pin (`bdf460e2…` before R670), so the
   next `itest:alrunner-v3` or gate run there stops with `al-runner-v3-gate-symbols-unverified`. Nothing is
@@ -639,7 +701,8 @@ Leg T is judged against the committed alpha.2 baseline with the pinned keys over
     "al-runner-v3.symbols-lethala.baseline.json": { "killed": 7, "survived": 4 },
     "al-runner-v3.symbols-lethalb.baseline.json": { "killed": 7, "survived": 4 },
     "al-runner-v3.multiobject.baseline.json": { "killed": 7, "survived": 1, "no-coverage": 6 },
-    "al-runner-v3.wrapped.baseline.json": { "killed": 62, "survived": 28, "no-coverage": 12 }
+    "al-runner-v3.wrapped.baseline.json": { "killed": 62, "survived": 28, "no-coverage": 12 },
+    "al-runner-v3.recheck.baseline.json": { "killed": 4, "error": 4 }
   }
 }
 ```
@@ -769,3 +832,11 @@ Leg T is judged against the committed alpha.2 baseline with the pinned keys over
   infra-fail) for a request that returns no row. The new cases read as kept refusals on all 15 gated builds. Leg C
   keeps its 28 facts; no pinned figure moves (pre-commitment and addendum in
   `docs/superpowers/specs/2026-11-14-r1000-serve-keep-texts-precommitment.md`).
+- 2026-11-17: PR-114a (coord PR-114, first half of [[R1106]]) adds the capability facts and leg DBM, with no
+  behaviour change. Leg C goes from 28 to 36 facts: 9 defect, 18 contract, 1 warn and 8 capability, a new kind that
+  fails the gate when it does not read `matches` and never refuses a session. `baselineBatchingFor` (pin flag, all 8
+  `matches`, §6 Sleep rule retired) is false on every build because no pin carries the flag. Leg DBM is new (see its
+  bullet). Predicted: all 8 facts `matches` on edge-4ebfe7913 (as probed in `/coord/handoff/PR-114/`); DBM passes with
+  4 requests for 4 codeunits; every other leg and pin unchanged. Session contract probes take longer by the new
+  facts' requests, and every cached probe is re-run once (the probe code hash changes). Pre-commitment:
+  `docs/superpowers/specs/2026-11-17-pr114a-batching-capability-facts.md`.

@@ -4,7 +4,16 @@
 // orchestrator's seams (tests 14, 15) are in orchestrator.test.ts. Call counters, no wall clock.
 import { afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { appendFileSync, existsSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { initParser } from "@lethal/engine";
@@ -54,6 +63,7 @@ import {
   v3DaemonClosesText,
   warmupCause,
 } from "../src/al-runner-v3-backend";
+import { BATCH_FORBIDDEN_FIELDS } from "../src/al-runner-v3-baseline-batch";
 import type { PeakProbe } from "../src/al-runner-v3-baseline-check";
 import { validateAlRunnerV3Config } from "../src/al-runner-v3-config";
 import {
@@ -77,7 +87,13 @@ import {
 } from "../src/al-runner-v3-entries";
 import { AlRunnerV3SeedError } from "../src/al-runner-v3-seed";
 import { AlcCompileError, type ArtifactIo, ArtifactPrepareError } from "../src/artifact";
-import type { RunOpts, TestMethodRef, TestVerdict, V3RequestTimed } from "../src/backend";
+import type {
+  RunOpts,
+  TestMethodRef,
+  TestVerdict,
+  V3BaselineOneShotTimed,
+  V3RequestTimed,
+} from "../src/backend";
 import { buildBackend } from "../src/cli";
 import { baselineSourceTag } from "../src/orchestrator";
 import { splitBackend } from "../src/parallel-queue";
@@ -155,6 +171,11 @@ interface Layout {
   readonly scratch: string;
 }
 
+/** PR-115: test codeunits `layout` writes with a `trigger OnRun`; a test sets and clears it. */
+const ONRUN_CUS = new Set<number>();
+/** PR-123: test codeunits `layout` writes with `Subtype = Normal`, so the source scan does not see them as tests. */
+const UNSCANNED_CUS = new Set<number>();
+
 async function layout(
   targetAl: string,
   suite: readonly TestMethodRef[],
@@ -188,7 +209,19 @@ async function layout(
   const byCu = new Map<number, string[]>();
   for (const r of suite) byCu.set(r.codeunitId, [...(byCu.get(r.codeunitId) ?? []), r.method]);
   for (const [cu, methods] of byCu) {
-    await writeFile(join(testDir, `Tests${cu}.Codeunit.al`), testAl(cu, methods));
+    const text = UNSCANNED_CUS.has(cu)
+      ? testAl(cu, methods).replace("Subtype = Test;", "Subtype = Normal;")
+      : testAl(cu, methods);
+    // PR-115: a test codeunit named in ONRUN_CUS gets a `trigger OnRun` (the scan sends it alone).
+    await writeFile(
+      join(testDir, `Tests${cu}.Codeunit.al`),
+      ONRUN_CUS.has(cu)
+        ? text.replace(
+            "Subtype = Test;",
+            "Subtype = Test;\n    trigger OnRun()\n    begin\n    end;\n",
+          )
+        : text,
+    );
   }
   await writeFile(
     join(deps, "Microsoft_System.app"),
@@ -426,6 +459,8 @@ interface ServeScript {
   delayMs?: (req: Req, n: number) => number;
   /** PR-88: daemons whose server has no pid any more (as after a cut answer, R895). The test adds to it. */
   pidGone?: Set<number>;
+  /** PR-115: a plain request with no `test` is a batch; it answers these codeunits less the `excludeTests` ones (default: every `Tests<cu>.Codeunit.al` in the test dir). */
+  batchCus?: readonly number[];
 }
 const goodEcho: Echo = (m) => ({
   method: "Echo",
@@ -553,6 +588,35 @@ function fakeServe(script: ServeScript = {}) {
               per.push({ type: "entrySummary", entry: e.id, ...count(rs) });
             }
             lines.push(...per);
+          } else if (body.test === undefined) {
+            // PR-115: a batch (no `test`): every codeunit's rows, less what `excludeTests` hides (a substring of the full name).
+            const out = ((body.excludeTests as string[] | undefined) ?? []).map((x) =>
+              x.toLowerCase(),
+            );
+            selected = new Set();
+            const cov = { coverage: [] as unknown[], perTestCoverage: [] as unknown[] };
+            const present = (await readdir(testDir))
+              .map((f) => /^Tests(\d+)\.Codeunit\.al$/.exec(f)?.[1])
+              .filter((x): x is string => x !== undefined)
+              .map(Number);
+            for (const cu of script.batchCus ?? present) {
+              const rs = rowsOf(onDisk, cu).filter(
+                (r) => !out.some((x) => `Codeunit${cu}.${r.method}`.toLowerCase().includes(x)),
+              );
+              if (rs.length === 0) continue;
+              selected.add(cu);
+              for (const r of rs) lines.push(testLine(cu, r));
+              count(rs);
+              if (body.coverage === true) {
+                const doc = (script.coverage?.(onDisk, cu, active, testDir) ?? {
+                  coverage: [],
+                  perTestCoverage: [],
+                }) as { coverage: unknown[]; perTestCoverage: unknown[] };
+                cov.coverage.push(...doc.coverage);
+                cov.perTestCoverage.push(...doc.perTestCoverage);
+              }
+            }
+            if (body.coverage === true) extra = cov;
           } else {
             const cu = cuOf(body.test);
             selected = new Set([cu]);
@@ -3023,6 +3087,7 @@ describe("the gate's transport flags (itest:alrunner-v3 harness)", () => {
       "S1E",
       "DB",
       "DBI",
+      "DBM",
       "S3",
       "N1",
       "N1E",
@@ -8331,6 +8396,7 @@ describe("R948 C: the memory guard", () => {
       serve: { coverage: plainCoverage },
       extra: { daemonBaseline: true },
       polls: 1,
+      seams: { concurrentSamples: false }, // PR-119: this test counts the guard's reads
     });
     const v: TestVerdict[] = [];
     r.b.baselinePhase(true);
@@ -8402,6 +8468,7 @@ describe("R948 C: the memory guard", () => {
       extra: { daemonBaseline: true },
       polls: 1,
       seams: {
+        concurrentSamples: false, // PR-119: this test counts the guard's reads
         memorySleep: async () => {
           if (closesAtFirstSleep < 0) closesAtFirstSleep = held.rig?.serve.closes.length ?? -2;
         },
@@ -9313,7 +9380,9 @@ describe("R951 R2-R6: replacement samples, kept one-shot answers", () => {
   });
 
   test("a skipped middle sample (wall timeout) is replaced FORWARD; the report names reason and replacement", async () => {
-    const r = await six();
+    // PR-119: a concurrent sample's forward pick is taken after the loop's position at the settle,
+    // so this in-place-flow pin runs with the samples in place (the concurrent pick: pr119 tests).
+    const r = await six({ seams: { concurrentSamples: false } });
     stubCus(r.b, { [CUS[1] ?? 0]: { timedOut: true, wallMs: 1 } });
     await baseline(r.b, SUITE6);
     expect(rep(r)).toMatchObject({
@@ -9538,9 +9607,10 @@ describe("R951 R2-R6: replacement samples, kept one-shot answers", () => {
   test("review 3: a forward replacement the loop never reaches is not counted", async () => {
     let n = 0;
     const r = await six({
-      // spent() is read at each loop top and once after the skipped sample's run: the 4th read is
-      // the loop top before the replacement (CUS[2]), where the fill stops.
-      stopHandle: { spent: () => ++n >= 4, signalled: () => false, stopForMemory: () => {} },
+      seams: { concurrentSamples: false }, // PR-119: the spent() read count below is the in-place flow's
+      // spent() is read twice per request (PR-119: again after the pre-check) and once after the skipped
+      // sample's run: the 6th read is the loop top before the replacement (CUS[2]), where the fill stops.
+      stopHandle: { spent: () => ++n >= 6, signalled: () => false, stopForMemory: () => {} },
     });
     stubCus(r.b, { [CUS[1] ?? 0]: { timedOut: true, wallMs: 1 } });
     await baseline(r.b, SUITE6);
@@ -10667,7 +10737,14 @@ describe("PR-21 (L5): re-check of a reused serve baseline", () => {
       allPass(m, cu, d, n).map((x) =>
         x.method === "B" ? { ...x, status: "fail" as const, message: text } : x,
       );
-  const named = (opts: RigOpts) => rig({ ...opts, appExtra: { publisher: PUB } });
+  // R1123 (PR-146): coverage on, so the re-check's coverage guard compares real maps (under "none" it compares none)
+  const named = (opts: RigOpts) =>
+    rig({
+      ...opts,
+      appExtra: { publisher: PUB },
+      extra: { coverage: "al-runner", ...opts.extra },
+      oneShotCoverage: plainCoverage,
+    });
   const rowsOf = (r: Rig) =>
     (r.b as unknown as { baselineRows: Map<number, unknown[]> }).baselineRows;
   /** Each first session's stored coverage, as the orchestrator builds it from the baseline verdicts. */
@@ -10843,6 +10920,45 @@ describe("PR-21 (L5): re-check of a reused serve baseline", () => {
     expect(why).toContain("no stored coverage to compare");
   });
 
+  test("R1123: under coverage none no map is compared, and the re-check says so by name instead of passing null vs null", async () => {
+    const state = await (await firstOf(allPass)).b.baselineState();
+    const r2 = await named({
+      serve: { rows: allPass, coverage: plainCoverage },
+      extra: { coverage: "none" },
+    });
+    r2.b.baselinePhase(true);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // nothing stored to compare: under coverage on this refuses (test 7); under none the rows decide
+      const why = await r2.b.recheckReusedBaseline(
+        JSON.parse(JSON.stringify(state)),
+        new Map(),
+        1000,
+      );
+      expect(why).toBeUndefined();
+      expect(
+        warn.mock.calls.some((c) => String(c[0]).includes("re-check: coverage not compared")),
+      ).toBe(true);
+      // the samples ask for no coverage either (build review): nothing would read it
+      expect(r2.serve.requests.length).toBeGreaterThan(0);
+      expect(r2.serve.requests.every((q) => q.body.coverage !== true)).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("R1123: a failing test's null vs null is not a comparison: with the passing test's map missing, it refuses", async () => {
+    const rows = rowsWith("boom"); // B fails, A passes
+    const r1 = await firstOf(rows);
+    // keep only B's stored entry ("null"): A's map is missing, so nothing real is compared
+    const onlyB = new Map(
+      [...(storedOf.get(r1) ?? new Map<string, string>())].filter(([k]) => k.endsWith(".b")),
+    );
+    expect([...onlyB.values()]).toEqual(["null"]);
+    const { why } = await recheck(r1, rows, (s) => s, onlyB);
+    expect(why).toContain("no stored coverage to compare");
+  });
+
   test("8 (review 1): the rows imported are this session's re-check rows, not the stored ones", async () => {
     const r1 = await firstOf(allPass);
     // the stored rows carry a tail the re-check does not compare (a refusal's first line only):
@@ -10983,6 +11099,46 @@ describe("PR-56: drift after a kept refusal", () => {
     expect(events).toEqual([]);
   });
 
+  test("R1115: in a mutant entry, a test red at baseline that now passes is not drift (its reach is unknown)", async () => {
+    // A fails at baseline and everywhere, except under M0002 on daemon 0, where the mutant makes it pass
+    const { r, events } = await driftRig((m, x, d) => {
+      if (x.method === "A") return m === "M0002" && d === 0 ? x : failed(x);
+      return m === "M0001" && x.method === "C" ? refused(x) : x;
+    });
+    await r.b.prefetchMutants(plans(["M0001"], [ref("C")])); // kept refusal
+    await r.b.prefetchMutants(plans(["M0002"], [ref("B"), ref("C")])); // A is before B, the first covering test
+    // red without the R1115 skip: one drift event and a second daemon
+    expect(events).toEqual([]);
+    expect(r.serve.daemons.length).toBe(1);
+  });
+
+  test("R1115: a NONE entry still compares a test red at baseline", async () => {
+    // A fails at baseline; on daemon 0 from the 3rd request on, a NONE run of A passes (carried state)
+    const { r, events } = await driftRig((m, x, d, n) => {
+      if (x.method === "A") return m === "NONE" && d === 0 && n >= 2 ? x : failed(x);
+      return m === "M0002" && x.method === "B" ? refused(x) : x;
+    });
+    await r.b.prefetchMutants(plans(["M0002"], [ref("B")])); // kept refusal
+    await r.b.activate("M0002");
+    await r.b.sendKillPair("M0002", ref("B"));
+    // red if the skip ignored the entry kind: no event
+    expect(events.map((e) => [e.test, e.baselineRow, e.row])).toEqual([
+      [`Codeunit${CU}.A`, "a=fail", "a=pass"],
+    ]);
+  });
+
+  test("R1115: in a mutant entry, a test green at baseline that now fails is still drift", async () => {
+    const { r, events } = await driftRig((m, x, d) => {
+      if (x.method === "A") return m === "M0002" && d === 0 ? failed(x) : x;
+      return m === "M0001" && x.method === "C" ? refused(x) : x;
+    });
+    await r.b.prefetchMutants(plans(["M0001"], [ref("C")]));
+    await r.b.prefetchMutants(plans(["M0002"], [ref("B"), ref("C")]));
+    expect(events.map((e) => [e.test, e.baselineRow, e.row])).toEqual([
+      [`Codeunit${CU}.A`, "a=pass", "a=fail"],
+    ]);
+  });
+
   test("review M1: a NONE confirm run alone after a kept refusal is not compared", async () => {
     const { r, events } = await driftRig((m, x, d, n) =>
       keptsIn(m, m === "NONE" && d === 0 && n >= 2 && x.method === "A" ? failed(x) : x),
@@ -11110,6 +11266,148 @@ describe("PR-100: serve-request-timed, and the phase a daemon closed in", () => 
       expect(e.tests).toBeGreaterThan(0);
     }
     expect(timed.some((e) => e.failed === true || e.cut === true)).toBe(false);
+  });
+
+  test("PR-113: each baseline plain request is timed as kind baseline, and nothing else is", async () => {
+    const r = await dbRig();
+    const timed: V3RequestTimed[] = [];
+    r.b.setRequestTimedSink((e) => timed.push(e));
+    await baseline(r.b, SUITE3);
+    expect(r.serve.requests).toHaveLength(3);
+    expect(timed.map((e) => e.kind)).toEqual(["baseline", "baseline", "baseline"]);
+    for (const e of timed) {
+      expect(e.lane).toBe(0);
+      expect(e.entries).toBe(1);
+      expect(e.tests).toBeGreaterThan(0);
+      expect(e.wallMs).toBeGreaterThanOrEqual(0);
+      expect(e.cause).toBeUndefined();
+    }
+  });
+
+  test("PR-113: a baseline event carries al-runner's timings", async () => {
+    const r = await dbRig({
+      serve: {
+        answer: (_q, _n, ls) => ({
+          lines: ls.map((x) =>
+            x.type === "summary" ? { ...x, timings: { setupMs: 7, engineMs: 8 } } : x,
+          ),
+        }),
+      },
+    });
+    const timed: V3RequestTimed[] = [];
+    r.b.setRequestTimedSink((e) => timed.push(e));
+    await baseline(r.b, SUITE3);
+    expect(timed.length).toBeGreaterThan(0);
+    for (const e of timed) expect(e.timings).toEqual({ setupMs: 7, engineMs: 8 });
+  });
+
+  test("PR-113: a failed baseline request is timed with failed, and has no timings", async () => {
+    const r = await dbRig({
+      serve: {
+        answer: (q) =>
+          q.ids[0]?.startsWith("plain:") === true && q.daemon === 0
+            ? { lines: [], eof: true }
+            : undefined,
+      },
+    });
+    const timed: V3RequestTimed[] = [];
+    r.b.setRequestTimedSink((e) => timed.push(e));
+    await baseline(r.b, SUITE3).catch(() => undefined);
+    const bad = timed.filter((e) => e.failed === true);
+    expect(bad).toHaveLength(1);
+    expect(bad[0]?.kind).toBe("baseline");
+    expect(bad[0]?.timings).toBeUndefined();
+  });
+
+  test("PR-113: the mutant phase's coverage and echo windows (plain requests outside the baseline) keep no event", async () => {
+    const r = await rig({
+      targetAl: SLEEPER_AL,
+      serve: { rows: killsM1, coverage: sleepCoverage() },
+    });
+    const timed: V3RequestTimed[] = [];
+    r.b.setRequestTimedSink((e) => timed.push(e));
+    await baseline(r.b, SUITE1);
+    await r.b.prefetchMutants(plans(["M0001", "M0002"]));
+    await r.b.activate("M0001");
+    await r.b.run(ref("A"), OPTS);
+    await r.b.activate("M0002");
+    await r.b.run(ref("A"), OPTS);
+    await r.b.run(ref("B"), OPTS);
+    const s = r.b.entriesStats();
+    // the windows really ran as plain requests ...
+    expect(s.coverageRequests + s.echoRequests).toBeGreaterThan(0);
+    // ... and are the only serve requests without an event
+    expect(timed.some((e) => e.kind === "baseline")).toBe(false);
+    expect(timed).toHaveLength(r.serve.requests.length - s.coverageRequests - s.echoRequests);
+  });
+
+  test("PR-113: a one-shot that never started (spawnError) is not timed", async () => {
+    const r = await dbRig();
+    const holder = r.b as unknown as { spawnCodeunit: (...a: unknown[]) => Promise<unknown> };
+    let spawns = 0;
+    holder.spawnCodeunit = async () => {
+      spawns += 1;
+      return { spawnError: "no process", wallMs: 5 };
+    };
+    const shots: V3BaselineOneShotTimed[] = [];
+    r.b.setBaselineOneShotSink((e) => shots.push(e));
+    await baseline(r.b, SUITE3).catch(() => undefined);
+    expect(spawns).toBeGreaterThan(0);
+    expect(shots).toEqual([]);
+  });
+
+  test("PR-113: a cross-check one-shot is timed with reason cross-check", async () => {
+    const r = await dbRig();
+    const shots: V3BaselineOneShotTimed[] = [];
+    r.b.setBaselineOneShotSink((e) => shots.push(e));
+    await baseline(r.b, SUITE3);
+    // the sample: the 2nd and the last codeunit, one process each (see R948 A)
+    expect(shots.map((e) => [e.codeunit, e.reason])).toEqual([
+      [CU2, "cross-check"],
+      [CU3, "cross-check"],
+    ]);
+    for (const e of shots) expect(e.wallMs).toBeGreaterThanOrEqual(0);
+  });
+
+  test("PR-113: after a dropped daemon baseline the ordinary one-shot calls are timed as other, each process once", async () => {
+    const other: CoverageFn = (m, cu, a, t) => {
+      const d = plainCoverage(m, cu, a, t) as {
+        perTestCoverage: { coverage: { statements: { line: number; hits: number }[] }[] }[];
+      };
+      const first = d.perTestCoverage[0]?.coverage[0];
+      if (first !== undefined) first.statements = [{ line: 99, hits: 1 }];
+      return d;
+    };
+    const r = await dbRig({ suite: SUITE2, oneShotCoverage: other });
+    const shots: V3BaselineOneShotTimed[] = [];
+    r.b.setBaselineOneShotSink((e) => shots.push(e));
+    await baseline(r.b, SUITE2);
+    expect(r.b.daemonBaselineReport().dropped).toBeDefined(); // the cross-check dropped the daemon baseline
+    expect(shots.filter((e) => e.reason === "cross-check").map((e) => e.codeunit)).toEqual([CU2]);
+    expect(
+      shots
+        .filter((e) => e.reason === "other")
+        .map((e) => e.codeunit)
+        .sort(),
+    ).toEqual([CU, CU2]);
+    // one event per process, none twice
+    expect(shots).toHaveLength(r.one.calls.length);
+  });
+
+  test("PR-113: R790's too-slow re-run is timed with reason too-slow", async () => {
+    const slowCu: RowsFn = (m, cu, d, n) =>
+      allPass(m, cu, d, n).map((x) =>
+        cu === CU ? { ...x, message: "Test exceeded 3s timeout." } : x,
+      );
+    const r = await dbRig({ serve: { rows: slowCu } });
+    const shots: V3BaselineOneShotTimed[] = [];
+    r.b.setBaselineOneShotSink((e) => shots.push(e));
+    await baseline(r.b, SUITE3);
+    expect(shots.filter((e) => e.reason === "too-slow").map((e) => e.codeunit)).toEqual([CU]);
+    expect(shots.filter((e) => e.reason === "cross-check").map((e) => e.codeunit)).toEqual([
+      CU2,
+      CU3,
+    ]);
   });
 
   test("a thrown send is timed with failed, and has no timings", async () => {
@@ -11282,5 +11580,1138 @@ describe("PR-100: serve-request-timed, and the phase a daemon closed in", () => 
     expect(warmupCause("recycle")).toBe("recycle");
     expect(warmupCause("timeout")).toBe("after-timeout");
     expect(warmupCause("refusal")).toBe("after-refusal");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// PR-115 (R1106 part b): the baseline's test codeunits in batches. The batch size is a seam (2 or 3), the
+// decision a seam (`baselineBatching`); the pin and probe side is pr114a-batching-accessor.test.ts.
+// ---------------------------------------------------------------------------------------------
+const CU4 = 79103;
+SUITE_METHODS[CU4] = ["E"];
+const SUITE4 = [...SUITE3, ref("E", CU4)];
+
+describe("PR-115: batching the daemon baseline", () => {
+  const bRig = (o: RigOpts = {}, size = 2): Promise<Rig> =>
+    dbRig({
+      ...o,
+      seams: { baselineBatching: true, baselineBatchSize: size, ...(o.seams ?? {}) },
+    });
+  const isBatch = (q: Req) => q.body.test === undefined;
+  // A batch answer that names an EXTRA row (no suite test) twice: only decode step 3 catches it, since the
+  // per-codeunit row check ignores extra rows (the first row of the answer is copied under another name).
+  const dupFirstRow = (q: Req, _n: number, lines: Record<string, unknown>[]) => {
+    const first = lines[0];
+    if (!isBatch(q) || first === undefined) return undefined;
+    const extra = { ...first, name: `Codeunit${CU}.Extra` };
+    return { lines: [extra, extra, ...lines] };
+  };
+
+  test("the batch body is requestBase's plus excludeTests and coverage, with none of the forbidden fields; the lone codeunit is today's request", async () => {
+    const r = await bRig({ extra: { daemonBaseline: true, noClient: true } });
+    const v = await baseline(r.b, SUITE3);
+    expect(v.map((x) => x.outcome)).toEqual(["pass", "pass", "pass", "pass"]);
+    expect(r.serve.requests).toHaveLength(2);
+    const [batch, single] = r.serve.requests;
+    if (batch === undefined || single === undefined) throw new Error("two requests");
+    expect(isBatch(batch)).toBe(true);
+    expect(single.body.test).toBe(`Codeunit${CU3}.`);
+    const { excludeTests, ...batchRest } = batch.body;
+    const { test: _t, ...singleRest } = single.body;
+    // every OTHER Subtype=Test codeunit of both trees: CU3, and the control echo codeunit deployed into active/
+    expect(excludeTests).toEqual([`Codeunit${CU3}.`, `Codeunit${ECHO}.`]);
+    expect(batchRest).toEqual(singleRest); // sourcePaths, testIsolation, noClient, coverage, perTestCoverage
+    expect(batch.body.noClient).toBe(true);
+    for (const f of BATCH_FORBIDDEN_FIELDS) expect(batch.body).not.toHaveProperty(f);
+    expect(r.b.daemonBaselineReport()).toMatchObject({ requests: 2, dropped: undefined });
+  });
+
+  test("a one-codeunit suite sends its codeunit alone: a batch of 1 is today's request (the empty-complement rule itself is pinned in pr115-baseline-batch.test.ts)", async () => {
+    const r = await bRig({ suite: SUITE1 });
+    await baseline(r.b, SUITE1);
+    expect(r.serve.requests.map((q) => q.body.test)).toEqual([`Codeunit${CU}.`]);
+    expect(r.serve.requests.every((q) => q.body.excludeTests === undefined)).toBe(true);
+  });
+
+  test("a test codeunit with trigger OnRun goes alone, and the other batch is shorter", async () => {
+    ONRUN_CUS.add(CU2);
+    try {
+      const r = await bRig();
+      await baseline(r.b, SUITE3);
+      expect(r.serve.requests.map((q) => q.body.test)).toEqual([
+        `Codeunit${CU}.`,
+        `Codeunit${CU2}.`,
+        `Codeunit${CU3}.`,
+      ]);
+    } finally {
+      ONRUN_CUS.delete(CU2);
+    }
+  });
+
+  test("the accessor false (no seam, no pin) means no batching", async () => {
+    const r = await dbRig({ seams: { baselineBatchSize: 2 } });
+    expect(r.b.isBaselineBatching()).toBe(false);
+    await baseline(r.b, SUITE3);
+    expect(r.serve.requests.every((q) => q.body.test !== undefined)).toBe(true);
+    expect(r.serve.requests).toHaveLength(3);
+  });
+
+  test("batching needs coverage: a fill without it sends every codeunit alone", async () => {
+    const r = await bRig();
+    const priv = r.b as unknown as {
+      lane: unknown;
+      fillDaemonBaseline(l: unknown, s: number, c: boolean): Promise<void>;
+    };
+    await priv.fillDaemonBaseline(priv.lane, 1, false);
+    expect(r.serve.requests).toHaveLength(3);
+    for (const q of r.serve.requests) {
+      expect(q.body.test).toBeDefined();
+      expect(q.body).not.toHaveProperty("coverage");
+    }
+  });
+
+  test("a batch request that fails keeps nothing: each codeunit is re-sent alone", async () => {
+    const r = await bRig({
+      serve: { answer: (q) => (isBatch(q) ? { lines: [], eof: true } : undefined) },
+    });
+    const v = await baseline(r.b, SUITE3);
+    expect(v.map((x) => x.outcome)).toEqual(["pass", "pass", "pass", "pass"]);
+    expect(r.serve.requests.map((q) => q.body.test)).toEqual([
+      undefined,
+      `Codeunit${CU}.`,
+      `Codeunit${CU2}.`,
+      `Codeunit${CU3}.`,
+    ]);
+  });
+
+  test("a duplicate test name discards the batch WITHOUT throwing, closes the daemon, re-sends alone, and turns batching off for the session", async () => {
+    const r = await bRig({ suite: SUITE4, serve: { answer: dupFirstRow } });
+    const v = await baseline(r.b, SUITE4);
+    expect(v.map((x) => x.outcome)).toEqual(["pass", "pass", "pass", "pass", "pass"]);
+    // one discarded batch, then four singles: the second group [CU3, CU4] is never batched (the first discard turned it off)
+    expect(r.serve.requests.map((q) => q.body.test)).toEqual([
+      undefined,
+      `Codeunit${CU}.`,
+      `Codeunit${CU2}.`,
+      `Codeunit${CU3}.`,
+      `Codeunit${CU4}.`,
+    ]);
+    expect(r.serve.requests.map((q) => q.daemon)).toEqual([0, 1, 1, 1, 1]); // closed after the discard
+  });
+
+  test("R1001's watch sees only decoded rows: a discarded batch's duplicate rows never reach it", async () => {
+    const seen: { id: number; names: string[] }[] = [];
+    const spy = spyOn(UniformRefusalWatch.prototype, "observe").mockImplementation(function (
+      this: unknown,
+      id: number,
+      rows: readonly { name: string }[],
+    ) {
+      seen.push({ id, names: rows.map((x) => x.name) });
+      return undefined;
+    });
+    try {
+      const r = await bRig({ serve: { answer: dupFirstRow } });
+      await baseline(r.b, SUITE3);
+    } finally {
+      spy.mockRestore();
+    }
+    // The fill's own watch saw each codeunit once, after the discard (later entries are the per-call watch's).
+    expect(seen.slice(0, 3).map((s) => s.id)).toEqual([CU, CU2, CU3]);
+    for (const s of seen) expect(new Set(s.names).size).toBe(s.names.length);
+  });
+
+  test("verdicts and coverage equal the unbatched baseline's", async () => {
+    const run = async (batched: boolean) => {
+      const r = await dbRig({
+        suite: SUITE4,
+        extra: { coverage: "al-runner", daemonBaseline: true },
+        ...(batched ? { seams: { baselineBatching: true, baselineBatchSize: 3 } } : {}),
+      });
+      const v = await baseline(r.b, SUITE4);
+      return { r, seen: v.map((x) => ({ outcome: x.outcome, coverage: x.coverage })) };
+    };
+    const plain = await run(false);
+    const batched = await run(true);
+    expect(batched.r.serve.requests.some((q) => q.body.test === undefined)).toBe(true);
+    expect(batched.seen).toEqual(plain.seen);
+    expect(plain.seen.some((x) => x.coverage !== undefined)).toBe(true);
+  });
+
+  test("R948: a batched sample is compared by rows and per-test sets, not by its top level (the union of its tests)", async () => {
+    const r = await bRig();
+    await baseline(r.b, SUITE3);
+    // CU2 (a sample) sits in the batch; its one-shot top level has lines 7 and 12, the union of its one test only 7.
+    expect(r.b.daemonBaselineReport()).toMatchObject({ dropped: undefined, compared: 2 });
+  });
+
+  test("R790 is per codeunit: a slow codeunit in a batch does not make its neighbour re-run", async () => {
+    const slow =
+      (which: number): RowsFn =>
+      (m, cu, d, n) =>
+        allPass(m, cu, d, n).map((x) =>
+          cu === which ? { ...x, message: "Test exceeded 3s timeout." } : x,
+        );
+    // CU is not a sample: slow, so skipped as too slow. CU2 slow instead: CU stays served.
+    const a = await bRig({ serve: { rows: slow(CU) } });
+    await baseline(a.b, SUITE3);
+    expect(a.b.daemonBaselineReport().skippedTooSlow).toEqual([`Codeunit${CU}`]);
+    const b = await bRig({ serve: { rows: slow(CU2) } });
+    await baseline(b.b, SUITE3);
+    expect(b.b.daemonBaselineReport().skippedTooSlow).toEqual([]);
+    expect(b.b.daemonBaselineReport().served).toBe(1); // CU, from the batch
+  });
+
+  test("the deadline is v3CallDeadlineMs over the batch's total tests", async () => {
+    const spy = spyOn(AlRunnerServer.prototype, "runEntries");
+    try {
+      const r = await bRig();
+      await baseline(r.b, SUITE3);
+      const s = Number(/--test-timeout (\d+)/.exec(r.serve.daemons[0]?.join(" ") ?? "")?.[1]);
+      const deadlines = spy.mock.calls.map((c) => c[1]);
+      expect(deadlines[0]).toBe(v3CallDeadlineMs(s, 3)); // A, B, C
+      expect(deadlines[1]).toBe(v3CallDeadlineMs(s, 1)); // D
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("one callId covers a batch: its codeunits' verdicts share it, the wall time is charged once", async () => {
+    // rows with no own time of their own are the ones that carry a call id (R963)
+    const noOwnTime: RowsFn = (m, cu, d, n) =>
+      allPass(m, cu, d, n).map((x) => ({ ...x, noDuration: true }));
+    const r = await bRig({ suite: SUITE4, serve: { rows: noOwnTime } }, 3);
+    const v = await baseline(r.b, SUITE4);
+    // groups [CU, CU2, CU3] and [CU4]; CU and CU3 are served from the batch, CU2 and CU4 are samples (one-shot).
+    const ids = (cu: number) =>
+      v.filter((_, i) => SUITE4[i]?.codeunitId === cu).map((x) => x.callId);
+    const shared = new Set([...ids(CU), ...ids(CU3)]);
+    expect(shared.size).toBe(1);
+    expect([...shared][0]).toBeDefined();
+    expect(shared.has(ids(CU2)[0])).toBe(false);
+  });
+
+  test("a stop signal after the batch request drops the whole batch", async () => {
+    const held: { rig?: Rig } = {};
+    const asked = () => held.rig?.serve.requests.length ?? 0;
+    const r = await bRig({
+      stopHandle: { spent: () => false, signalled: () => asked() >= 1, stopForMemory: () => {} },
+    });
+    held.rig = r;
+    await baseline(r.b, SUITE3);
+    expect(r.serve.requests).toHaveLength(1);
+    expect(r.b.daemonBaselineReport().served).toBe(0);
+    expect(oneShotCodeunits(r)).toHaveLength(3); // nothing kept: all three run live
+  });
+
+  test("R951: a skipped sample inside a batch is replaced by a later codeunit of the same batch", async () => {
+    const r = await bRig({ suite: SUITE4 }, 3);
+    const holder = r.b as unknown as { spawnCodeunit: (...a: unknown[]) => Promise<unknown> };
+    const real = holder.spawnCodeunit.bind(r.b);
+    let first = true;
+    holder.spawnCodeunit = async (...a) => {
+      if (!first) return real(...a);
+      first = false;
+      return { timedOut: true, wallMs: 1 }; // CU2's cross-check run gives no answer
+    };
+    await baseline(r.b, SUITE4).catch(() => {});
+    expect(r.b.daemonBaselineReport().replacements).toEqual({
+      [`Codeunit${CU2}`]: `Codeunit${CU3}`,
+    });
+    // one batch [CU, CU2, CU3] and CU4 alone: the replacement CU3 was served from the batch's answer, not re-asked
+    expect(r.serve.requests).toHaveLength(2);
+    expect(r.serve.requests[0] !== undefined && isBatchReq(r.serve.requests[0])).toBe(true);
+  });
+});
+const isBatchReq = (q: Req) => q.body.test === undefined;
+
+// ---------------------------------------------------------------------------------------------
+// PR-123: the L5 re-check of a reused baseline, in batches (spec 2026-11-17-pr123-batched-recheck.md), as
+// PR-126 changed it (spec 2026-11-17-pr126-recheck-coverage-samples-only.md): the samples go singly WITH
+// coverage, the rest batch WITHOUT. Seven codeunits (SUITE7), batch size 2: the samples are the 2nd, the
+// middle and the last (CU2, CU4, CU7); the non-samples CU, CU3, CU5, CU6 make the batches [CU, CU3] and
+// [CU5, CU6]. Call counters and request logs on the fakes, never the clock.
+// ---------------------------------------------------------------------------------------------
+const CU5 = 79104;
+const CU6 = 79105;
+const CU7 = 79106;
+SUITE_METHODS[CU5] = ["F"];
+SUITE_METHODS[CU6] = ["G"];
+SUITE_METHODS[CU7] = ["H"];
+const SUITE7 = [...SUITE4, ref("F", CU5), ref("G", CU6), ref("H", CU7)];
+interface BatchReq {
+  batchRequest(
+    ...a: unknown[]
+  ): Promise<Map<number, { withCoverage: boolean; coverage: { kind: string } }> | undefined>;
+}
+describe("PR-123: the batched re-check of a reused baseline", () => {
+  const isBatch = (q: Req) => q.body.test === undefined;
+  // R1123 (PR-146): coverage on, so a sample's coverage is a real map (under "none" the re-check compares none)
+  const named = (opts: RigOpts) =>
+    rig({
+      suite: SUITE7,
+      oneShotCoverage: plainCoverage,
+      ...opts,
+      appExtra: { publisher: "Acme Pub" },
+      extra: { coverage: "al-runner", ...opts.extra },
+    });
+  const rowsOf = (r: Rig) =>
+    (r.b as unknown as { baselineRows: Map<number, unknown[]> }).baselineRows;
+  const priv = (r: Rig) =>
+    r.b as unknown as {
+      baselineStats: { batches: number; batchDiscards: number };
+      baselineBatchingSpent: string | undefined;
+      memoryGate(a: boolean): Promise<boolean>;
+      checkBound(l: unknown): Promise<void>;
+    };
+  const batchesOf = (r: Rig) => r.serve.requests.filter(isBatch);
+  const singlesOf = (r: Rig) => r.serve.requests.filter((q) => !isBatch(q));
+  /** Rows equal to allPass, except the listed (codeunit, method) tests fail. */
+  const failing =
+    (...bad: [number, string][]): RowsFn =>
+    (m, cu, d, n) =>
+      allPass(m, cu, d, n).map((x) =>
+        bad.some(([c, meth]) => c === cu && meth === x.method)
+          ? { ...x, status: "fail" as const, message: "boom" }
+          : x,
+      );
+  /** The first session: one unbatched baseline, its stored state and stored coverage. */
+  const stored = async (extra?: Partial<AlRunnerV3Config>, cov: CoverageFn = plainCoverage) => {
+    const r = await named({
+      serve: { rows: allPass, coverage: cov },
+      ...(extra !== undefined ? { extra, oneShotCoverage: cov } : {}),
+    });
+    const verdicts = await baseline(r.b, SUITE7);
+    return {
+      state: await r.b.baselineState(),
+      coverage: new Map(
+        verdicts.map((v) => [
+          `codeunit${v.ref.codeunitId}.${v.ref.method}`.toLowerCase(),
+          JSON.stringify(v.coverage ?? null),
+        ]),
+      ) as ReadonlyMap<string, string>,
+    };
+  };
+  interface Resume {
+    rows?: RowsFn;
+    coverage?: CoverageFn;
+    batched?: boolean;
+    answer?: ServeScript["answer"];
+    stopHandle?: RigOpts["stopHandle"];
+    patch?: (s: Record<string, unknown>) => unknown;
+    before?: (r: Rig) => Promise<void> | void;
+    extra?: Partial<AlRunnerV3Config>;
+  }
+  const resume = async (f: Awaited<ReturnType<typeof stored>>, o: Resume = {}) => {
+    const r2 = await named({
+      serve: {
+        rows: o.rows ?? allPass,
+        coverage: o.coverage ?? plainCoverage,
+        ...(o.answer !== undefined ? { answer: o.answer } : {}),
+      },
+      ...(o.batched === false
+        ? {}
+        : { seams: { baselineBatching: true, baselineBatchSize: 2 } as const }),
+      ...(o.stopHandle !== undefined ? { stopHandle: o.stopHandle } : {}),
+      ...(o.extra !== undefined ? { extra: o.extra } : {}),
+    });
+    await o.before?.(r2);
+    r2.b.baselinePhase(true);
+    const state = JSON.parse(JSON.stringify(f.state)) as Record<string, unknown>;
+    const why = await r2.b.recheckReusedBaseline(o.patch?.(state) ?? state, f.coverage, 1000);
+    return { why, r2 };
+  };
+  /** The stored coverage of sample CU2's test C is another map (as the L5 test 6 does it). */
+  const otherCoverage = (f: Awaited<ReturnType<typeof stored>>) =>
+    new Map([...f.coverage, [`codeunit${CU2}.c`, JSON.stringify({ not: "it" })]]);
+  const lineOf = (warn: { mock: { calls: unknown[][] } }) =>
+    warn.mock.calls.map((c) => String(c[0])).find((s) => s.includes("re-check batching (PR-123)"));
+
+  test("the same answers, the same outcome, batched and unbatched: all equal reuses, and the batched arm sent batches only", async () => {
+    const f = await stored();
+    const plain = await resume(f, { batched: false });
+    const batched = await resume(f);
+    expect(plain.why).toBeUndefined();
+    expect(batched.why).toBeUndefined();
+    expect(batchesOf(plain.r2)).toHaveLength(0);
+    expect(singlesOf(plain.r2)).toHaveLength(7);
+    // red without the batched fetch: seven singles
+    expect(batchesOf(batched.r2)).toHaveLength(2);
+    expect(singlesOf(batched.r2)).toHaveLength(3); // the samples
+    expect(rowsOf(batched.r2).size).toBe(7);
+  });
+
+  test("PR-126: the samples go singly WITH coverage and are in every batch's excludeTests; a non-sample batch's body has neither coverage field", async () => {
+    const f = await stored();
+    const { why, r2 } = await resume(f);
+    expect(why).toBeUndefined();
+    const batches = batchesOf(r2);
+    expect(batches.length).toBeGreaterThan(0);
+    // each sample once, alone, asking for coverage; never inside a batch
+    const singles = singlesOf(r2);
+    expect(singles.map((q) => q.body.test).sort()).toEqual(
+      [CU2, CU4, CU7].map((c) => `Codeunit${c}.`).sort(),
+    );
+    for (const q of singles) expect(q.body.coverage).toBe(true);
+    for (const q of batches) {
+      for (const c of [CU2, CU4, CU7]) expect(q.body.excludeTests).toContain(`Codeunit${c}.`);
+      expect(q.body).not.toHaveProperty("coverage");
+      expect(q.body).not.toHaveProperty("perTestCoverage");
+    }
+  });
+
+  test("PR-126: a non-sample batch's answers carry withCoverage: false and unavailable coverage", async () => {
+    const f = await stored();
+    const seen: { withCoverage: boolean; kind: string }[] = [];
+    const real = (AlRunnerV3Backend.prototype as unknown as BatchReq).batchRequest;
+    const spy = spyOn(AlRunnerV3Backend.prototype as unknown as BatchReq, "batchRequest");
+    spy.mockImplementation(async function (this: unknown, ...a: unknown[]) {
+      const out = await real.apply(this, a);
+      for (const v of out?.values() ?? [])
+        seen.push({ withCoverage: v.withCoverage, kind: v.coverage.kind });
+      return out;
+    });
+    try {
+      const { why } = await resume(f);
+      expect(why).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(seen).toHaveLength(4); // CU, CU3, CU5, CU6
+    for (const s of seen) expect(s).toEqual({ withCoverage: false, kind: "unavailable" });
+  });
+
+  test("PR-126: the fill's batch body still asks for coverage (both fields true)", async () => {
+    const r = await dbRig({
+      suite: SUITE4,
+      seams: { baselineBatching: true, baselineBatchSize: 2 },
+    });
+    await baseline(r.b, SUITE4);
+    const batches = r.serve.requests.filter(isBatch);
+    expect(batches.length).toBeGreaterThan(0);
+    for (const q of batches) {
+      expect(q.body.coverage).toBe(true);
+      expect(q.body.perTestCoverage).toBe(true);
+    }
+  });
+
+  test("PR-126 (L3): the fill's step 5 still holds: a ghost per-test entry in a FILL batch discards it", async () => {
+    const r = await dbRig({
+      suite: SUITE3,
+      seams: { baselineBatching: true, baselineBatchSize: 2 },
+      serve: {
+        answer: (q, _n, lines) =>
+          isBatch(q)
+            ? {
+                lines: lines.map((l) =>
+                  l.type === "summary"
+                    ? {
+                        ...l,
+                        perTestCoverage: [
+                          ...((l.perTestCoverage as unknown[] | undefined) ?? []),
+                          { test: `Codeunit${CU}.Ghost`, coverage: [] },
+                        ],
+                      }
+                    : l,
+                ),
+              }
+            : undefined,
+      },
+    });
+    await baseline(r.b, SUITE3);
+    const p = r.b as unknown as {
+      baselineStats: { batchDiscards: number };
+      baselineBatchingSpent: string | undefined;
+    };
+    expect(p.baselineStats.batchDiscards).toBe(1);
+    expect(p.baselineBatchingSpent).toContain("no row of the batch");
+  });
+
+  test("the same answers, the same outcome: one stored row differs (a codeunit no sample covers), not reused either way, nothing imported", async () => {
+    const f = await stored();
+    const rows = failing([CU, "B"]);
+    const plain = await resume(f, { batched: false, rows });
+    const batched = await resume(f, { rows });
+    expect(plain.why).toContain(`codeunit ${CU}:`);
+    expect(batched.why).toBe(plain.why); // red without the row compare on a batched answer
+    expect(batchesOf(batched.r2).length).toBeGreaterThan(0);
+    expect(rowsOf(batched.r2).size).toBe(0);
+  });
+
+  test("the same answers, the same outcome: a sample's coverage differs, not reused either way", async () => {
+    const f = await stored();
+    const stored2 = { ...f, coverage: otherCoverage(f) };
+    const plain = await resume(stored2, { batched: false });
+    const batched = await resume(stored2);
+    expect(plain.why).toContain("coverage differs");
+    expect(batched.why).toBe(plain.why); // red without the sample's coverage compare on a batched answer
+    expect(batchesOf(batched.r2).length).toBeGreaterThan(0);
+  });
+
+  test("batching on: ONE memory hold and ONE bound check per batch; batching off: one per codeunit", async () => {
+    const f = await stored();
+    const count = async (batched: boolean) => {
+      const gate: unknown[] = [];
+      const bound: unknown[] = [];
+      const { why } = await resume(f, {
+        batched,
+        before: (r) => {
+          const p = priv(r);
+          const g = p.memoryGate.bind(p);
+          const c = p.checkBound.bind(p);
+          p.memoryGate = (a) => {
+            gate.push(a);
+            return g(a);
+          };
+          p.checkBound = (l) => {
+            bound.push(l);
+            return c(l);
+          };
+        },
+      });
+      expect(why).toBeUndefined();
+      return { gate: gate.length, bound: bound.length };
+    };
+    // two batches and the three samples singly; unbatched: seven
+    expect(await count(true)).toEqual({ gate: 5, bound: 5 });
+    expect(await count(false)).toEqual({ gate: 7, bound: 7 });
+  });
+
+  test("a discarded batch whose rows MATCH the stored ones: its rows are not used, the re-sends are singles (coverage for samples only), batching is latched off with the re-check's reason", async () => {
+    const f = await stored();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // request 0 is the first batch [CU, CU3]: its rows EQUAL the stored ones, but an extra row named twice
+      // discards it (decode step 3; a ghost coverage entry no longer discards a no-coverage batch, PR-126).
+      // Every later request answers a DIFFERENT row for CU (B fails), so using the discarded answer would wrongly reuse.
+      const { why, r2 } = await resume(f, {
+        rows: (m, cu, d, n) => (n === 0 ? allPass(m, cu, d, n) : failing([CU, "B"])(m, cu, d, n)),
+        answer: (q, _n, lines) => {
+          const first = lines[0];
+          if (!isBatch(q) || first === undefined) return undefined;
+          const extra = { ...first, name: `Codeunit${CU}.Extra` };
+          return { lines: [extra, extra, ...lines] };
+        },
+      });
+      expect(why).toContain(`codeunit ${CU}:`); // the single's row decided
+      expect(rowsOf(r2).size).toBe(0);
+      // the discarded batch, then CU alone (and no coverage: CU is no sample); the second batch is never sent (the latch)
+      expect(r2.serve.requests.map((q) => q.body.test)).toEqual([undefined, `Codeunit${CU}.`]);
+      expect(singlesOf(r2).map((q) => q.body.coverage === true)).toEqual([false]);
+      expect(priv(r2).baselineBatchingSpent).toStartWith("the re-check: ");
+      expect(priv(r2).baselineBatchingSpent).toContain(`test Codeunit${CU}.Extra appears twice`); // step 3
+      expect(priv(r2).baselineStats.batchDiscards).toBe(1);
+      expect(lineOf(warn)).toContain("1 discarded or failed (the re-check: ");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  describe("with a real coverage index (coverage: al-runner)", () => {
+    const real = { coverage: "al-runner" } as const;
+    /** Every test hits the target's line 5, except the ones `skip` names: those hit nothing in the target. */
+    const hitsTarget =
+      (skip: (cu: number, method: string) => boolean): CoverageFn =>
+      (_m, cu, active, t) => {
+        const own = (method: string) => ({
+          test: `Codeunit${cu}.${method}`,
+          coverage: [
+            { file: join(t, `Tests${cu}.Codeunit.al`), statements: [{ line: 7, hits: 1 }] },
+            ...(skip(cu, method)
+              ? []
+              : [
+                  {
+                    file: join(active, "Logic.Codeunit.al"),
+                    statements: [{ line: 5, hits: 1 }],
+                  },
+                ]),
+          ],
+        });
+        const tests = (SUITE_METHODS[cu] ?? []).map(own);
+        return {
+          coverage: tests.flatMap((e) => e.coverage),
+          perTestCoverage: tests,
+        };
+      };
+    const same = hitsTarget(() => false);
+    /** CU2's test C no longer hits the target; the rows and every other test's coverage are the same. */
+    const otherLine = hitsTarget((cu, method) => cu === CU2 && method === "C");
+
+    test("a sample's single-request per-test coverage equal to the stored map: reused, and the stored maps are real", async () => {
+      const f = await stored(real, same);
+      expect(f.coverage.get(`codeunit${CU2}.c`)).not.toBe("null"); // a real index, not null against null
+      const { why, r2 } = await resume(f, { extra: real, coverage: same });
+      expect(why).toBeUndefined();
+      expect(batchesOf(r2)).toHaveLength(2);
+      expect(singlesOf(r2)).toHaveLength(3); // the samples, with coverage
+    });
+
+    test("a sample's single-request per-test coverage that differs from the stored map (rows equal) is not reused, naming the method (PR-126 L4)", async () => {
+      const f = await stored(real, same);
+      const { why, r2 } = await resume(f, { extra: real, coverage: otherLine });
+      expect(why).toContain(`codeunit ${CU2}: C's coverage differs`);
+      expect(batchesOf(r2).length).toBeGreaterThan(0);
+      expect(singlesOf(r2)).toHaveLength(1); // CU2, the first sample in stored order; the check stopped there
+      expect(rowsOf(r2).size).toBe(0);
+    });
+  });
+
+  test("a failed batch request: latched, a discard counted, singles sent", async () => {
+    const f = await stored();
+    const { why, r2 } = await resume(f, {
+      answer: (q) => (isBatch(q) ? { lines: [], eof: true } : undefined),
+    });
+    expect(why).toBeUndefined();
+    expect(r2.serve.requests.map((q) => q.body.test)).toEqual([
+      undefined,
+      ...[CU, CU2, CU3, CU4, CU5, CU6, CU7].map((c) => `Codeunit${c}.`),
+    ]);
+    // coverage only for the samples CU2, CU4, CU7
+    expect(singlesOf(r2).map((q) => q.body.coverage === true)).toEqual([
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true,
+    ]);
+    expect(priv(r2).baselineBatchingSpent).toStartWith("the re-check: a batch request failed");
+    expect(priv(r2).baselineStats.batchDiscards).toBe(1);
+  });
+
+  test("a stop signal after a batch returns the signal reason, and no answer of that batch is compared", async () => {
+    const f = await stored();
+    const held: { rig?: Rig } = {};
+    const { why, r2 } = await resume(f, {
+      // the batch's rows differ: a compare would name the codeunit instead of the signal
+      rows: failing([CU, "B"]),
+      stopHandle: {
+        spent: () => false,
+        signalled: () => (held.rig?.serve.requests.length ?? 0) >= 1,
+        stopForMemory: () => {},
+      },
+      before: (r) => {
+        held.rig = r;
+      },
+    });
+    expect(why).toBe("a stop signal (during the re-check)");
+    expect(r2.serve.requests).toHaveLength(1);
+    expect(rowsOf(r2).size).toBe(0);
+  });
+
+  test("the budget is checked before each batch", async () => {
+    const f = await stored();
+    const held: { rig?: Rig } = {};
+    const { why, r2 } = await resume(f, {
+      stopHandle: {
+        spent: () => (held.rig?.serve.requests.length ?? 0) >= 1,
+        signalled: () => false,
+        stopForMemory: () => {},
+      },
+      before: (r) => {
+        held.rig = r;
+      },
+    });
+    expect(why).toContain("the time budget");
+    expect(r2.serve.requests).toHaveLength(1); // the second batch was never sent
+  });
+
+  test("a codeunit with trigger OnRun goes singly, the rest still batch", async () => {
+    ONRUN_CUS.add(CU3);
+    try {
+      const f = await stored();
+      const { why, r2 } = await resume(f);
+      expect(why).toBeUndefined();
+      // the batch [CU5, CU6] first (CU and CU3 are alone), then the singles in stored order
+      expect(r2.serve.requests.map((q) => q.body.test)).toEqual([
+        undefined,
+        ...[CU, CU2, CU3, CU4, CU7].map((c) => `Codeunit${c}.`),
+      ]);
+    } finally {
+      ONRUN_CUS.delete(CU3);
+    }
+  });
+
+  test("a suite codeunit with no stored rows (and no source file) is in the batch's excludeTests", async () => {
+    UNSCANNED_CUS.add(CU3);
+    try {
+      const f = await stored();
+      const { why, r2 } = await resume(f, {
+        patch: (s) => ({ ...s, rows: (s.rows as [number, unknown][]).filter(([k]) => k !== CU3) }),
+      });
+      expect(why).toBeUndefined();
+      const batch = batchesOf(r2)[0];
+      if (batch === undefined) throw new Error("a batch was sent");
+      // CU3 is only in the suite (the scan does not find it): the suite ids exclude it
+      expect(batch.body.excludeTests).toContain(`Codeunit${CU3}.`);
+      // the samples (now CU2, CU5, CU7) are excluded too; the batch is [CU, CU4]
+      expect(batch.body.excludeTests).toContain(`Codeunit${CU5}.`);
+      expect(batch.body.excludeTests).not.toContain(`Codeunit${CU4}.`);
+    } finally {
+      UNSCANNED_CUS.delete(CU3);
+    }
+  });
+
+  test("batches are planned over ascending ids, and the checks run in stored order", async () => {
+    const f = await stored();
+    const { why, r2 } = await resume(f, {
+      // stored order CU7 .. CU; samples CU6, CU4, CU. Two failing BATCHED codeunits: CU5 is stored before CU2,
+      // so the reason names CU5 (ascending or batch order would name CU2)
+      patch: (s) => ({ ...s, rows: [...(s.rows as unknown[])].reverse() }),
+      rows: failing([CU5, "F"], [CU2, "C"]),
+    });
+    expect(why).toContain(`codeunit ${CU5}:`);
+    const first = batchesOf(r2)[0]?.body.excludeTests as string[] | undefined;
+    // ascending plan over the non-samples CU2, CU3, CU5, CU7: the first batch is [CU2, CU3]
+    expect(first).toContain(`Codeunit${CU4}.`);
+    expect(first).toContain(`Codeunit${CU5}.`);
+    expect(first).not.toContain(`Codeunit${CU2}.`);
+    expect(first).not.toContain(`Codeunit${CU3}.`);
+  });
+
+  test("the stats line, both ways", async () => {
+    const f = await stored();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await resume(f);
+      expect(lineOf(warn)).toContain("2 batch(es) kept, 0 discarded or failed");
+      warn.mockClear();
+      await resume(f, { batched: false });
+      expect(lineOf(warn)).toContain("re-check batching (PR-123): off (");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("after a batched reuse, a warm-up NONE row that differs from an imported row throws by name", async () => {
+    const f = await stored();
+    const { why, r2 } = await resume(f, {
+      // requests 0 and 1 are the two batches, 2-4 the samples; the warm-up is request 5 and disagrees on CU2
+      rows: (m, cu, d, n) =>
+        n >= 5 && cu === CU2 ? [{ method: "C", status: "fail" as const }] : allPass(m, cu, d, n),
+    });
+    expect(why).toBeUndefined();
+    r2.b.baselinePhase(false);
+    const err = await r2.b.prefetchMutants(plans(["M0001"], SUITE7)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AlRunnerV3EntriesRefusedError);
+    expect(String(err)).toContain("al-runner-v3-entries-warmup-disagrees");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// PR-119 (R1107): the daemon fill's cross-check samples run beside the daemon. Event logs and call
+// counters on the fakes, never the clock: a "hold" waits for an event, with a cap only so a
+// sequential flow (where the event can never come first) cannot hang.
+// ---------------------------------------------------------------------------------------------
+describe("PR-119: cross-check samples beside the daemon", () => {
+  // Six codeunits: the plan samples index 1 and the last (index 5).
+  const CUS = [79120, 79121, 79122, 79123, 79124, 79125];
+  for (const c of CUS) SUITE_METHODS[c] = ["T"];
+  const SUITE = CUS.map((c) => ref("T", c));
+  const at = (i: number) => CUS[i] ?? 0;
+  const until = async (pred: () => boolean) => {
+    for (let i = 0; i < 150 && !pred(); i += 1) await Bun.sleep(1);
+  };
+  interface Hooks {
+    /** Runs at the start of a codeunit's FIRST one-shot process. */
+    hold?: (id: number, log: string[]) => Promise<void>;
+    /** Gives that first process this result instead of running it. */
+    stub?: Record<number, unknown>;
+    /** That first process throws. */
+    boom?: number[];
+  }
+  const GIBS = 2 ** 30;
+  const memSample = (usedBytes: number) => ({
+    usedBytes,
+    maxBytes: 32 * GIBS,
+    source: "/sys/fs/cgroup/memory.max",
+  });
+  /** One test's rig with an event log: `req:<cu>` at a daemon request, `start:`/`end:<cu>` around a one-shot. */
+  async function setup(o: RigOpts & { hooks?: Hooks } = {}) {
+    const log: string[] = [];
+    const { hooks, ...rest } = o;
+    const r = await dbRig({
+      suite: SUITE,
+      ...rest,
+      serve: {
+        coverage: plainCoverage,
+        stderr: (req) => {
+          log.push(`req:${/Codeunit(\d+)/.exec(req.ids[0] ?? "")?.[1]}`);
+          return undefined;
+        },
+        ...(rest.serve ?? {}),
+      },
+    });
+    const holder = r.b as unknown as {
+      spawnCodeunit: (...a: { id: number }[]) => Promise<unknown>;
+    };
+    const real = holder.spawnCodeunit.bind(r.b);
+    const seen = new Map<number, number>();
+    holder.spawnCodeunit = async (...a) => {
+      const id = a[0]?.id ?? 0;
+      const n = (seen.get(id) ?? 0) + 1;
+      seen.set(id, n);
+      log.push(`start:${id}`);
+      if (n === 1) await hooks?.hold?.(id, log);
+      if (n === 1 && hooks?.boom?.includes(id)) throw new Error("sample boom");
+      const made = n === 1 ? hooks?.stub?.[id] : undefined;
+      const out = made ?? (await real(...a));
+      log.push(`end:${id}`);
+      return out;
+    };
+    const idx = (e: string) => log.indexOf(e);
+    return { r, log, idx, rep: () => r.b.daemonBaselineReport() };
+  }
+  const timedOut = { timedOut: true, wallMs: 1 };
+  /** The one-shot of codeunit index 1 differs from the daemon's. */
+  const differsAt1: RowsFn = (_m, cu) =>
+    cu === at(1)
+      ? [{ method: "T", status: "fail" as const, message: "differs" }]
+      : (SUITE_METHODS[cu] ?? []).map((method) => ({ method, status: "pass" as const }));
+  /** Holds a first one-shot until the daemon request for index `i` has arrived. */
+  const holdUntilReq = (sample: number, i: number) => (id: number, log: string[]) =>
+    id === sample ? until(() => log.includes(`req:${at(i)}`)) : Promise.resolve();
+  /** Holds a first one-shot until another one-shot starts (it never does while the loop settles it first). */
+  const holdUntilOtherStart = (sample: number) => (id: number, log: string[]) =>
+    id === sample
+      ? until(() => log.some((e) => e.startsWith("start:") && e !== `start:${sample}`))
+      : Promise.resolve();
+
+  test("a sample in flight overlaps the next daemon request; the stats and the console line say so", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t = await setup({ hooks: { hold: holdUntilReq(at(1), 2) } });
+      await baseline(t.r.b, SUITE);
+      // the request for index 2 arrived while index 1's one-shot was still running
+      expect(t.idx(`req:${at(2)}`)).toBeGreaterThan(-1);
+      expect(t.idx(`req:${at(2)}`)).toBeLessThan(t.idx(`end:${at(1)}`));
+      expect(t.rep()).toMatchObject({
+        dropped: undefined,
+        samplesOverlapped: 1,
+        samplesSequential: 1,
+      });
+      expect(t.rep().sampleMemoryAtStart).toBeUndefined(); // no guard here
+      expect(
+        warn.mock.calls.some((c) =>
+          String(c[0]).includes("baseline samples (PR-119): 1 overlapped, 1 sequential"),
+        ),
+      ).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("the seam off, or LETHAL_V3_SEQUENTIAL_SAMPLES=1: today's call order, each sample finished before the next request", async () => {
+    const sequential = (t: Awaited<ReturnType<typeof setup>>) => {
+      expect(t.idx(`end:${at(1)}`)).toBeLessThan(t.idx(`req:${at(2)}`));
+      expect(t.rep()).toMatchObject({ samplesOverlapped: 0, samplesSequential: 2 });
+    };
+    const off = await setup({
+      seams: { concurrentSamples: false },
+      hooks: { hold: holdUntilReq(at(1), 2) },
+    });
+    await baseline(off.r.b, SUITE);
+    sequential(off);
+    const before = process.env.LETHAL_V3_SEQUENTIAL_SAMPLES;
+    process.env.LETHAL_V3_SEQUENTIAL_SAMPLES = "1";
+    try {
+      const env = await setup({ hooks: { hold: holdUntilReq(at(1), 2) } });
+      await baseline(env.r.b, SUITE);
+      sequential(env);
+      process.env.LETHAL_V3_SEQUENTIAL_SAMPLES = "yes";
+      await expect(setup()).rejects.toThrow(/al-runner-v3-sequential-samples-refused/);
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "LETHAL_V3_SEQUENTIAL_SAMPLES");
+      else process.env.LETHAL_V3_SEQUENTIAL_SAMPLES = before;
+    }
+  });
+
+  test("a sample that settles with no daemon request started beside it counts as sequential (one batch holds every codeunit)", async () => {
+    const t = await setup({ seams: { baselineBatching: true, baselineBatchSize: 6 } });
+    await baseline(t.r.b, SUITE);
+    expect(t.r.serve.requests.filter((q) => q.body.test === undefined)).toHaveLength(1);
+    expect(t.rep()).toMatchObject({ dropped: undefined, compared: 2 });
+    // index 1 ran in flight, but every later answer was cached: no request overlapped it
+    expect(t.rep()).toMatchObject({ samplesOverlapped: 0, samplesSequential: 2 });
+  });
+
+  test("the result is applied only at the settle: a differing sample does not stop the requests the loop makes before it settles", async () => {
+    const t = await setup({ oneShotRows: differsAt1 });
+    await baseline(t.r.b, SUITE).catch(() => {});
+    expect(t.rep().dropped).toContain("differs from a fresh process's");
+    expect(t.r.serve.requests).toHaveLength(6); // sequentially: 2, the drop came first
+  });
+
+  test("a dropped result wins over a later uniform stop (R1001): the drop is the reading, not a throw", async () => {
+    const t = await setup({
+      suite: R1001_SUITE,
+      serve: { rows: refusedAll },
+      oneShotRows: (_m, cu) =>
+        (SUITE_METHODS[cu] ?? []).map((method) => ({ method, status: "pass" as const })),
+    });
+    const v = await baseline(t.r.b, R1001_SUITE);
+    expect(v).toHaveLength(R1001_SUITE.length);
+    expect(t.rep().dropped).toContain("differs from a fresh process's");
+    expect(t.r.serve.requests.length).toBeGreaterThanOrEqual(10); // the loop ran on to the 10th refusal
+  });
+
+  test("a dropped result wins over the two-unusable drop", async () => {
+    const t = await setup({
+      oneShotRows: differsAt1,
+      serve: { answer: (_q, n) => (n === 2 || n === 3 ? { lines: [], eof: true } : undefined) },
+    });
+    await baseline(t.r.b, SUITE).catch(() => {});
+    expect(t.rep().dropped).toContain("differs from a fresh process's");
+    expect(t.rep().dropped).not.toContain("two serve requests");
+  });
+
+  test("a dropped result is applied at the loop's end after a stop, not lost", async () => {
+    const held: { r?: Rig } = {};
+    const t = await setup({
+      oneShotRows: differsAt1,
+      stopHandle: {
+        spent: () => (held.r?.serve.requests.length ?? 0) >= 3,
+        signalled: () => false,
+        stopForMemory: () => {},
+      },
+    });
+    held.r = t.r;
+    await baseline(t.r.b, SUITE).catch(() => {});
+    expect(t.rep().dropped).toContain("differs from a fresh process's");
+  });
+
+  test("the sample's throw beats a loop throw in finally, and the loop's is named in a warning", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t = await setup({ hooks: { boom: [at(1)] } });
+      const h = t.r.b as unknown as { baselineRequest: (...a: unknown[]) => Promise<unknown> };
+      const realReq = h.baselineRequest.bind(t.r.b);
+      let calls = 0;
+      h.baselineRequest = async (...a) => {
+        if (++calls === 3) throw new Error("loop boom");
+        return realReq(...a);
+      };
+      await expect(baseline(t.r.b, SUITE)).rejects.toThrow("sample boom");
+      expect(
+        warn.mock.calls.some((c) =>
+          String(c[0]).includes("al-runner-v3-baseline-sample-error-order"),
+        ),
+      ).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("finally applies nothing but a throw: a dropped sample in flight when the loop throws gives the loop's error, no drop, no notice", async () => {
+    const seen: [string, string][] = [];
+    const t = await setup({ oneShotRows: differsAt1, notify: (c, m) => seen.push([c, m]) });
+    const h = t.r.b as unknown as { baselineRequest: (...a: unknown[]) => Promise<unknown> };
+    const realReq = h.baselineRequest.bind(t.r.b);
+    let calls = 0;
+    h.baselineRequest = async (...a) => {
+      if (++calls === 3) throw new Error("loop boom");
+      return realReq(...a);
+    };
+    await expect(baseline(t.r.b, SUITE)).rejects.toThrow("loop boom");
+    expect(dropNotice(seen)).toHaveLength(0);
+    expect(t.rep().dropped).toBeUndefined();
+  });
+
+  test("a skipped forward pick is taken after the loop's position at the settle, and the too-slow one-shot settles the sample first", async () => {
+    const slow: RowsFn = (_m, cu) =>
+      cu === at(3)
+        ? [{ method: "T", status: "fail" as const, message: "Test exceeded 9s timeout." }]
+        : (SUITE_METHODS[cu] ?? []).map((method) => ({ method, status: "pass" as const }));
+    const t = await setup({
+      serve: { rows: slow },
+      oneShotRows: slow,
+      hooks: {
+        stub: { [at(1)]: timedOut },
+        // held until the too-slow one-shot of index 3 starts: it never can before the sample is settled
+        hold: (id, log) =>
+          id === at(1) ? until(() => log.includes(`start:${at(3)}`)) : Promise.resolve(),
+      },
+    });
+    await baseline(t.r.b, SUITE);
+    expect(t.idx(`end:${at(1)}`)).toBeGreaterThan(-1);
+    expect(t.idx(`end:${at(1)}`)).toBeLessThan(t.idx(`start:${at(3)}`));
+    // settled while the loop was at index 3: the first unsampled codeunit after it is index 4 (not 2)
+    expect(t.rep().replacements).toEqual({ [`Codeunit${at(1)}`]: `Codeunit${at(4)}` });
+  });
+
+  test("a backward pick runs after the in-flight sample settled, never beside it", async () => {
+    const t = await setup({
+      hooks: { stub: { [at(1)]: timedOut }, hold: holdUntilOtherStart(at(1)) },
+    });
+    await baseline(t.r.b, SUITE);
+    expect(t.idx(`end:${at(1)}`)).toBeGreaterThan(-1);
+    expect(t.idx(`end:${at(1)}`)).toBeLessThan(t.idx(`start:${at(4)}`)); // the backward pick (the last has no later codeunit)
+    expect(t.idx(`end:${at(1)}`)).toBeLessThan(t.idx(`start:${at(5)}`)); // and the last sample
+    expect(t.rep().replacements).toEqual({ [`Codeunit${at(1)}`]: `Codeunit${at(4)}` });
+  });
+
+  test("the got-undefined sample branch settles the sample before its replacement runs", async () => {
+    const t = await setup({
+      hooks: { hold: holdUntilOtherStart(at(1)) },
+      serve: { answer: (_q, n) => (n === 5 ? { lines: [], eof: true } : undefined) },
+    });
+    await baseline(t.r.b, SUITE);
+    expect(t.idx(`end:${at(1)}`)).toBeGreaterThan(-1);
+    expect(t.idx(`end:${at(1)}`)).toBeLessThan(t.idx(`start:${at(4)}`));
+    expect(t.rep().replacements).toEqual({ [`Codeunit${at(5)}`]: `Codeunit${at(4)}` });
+  });
+
+  test("a skipped result settled at a stop starts no replacement one-shot (R955)", async () => {
+    const held: { r?: Rig } = {};
+    const t = await setup({
+      hooks: { stub: { [at(1)]: timedOut } },
+      stopHandle: {
+        spent: () => false,
+        // the request for index 5 is the last that arrives: the stop signal ends it
+        signalled: () => (held.r?.serve.requests.length ?? 0) >= 6,
+        stopForMemory: () => {},
+      },
+    });
+    held.r = t.r;
+    // Only the fill (the first baseline call): later live calls would start index 4 for their own sake.
+    t.r.b.baselinePhase(true);
+    await t.r.b.activate(null);
+    await t.r.b.run(SUITE[0] ?? ref("T"), OPTS).catch(() => {});
+    t.r.b.baselinePhase(false);
+    expect(t.rep().sampledSkipped).toEqual([`Codeunit${at(1)} (timed-out)`]);
+    expect(t.log.includes(`start:${at(4)}`)).toBe(false); // the backward pick did not run
+  });
+
+  describe("memory (the guard on, a fixed reader)", () => {
+    const guarded = (
+      used: (held: { r?: Rig }) => number | undefined,
+      o: {
+        rss?: number;
+        hooks?: Hooks;
+        sampleRss?: () => number;
+        stopHandle?: RigOpts["stopHandle"];
+      } = {},
+    ) => {
+      const held: { r?: Rig } = {};
+      return setup({
+        extra: { memoryHeadroomGb: 4 },
+        seams: {
+          memoryReader: () => {
+            const u = used(held);
+            return u === undefined ? undefined : memSample(u);
+          },
+          memorySleep: async () => {},
+          anonReader: () => o.rss ?? GIBS,
+          ...(o.sampleRss !== undefined ? { sampleRss: o.sampleRss } : {}),
+        },
+        ...(o.stopHandle !== undefined ? { stopHandle: o.stopHandle } : {}),
+        ...(o.hooks !== undefined ? { hooks: o.hooks } : {}),
+      }).then((t) => {
+        held.r = t.r;
+        return t;
+      });
+    };
+
+    test("room: a sample overlaps and the fill's start reading is recorded; no room (23 of 28 GiB): it runs in place", async () => {
+      const yes = await guarded(() => 20 * GIBS);
+      await baseline(yes.r.b, SUITE);
+      expect(yes.rep().samplesOverlapped).toBeGreaterThanOrEqual(1);
+      expect(yes.rep().sampleMemoryAtStart).toBe(20 * GIBS);
+      const no = await guarded(() => 23 * GIBS);
+      await baseline(no.r.b, SUITE);
+      expect(no.rep()).toMatchObject({
+        samplesOverlapped: 0,
+        samplesSequential: 2,
+        dropped: undefined,
+      });
+    });
+
+    test("an unreadable memory reading, or an unreadable daemon RSS, means sequential", async () => {
+      const reading = await guarded((h) =>
+        (h.r?.serve.requests.length ?? 0) >= 2 ? undefined : 20 * GIBS,
+      );
+      await baseline(reading.r.b, SUITE);
+      expect(reading.rep().samplesOverlapped).toBe(0);
+      const rss = await guarded(() => 20 * GIBS, { rss: 0 });
+      await baseline(rss.r.b, SUITE);
+      expect(rss.rep().samplesOverlapped).toBe(0);
+    });
+
+    test("S is the larger of the estimate and the daemon's RSS: a 9 GiB daemon refuses a sample 3 GiB would admit", async () => {
+      const big = await guarded(() => 17 * GIBS, { rss: 9 * GIBS });
+      await baseline(big.r.b, SUITE);
+      expect(big.rep().samplesOverlapped).toBe(0);
+      const small = await guarded(() => 17 * GIBS, { rss: GIBS });
+      await baseline(small.r.b, SUITE);
+      expect(small.rep().samplesOverlapped).toBeGreaterThanOrEqual(1);
+    });
+
+    test("a daemon request whose read says no settles the sample before its gate", async () => {
+      // 20 GiB with nothing held, 26 GiB while the sample holds its reservation: admitted, then no room.
+      const t = await guarded((h) =>
+        ((h.r?.b as unknown as { memoryHeld: number } | undefined)?.memoryHeld ?? 0) > 0
+          ? 26 * GIBS
+          : 20 * GIBS,
+      );
+      await baseline(t.r.b, SUITE);
+      // admitted (started in flight), but settled before the request started: sequential in effect
+      expect(t.idx(`start:${at(1)}`)).toBeGreaterThan(-1);
+      expect(t.idx(`end:${at(1)}`)).toBeLessThan(t.idx(`req:${at(2)}`));
+      expect(t.rep()).toMatchObject({ samplesOverlapped: 0, samplesSequential: 2 });
+    });
+
+    const heldOf = (h: { r?: Rig }) =>
+      (h.r?.b as unknown as { memoryHeld: number } | undefined)?.memoryHeld ?? 0;
+
+    test("a settle at the pre-check whose replacement one-shot spends the stop handle: no daemon request follows (R955)", async () => {
+      const seen: { log?: string[] } = {};
+      // The sample (index 1) stays in flight, held, until the request for index 5 would arrive. That request's
+      // pre-check says no (26 GiB while the sample holds), so the sample settles: skipped, and its backward
+      // replacement (index 4, nothing is left after index 5's position) runs one-shot and spends the stop handle.
+      const t = await guarded(
+        (h) => (heldOf(h) > 0 && (h.r?.serve.requests.length ?? 0) >= 5 ? 26 * GIBS : 20 * GIBS),
+        {
+          hooks: { stub: { [at(1)]: timedOut }, hold: holdUntilReq(at(1), 5) },
+          stopHandle: {
+            spent: () => seen.log?.includes(`end:${at(4)}`) === true,
+            signalled: () => false,
+            stopForMemory: () => {},
+          },
+        },
+      );
+      seen.log = t.log;
+      // Only the fill (the first baseline call): later live calls would send requests of their own.
+      t.r.b.baselinePhase(true);
+      await t.r.b.activate(null);
+      await t.r.b.run(SUITE[0] ?? ref("T"), OPTS).catch(() => {});
+      t.r.b.baselinePhase(false);
+      expect(t.log).toContain(`end:${at(4)}`); // the replacement ran, inside the settle
+      expect(t.r.serve.requests).toHaveLength(5); // and the request for index 5 never went out
+    });
+
+    test("the pre-check reads with the in-flight sample's reservation already held (its gate was queued first)", async () => {
+      const reads: { req: number; held: boolean }[] = [];
+      const t = await guarded(
+        (h) => {
+          reads.push({ req: h.r?.serve.requests.length ?? 0, held: heldOf(h) > 0 });
+          return 20 * GIBS;
+        },
+        { hooks: { hold: holdUntilReq(at(1), 3) } },
+      );
+      await baseline(t.r.b, SUITE);
+      // after request 1 is answered (2 requests in): admission, the sample's own gate, the pre-check, the gate of request 2
+      expect(reads.filter((x) => x.req === 2).map((x) => x.held)).toEqual([
+        false,
+        false,
+        true,
+        true,
+      ]);
+    });
+
+    test("the sampleRss seam replaces the per-pid read in admission: 0 means the sample runs in place", async () => {
+      const t = await guarded(() => 20 * GIBS, { sampleRss: () => 0 });
+      await baseline(t.r.b, SUITE);
+      expect(t.rep()).toMatchObject({ samplesOverlapped: 0, samplesSequential: 2 });
+    });
   });
 });

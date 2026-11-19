@@ -621,8 +621,8 @@ export function knownDifferencesRefusal(
 
 /**
  * Leg C's defect facts: each must read `defect-present` (r6; `none-selected-exit` since r7, R632;
- * `refusal-row-shape` since r9, R639). Every other fact of the 28 is a contract fact and must read
- * `matches`, except the warn facts.
+ * `refusal-row-shape` since r9, R639). Every other fact of the 36 is a contract or capability fact and
+ * must read `matches`, except the warn facts.
  */
 export const V3_DEFECT_FACTS = [
   "upstream-compile-errors",
@@ -638,10 +638,12 @@ export const V3_DEFECT_FACTS = [
 ] as const;
 
 /**
- * Leg C's pre-committed fact count: 9 defect, 18 contract, 1 warn (r13, R590: the contract fact
- * `dependency-skip-line`; r12 (R667, `message-has-no-type-prefix`) had 27, r9 had 26).
+ * Leg C's pre-committed fact count: 9 defect, 18 contract, 1 warn, 8 capability (PR-114a: the eight
+ * `batch-*` facts of `V3_CAPABILITY_FACTS`; a capability fact not reading `matches` is a gate-fail
+ * here, never a session refusal). r13 (R590, the contract fact `dependency-skip-line`) had 28; r12
+ * (R667, `message-has-no-type-prefix`) had 27, r9 had 26.
  */
-export const V3_LEG_C_FACTS = 28;
+export const V3_LEG_C_FACTS = 36;
 
 /** F4 (R639): leg C's per-fact log line, with `measured` whole. */
 export const legCFactLine = (f: {
@@ -669,11 +671,14 @@ export function classifyLegC(
     readonly fact: string;
     readonly verdict: string;
     readonly measured?: string;
+    readonly reference?: string;
   }>,
   defects: readonly string[],
   count: number,
   warns: readonly string[] = V3_WARN_FACTS,
   pin?: V3BuildPin["legC"],
+  /** PR-117: the capability facts (`V3_CAPABILITY_FACTS`); empty by default, so a caller that passes none judges them as before. */
+  capabilities: readonly string[] = [],
 ): { readonly outcome: "pass" | "held" | "gate-fail" | "infra-fail"; readonly lines: string[] } {
   const lines: string[] = [];
   let fail = facts.length !== count;
@@ -729,6 +734,24 @@ export function classifyLegC(
       // refusal through unseen (a retry, never a block).
       infra = true;
       lines.push(`infra-fail: ${f.fact}: unmeasurable${m}`);
+    } else if (
+      capabilities.includes(f.fact) &&
+      f.verdict === "diverged" &&
+      f.reference !== undefined
+    ) {
+      // PR-117 (M-2): only the batch half differs and the single request is right: batching stays off
+      // for this build, which costs speed, never the build. A wrong single request is a real defect.
+      if (f.reference === "pass") {
+        lines.push(`al-runner-v3-baseline-batching-off: ${f.fact}: diverged${m}`);
+      } else if (f.reference === "fail") {
+        fail = true;
+        lines.push(
+          `gate-fail: ${f.fact}: diverged and its alone reference fails (the single request is wrong)${m}`,
+        );
+      } else {
+        infra = true;
+        lines.push(`infra-fail: ${f.fact}: diverged and its alone reference ran nothing${m}`);
+      }
     } else if (want === "defect-present" && f.verdict === "gone") {
       held = true;
       lines.push(`held: ${f.fact}: defect-present -> gone (an upstream fix; re-pre-commit)${m}`);
@@ -1048,6 +1071,11 @@ export interface V3GateReceipt {
   /** R612 M-2: leg C's reading of each warn fact (`V3_WARN_FACTS`); the update script copies it
    *  into `.gated` on a pass. */
   readonly warnFacts?: Readonly<Record<string, string>>;
+  /** PR-117: leg C's eight capability readings (`V3_CAPABILITY_FACTS`). The update script records
+   *  them into `.gated` only with `legs.DBM === "pass"` AND `dbmBatched === true`. */
+  readonly batchFacts?: Readonly<Record<string, string>>;
+  /** PR-117: DBM ran its baseline batched (2 requests) and passed every check. Absent otherwise. */
+  readonly dbmBatched?: true;
   /** F8: the BC build of each leg's oracle server, beside v3's `--bc-version`. */
   readonly oracleBcBuild: Readonly<Record<string, string>>;
   readonly writtenAt: string;

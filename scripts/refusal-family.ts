@@ -56,6 +56,18 @@ export interface Family {
   /** The handle's declaration, per type. */
   readonly handles: Readonly<Record<string, string>>;
   readonly cells: readonly Cell[];
+  /** PR-191: support codeunits after the last cell's id (cell ids end at BASE + cells.length); widens app.json's idRanges. */
+  readonly extraIds?: number;
+  /**
+   * PR-191: extra census readers. Each is an AL Text `expr` (using the `vars` it declares) that keep-census folds into the
+   * observation it compares, beside the kit's own state, so state the kit cannot see (a bound subscriber, a SingleInstance
+   * global, XML runtime state) shows up as a difference. A family without it is measured exactly as before.
+   */
+  readonly readers?: readonly {
+    readonly name: string;
+    readonly vars: readonly string[];
+    readonly expr: string;
+  }[];
   /** PR-02: the app's `target` when the cells need one (DotNet needs `OnPrem`). */
   readonly target?: "OnPrem";
   /**
@@ -2316,6 +2328,364 @@ dotnet
       "Report.SaveAs(Report::\"T12 Report\", '<a/>', ReportFormat::Xml, OutS);",
       { vars: ["OutS: OutStream;"] },
     ),
+  ],
+};
+
+/**
+ * PR-133: two refusal texts DO's x2 window still closed its serve daemon on, each driven by an invented cell (no corpus source
+ * text); the C* text has a second, nested cell. Cell i is codeunit BASE_ID + 1 + i (51001 to 51003); the support objects are
+ * table 51000, codeunit 51000 and pages 51000 and 51001, all inside the family's id block (51000 to 51004).
+ */
+export const X2_REFUSALS: Family = {
+  name: "x2-refusals",
+  issue: "https://github.com/aldevtools/BusinessCentral.AL.Runner/issues/7924",
+  target: "OnPrem",
+  known: [],
+  support: `table 51000 "X2 Row"
+{
+    fields
+    {
+        field(1; Id; Integer) { }
+        field(2; Amount; BigInteger) { }
+        field(3; Trig; Integer)
+        {
+            trigger OnValidate()
+            var
+                R: Record "X2 Row";
+            begin
+                R.SetFilter(Amount, 'C*');
+                if R.FindFirst() then;
+            end;
+        }
+    }
+    keys { key(PK; Id) { Clustered = true; } }
+}
+
+codeunit 51000 "X2 Helper"
+{
+    [TryFunction]
+    procedure ValidateTrig(var R: Record "X2 Row")
+    begin
+        R.Validate(Trig, 1);
+    end;
+}
+
+page 51000 "X2 Wizard"
+{
+    PageType = Card;
+    SourceTable = "X2 Row";
+    UsageCategory = None;
+    layout { area(Content) { field(IdCtl; Rec.Id) { ApplicationArea = All; } } }
+    actions
+    {
+        area(Processing)
+        {
+            action(Go)
+            {
+                ApplicationArea = All;
+                trigger OnAction()
+                var
+                    Helper: Codeunit "X2 Helper";
+                    Row: Record "X2 Row";
+                begin
+                    Row.Id := 1;
+                    if not Helper.ValidateTrig(Row) then;
+                end;
+            }
+        }
+    }
+}
+
+page 51001 "X2 Card"
+{
+    PageType = Card;
+    SourceTable = "X2 Row";
+    UsageCategory = None;
+    layout { area(Content) { field(IdCtl; Rec.Id) { ApplicationArea = All; } } }
+    actions
+    {
+        area(Processing)
+        {
+            action(OpenWizard)
+            {
+                ApplicationArea = All;
+                trigger OnAction()
+                begin
+                    Page.RunModal(Page::"X2 Wizard");
+                end;
+            }
+        }
+    }
+}
+`,
+  handles: {},
+  cells: [
+    t9(
+      "Filter",
+      "SetFilterBigIntWildcard",
+      "C*",
+      "R.SetFilter(Amount, 'C*'); if R.FindFirst() then;",
+      {
+        vars: ['R: Record "X2 Row";'],
+      },
+    ),
+    t9("RecordRef", "GetTable", "Integer 123", "RR.GetTable(V);", {
+      vars: ["RR: RecordRef;", "V: Variant;"],
+      setup: ["V := 123;"],
+    }),
+    // PR-133 amendment 1: the C* text reached as DO reaches it: a card TestPage action runs a wizard with Page.RunModal,
+    // a modal handler invokes the wizard's action, which calls a [TryFunction] that validates a field whose OnValidate
+    // runs the SetFilter. The refusal must unwind through all of it.
+    t9("Page", "NestedValidate", "C*", "TP.OpenWizard.Invoke();", {
+      vars: ['R: Record "X2 Row";', 'TP: TestPage "X2 Card";'],
+      setup: ["R.Id := 1;", "R.Insert();", "TP.OpenView();"],
+      handlers: [
+        '    [ModalPageHandler]\n    procedure WizHandler(var W: TestPage "X2 Wizard")\n    begin\n        W.Go.Invoke();\n    end;\n',
+      ],
+    }),
+  ],
+};
+
+/**
+ * PR-139: the NUL-run Evaluate text at the widths DO's x3 window closed on (3, 10, 12, 14, 30, 37, 40), each driven by an
+ * invented cell: the plain shape, a bare array-element Evaluate, a TryFunction, a nested TestPage/modal/TryFunction/OnValidate
+ * chain (as X2's NestedValidate) and an OnInsert trigger after writes to a SingleInstance Dictionary. Amendment 1 appends the
+ * widths 7, 9, 11, 13, 16, 21, 25 and 27 (the other NUL widths in M28736's DO requests). Every cell must give
+ * "Evaluate of `<N NULs>` into Decimal (form not pinned by the corpus)". Cell i is codeunit BASE_ID + 1 + i (51001 to 51019);
+ * support codeunits 51000 and 51020, tables 51000 and 51001, pages 51000 and 51001 (the id block is 51000 to 51020).
+ */
+const X3_VARS = ["T: Text;", "Ch: Char;", "I: Integer;"];
+const x3Nul = (n: number): string[] => ["Ch := 0;", `for I := 1 to ${n} do T += Format(Ch);`];
+const X3_NUL_BODY = `        T := '';
+        Ch := 0;
+        for I := 1 to 10 do T += Format(Ch);`;
+export const X3_REFUSALS: Family = {
+  name: "x3-refusals",
+  issue: "https://github.com/aldevtools/BusinessCentral.AL.Runner/issues/7924",
+  target: "OnPrem",
+  known: [],
+  support: `table 51000 "X3 Row"
+{
+    fields
+    {
+        field(1; Id; Integer) { }
+        field(3; Trig; Integer)
+        {
+            trigger OnValidate()
+            var
+                T: Text;
+                Ch: Char;
+                I: Integer;
+                V: Integer;
+            begin
+${X3_NUL_BODY}
+                if not Evaluate(V, T) then;
+            end;
+        }
+    }
+    keys { key(PK; Id) { Clustered = true; } }
+}
+
+table 51001 "X3 Ins"
+{
+    fields { field(1; Id; Integer) { } }
+    keys { key(PK; Id) { Clustered = true; } }
+
+    trigger OnInsert()
+    var
+        T: Text;
+        Ch: Char;
+        I: Integer;
+        V: Integer;
+    begin
+${X3_NUL_BODY}
+        if not Evaluate(V, T) then;
+    end;
+}
+
+codeunit 51000 "X3 Helper"
+{
+    [TryFunction]
+    procedure ValidateTrig(var R: Record "X3 Row")
+    begin
+        R.Validate(Trig, 1);
+    end;
+
+    [TryFunction]
+    procedure EvalBare()
+    var
+        T: Text;
+        Ch: Char;
+        I: Integer;
+        V: Integer;
+    begin
+${X3_NUL_BODY}
+        Evaluate(V, T);
+    end;
+}
+
+codeunit 51020 "X3 Cache"
+{
+    SingleInstance = true;
+
+    var
+        Seen: Dictionary of [Text, Integer];
+
+    procedure Put(K: Text; V: Integer)
+    begin
+        Seen.Set(K, V);
+    end;
+}
+
+page 51000 "X3 Wizard"
+{
+    PageType = Card;
+    SourceTable = "X3 Row";
+    UsageCategory = None;
+    layout { area(Content) { field(IdCtl; Rec.Id) { ApplicationArea = All; } } }
+    actions
+    {
+        area(Processing)
+        {
+            action(Go)
+            {
+                ApplicationArea = All;
+                trigger OnAction()
+                var
+                    Helper: Codeunit "X3 Helper";
+                    Row: Record "X3 Row";
+                begin
+                    Row.Id := 1;
+                    if not Helper.ValidateTrig(Row) then;
+                end;
+            }
+        }
+    }
+}
+
+page 51001 "X3 Card"
+{
+    PageType = Card;
+    SourceTable = "X3 Row";
+    UsageCategory = None;
+    layout { area(Content) { field(IdCtl; Rec.Id) { ApplicationArea = All; } } }
+    actions
+    {
+        area(Processing)
+        {
+            action(OpenWizard)
+            {
+                ApplicationArea = All;
+                trigger OnAction()
+                begin
+                    Page.RunModal(Page::"X3 Wizard");
+                end;
+            }
+        }
+    }
+}
+`,
+  handles: {},
+  cells: [
+    ...[3, 10, 12, 14, 30, 37, 40].map((n) =>
+      t9("Evaluate", "NulInteger", `${n} NULs`, "if not Evaluate(V, T) then;", {
+        vars: ["V: Integer;", ...X3_VARS],
+        setup: x3Nul(n),
+      }),
+    ),
+    t9("Evaluate", "NulIntArray", "10 NULs", "Evaluate(A[1], T);", {
+      vars: ["A: array[3] of Integer;", ...X3_VARS],
+      setup: x3Nul(10),
+    }),
+    t9("Evaluate", "NulTryFunction", "10 NULs", "if not Helper.EvalBare() then;", {
+      vars: ['Helper: Codeunit "X3 Helper";'],
+    }),
+    t9("Page", "NestedEvaluate", "10 NULs", "TP.OpenWizard.Invoke();", {
+      vars: ['R: Record "X3 Row";', 'TP: TestPage "X3 Card";'],
+      setup: ["R.Id := 1;", "R.Insert();", "TP.OpenView();"],
+      handlers: [
+        '    [ModalPageHandler]\n    procedure WizHandler(var W: TestPage "X3 Wizard")\n    begin\n        W.Go.Invoke();\n    end;\n',
+      ],
+    }),
+    t9("Evaluate", "NulOnInsert", "10 NULs", "R.Insert(true);", {
+      vars: ['R: Record "X3 Ins";', 'Cache: Codeunit "X3 Cache";'],
+      setup: ["Cache.Put('a', 1);", "R.Id := 1;"],
+    }),
+    // amendment 1: the other NUL widths M28736's DO requests hold (7, 9, 11, 13, 16, 21, 25, 27), appended so C0-C10 keep
+    // their codeunit ids
+    ...[7, 9, 11, 13, 16, 21, 25, 27].map((n) =>
+      t9("Evaluate", "NulInteger", `${n} NULs`, "if not Evaluate(V, T) then;", {
+        vars: ["V: Integer;", ...X3_VARS],
+        setup: x3Nul(n),
+      }),
+    ),
+  ],
+};
+
+/**
+ * PR-159: the two sibling texts DO's y1 window still closed on, each driven by an invented cell (no corpus source text):
+ * `RecordRef.GetTable of Integer 12345` plainly and through a procedure that first checks `IsRecord` (the remove-not mutant
+ * of DO's guard), and the JSON writer's WriteStartObject at path `message.body.toRecipients[0].emailAddress`. Cell i is
+ * codeunit BASE_ID + 1 + i (51001 to 51003); the support codeunit is 51000 (the family's id block is 51000 to 51003).
+ */
+export const Y1_REFUSALS: Family = {
+  name: "y1-refusals",
+  issue: "https://github.com/aldevtools/BusinessCentral.AL.Runner/issues/7924",
+  target: "OnPrem",
+  known: [],
+  support: `codeunit 51000 "Y1 Helper"
+{
+    procedure GetLog(VariantRecord: Variant)
+    var
+        RecRef: RecordRef;
+    begin
+        if VariantRecord.IsRecord then
+            exit;
+        RecRef.GetTable(VariantRecord);
+    end;
+}
+
+dotnet
+{
+    assembly(mscorlib)
+    {
+        type(System.IO.StringWriter; Y1StringWriter) { }
+    }
+    assembly(Newtonsoft.Json)
+    {
+        type(Newtonsoft.Json.JsonTextWriter; Y1JsonTextWriter) { }
+    }
+}
+`,
+  handles: {},
+  cells: [
+    t9("RecordRef", "GetTable", "Integer 12345", "RR.GetTable(V);", {
+      vars: ["RR: RecordRef;", "V: Variant;"],
+      setup: ["V := 12345;"],
+    }),
+    t9("RecordRef", "GetTableGuarded", "Integer 12345", "Helper.GetLog(V);", {
+      vars: ['Helper: Codeunit "Y1 Helper";', "V: Variant;"],
+      setup: ["V := 12345;"],
+    }),
+    t9("JsonTextWriter", "WriteStartObject", "state Object", "JW.WriteStartObject();", {
+      vars: ["SW: DotNet Y1StringWriter;", "JW: DotNet Y1JsonTextWriter;"],
+      setup: [
+        "SW := SW.StringWriter();",
+        "JW := JW.JsonTextWriter(SW);",
+        "JW.WriteStartObject();",
+        "JW.WritePropertyName('message');",
+        "JW.WriteStartObject();",
+        "JW.WritePropertyName('body');",
+        "JW.WriteStartObject();",
+        "JW.WritePropertyName('toRecipients');",
+        "JW.WriteStartArray();",
+        "JW.WriteStartObject();",
+        "JW.WritePropertyName('emailAddress');",
+        "JW.WriteStartObject();",
+        "JW.WritePropertyName('address');",
+        "JW.WriteValue('a');",
+      ],
+    }),
   ],
 };
 
@@ -4701,6 +5071,645 @@ export const JSON_TEXT: Family = {
   testPermissions: "Disabled",
 };
 
+/**
+ * PR-191: the XML refusal texts DO's y2 window closed on, each driven by an invented cell (no corpus source text). A
+ * non-SingleInstance wrapper codeunit (51000) holds a global XmlNode; the cells call it through 2 to 4 procedures. The deep
+ * cells (depth 6, two codeunits) bind a manual subscriber and set a SingleInstance codeunit first. Cell i is codeunit
+ * BASE_ID + 1 + i (51001 to 51021); the support codeunits are 51000 and 51022 to 51025 (`extraIds`).
+ * Amendment 1 MED-3: `WriteTo(OutStream)` on an unassigned XmlNode fails with an engine error (no refusal), so it has no cell.
+ */
+const Y2_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const y2 = (method: string, call: string, vars: string[] = [], setup: string[] = []): Cell =>
+  t9("XmlCell", method, "y2", call, {
+    vars: ['W: Codeunit "Y2 Xml Node";', ...vars],
+    setup,
+  });
+const y2Name = (method: string, name: string): Cell => y2(method, `W.CreateNamed(${name});`);
+const Y2_DEEP_VARS = [
+  'Chain: Codeunit "Y2 Chain";',
+  'Sub: Codeunit "Y2 Subscriber";',
+  'Single: Codeunit "Y2 Single";',
+];
+// the SingleInstance global and the binding, then a real blob row written through an OutStream, then a Commit (DO's deep tests)
+const Y2_DEEP_SETUP = [
+  "Single.SetValue('x');",
+  "BindSubscription(Sub);",
+  "W.WriteBlob();",
+  "Commit();",
+];
+export const Y2_XML: Family = {
+  name: "y2-xml",
+  issue: "https://github.com/aldevtools/BusinessCentral.AL.Runner/issues/7924",
+  known: [],
+  extraIds: 4,
+  support: `codeunit 51000 "Y2 Xml Node"
+{
+    var
+        Node: XmlNode;
+
+    procedure Init()
+    var
+        Root: XmlElement;
+    begin
+        Root := XmlElement.Create('root');
+        Root.Add(XmlElement.Create('child'));
+        Node := Root.AsXmlNode();
+    end;
+
+    procedure SetNode(var N: XmlNode)
+    begin
+        Node := N;
+    end;
+
+    procedure UnassignedAfterChildren()
+    begin
+        UnassignedAfterChildrenInner();
+    end;
+
+    local procedure UnassignedAfterChildrenInner()
+    var
+        Root: XmlElement;
+        Children: XmlNodeList;
+        Unset: XmlNode;
+        B: Boolean;
+    begin
+        Root := Node.AsXmlElement();
+        Children := Root.GetChildNodes();
+        B := Unset.IsXmlText();
+    end;
+
+    procedure CopyUnassignedInto(Target: Codeunit "Y2 Xml Node")
+    var
+        Unset: XmlNode;
+    begin
+        Target.SetNode(Unset);
+        Target.UseNode();
+    end;
+
+    procedure UseNode()
+    var
+        B: Boolean;
+    begin
+        B := Node.IsXmlText();
+    end;
+
+    // M36794/5's shape: the target is passed by var and the setter is never called, so its global stays unset
+    procedure SkipSetter(var Target: Codeunit "Y2 Xml Node")
+    begin
+        // nothing touches Target or any XML value: the first refusing statement is the caller's Target.UseNode()
+    end;
+
+    procedure SetOnlyInto(Target: Codeunit "Y2 Xml Node")
+    var
+        Unset: XmlNode;
+    begin
+        Target.SetNode(Unset);
+    end;
+
+    procedure Deep6Noop()
+    begin
+    end;
+
+    // the deep setup's state, read inside the same test (the DeepSetupOnly control)
+    procedure AssertDeepState(Single: Codeunit "Y2 Single")
+    var
+        Row: Record "Y2 Blob Row";
+        Hits: Integer;
+    begin
+        Hits := Single.TakeHits();
+        if Hits <> 1 then
+            Error('subscriber ran %1 times, expected 1', Hits);
+        if Single.GetValue() <> 'x' then
+            Error('Y2 Single value is [%1], expected [x]', Single.GetValue());
+        if not Row.Get('B1') then
+            Error('blob row B1 is missing');
+        Row.CalcFields(Blob);
+        if not Row.Blob.HasValue() then
+            Error('blob row B1 has an empty blob');
+    end;
+
+    procedure MultiContentWithUnassigned()
+    begin
+        MultiContentInner();
+    end;
+
+    local procedure MultiContentInner()
+    var
+        Root: XmlElement;
+        Unset: XmlNode;
+    begin
+        Root := XmlElement.Create('root');
+        Root.Add(XmlText.Create('first'), Unset);
+    end;
+
+    procedure WriteBlob()
+    var
+        Row: Record "Y2 Blob Row";
+        OutS: OutStream;
+    begin
+        Row.Init();
+        Row."Code" := 'B1';
+        Row.Blob.CreateOutStream(OutS);
+        OutS.WriteText('payload');
+        Row.Insert();
+    end;
+
+    procedure SetAttributeOnUnassigned()
+    begin
+        SetAttributeInner();
+    end;
+
+    local procedure SetAttributeInner()
+    var
+        E: XmlElement;
+    begin
+        E.SetAttribute('a', '', 'b');
+    end;
+
+    procedure HasAttributesOnUnassigned()
+    begin
+        HasAttributesInner();
+    end;
+
+    local procedure HasAttributesInner()
+    var
+        E: XmlElement;
+        B: Boolean;
+    begin
+        B := E.HasAttributes();
+    end;
+
+    procedure AddUnassignedToDocument()
+    begin
+        AddUnassignedInner();
+    end;
+
+    local procedure AddUnassignedInner()
+    var
+        Doc: XmlDocument;
+        Unset: XmlNode;
+    begin
+        Doc := XmlDocument.Create();
+        Doc.Add(Unset);
+    end;
+
+    procedure GetFromUnassignedCollection()
+    begin
+        GetFromCollectionInner();
+    end;
+
+    local procedure GetFromCollectionInner()
+    var
+        Coll: XmlAttributeCollection;
+        Attr: XmlAttribute;
+        B: Boolean;
+    begin
+        B := Coll.Get('a', Attr);
+    end;
+
+    procedure CreateNamed(Name: Text)
+    begin
+        CreateNamedInner(Name);
+    end;
+
+    local procedure CreateNamedInner(Name: Text)
+    var
+        E: XmlElement;
+    begin
+        E := XmlElement.Create(Name);
+    end;
+
+    procedure AlphabetName(Len: Integer): Text
+    var
+        Alphabet: Text;
+        R: Text;
+        i: Integer;
+    begin
+        Alphabet := '${Y2_ALPHABET}';
+        for i := 0 to Len - 1 do
+            R += CopyStr(Alphabet, (i mod StrLen(Alphabet)) + 1, 1);
+        exit(R);
+    end;
+
+    procedure Deep6AddUnassigned()
+    begin
+        AddUnassignedInner();
+    end;
+
+    procedure Deep6CreateNamed(Name: Text)
+    begin
+        CreateNamedInner(Name);
+    end;
+}
+
+codeunit 51022 "Y2 Chain"
+{
+    procedure RaiseProbe()
+    begin
+        OnY2Step();
+    end;
+
+    procedure ContentDeep(W: Codeunit "Y2 Xml Node")
+    begin
+        ContentStep2(W);
+    end;
+
+    local procedure ContentStep2(W: Codeunit "Y2 Xml Node")
+    begin
+        OnY2Step();
+        ContentStep3(W);
+    end;
+
+    local procedure ContentStep3(W: Codeunit "Y2 Xml Node")
+    begin
+        ContentStep4(W);
+    end;
+
+    local procedure ContentStep4(W: Codeunit "Y2 Xml Node")
+    begin
+        W.Deep6AddUnassigned();
+    end;
+
+    procedure NoopDeep(W: Codeunit "Y2 Xml Node")
+    begin
+        NoopStep2(W);
+    end;
+
+    local procedure NoopStep2(W: Codeunit "Y2 Xml Node")
+    begin
+        OnY2Step();
+        NoopStep3(W);
+    end;
+
+    local procedure NoopStep3(W: Codeunit "Y2 Xml Node")
+    begin
+        NoopStep4(W);
+    end;
+
+    local procedure NoopStep4(W: Codeunit "Y2 Xml Node")
+    begin
+        W.Deep6Noop();
+    end;
+
+    procedure NameDeep(W: Codeunit "Y2 Xml Node"; Name: Text)
+    begin
+        NameStep2(W, Name);
+    end;
+
+    local procedure NameStep2(W: Codeunit "Y2 Xml Node"; Name: Text)
+    begin
+        OnY2Step();
+        NameStep3(W, Name);
+    end;
+
+    local procedure NameStep3(W: Codeunit "Y2 Xml Node"; Name: Text)
+    begin
+        NameStep4(W, Name);
+    end;
+
+    local procedure NameStep4(W: Codeunit "Y2 Xml Node"; Name: Text)
+    begin
+        W.Deep6CreateNamed(Name);
+    end;
+
+    [IntegrationEvent(false, false)]
+    local procedure OnY2Step()
+    begin
+    end;
+}
+
+codeunit 51023 "Y2 Subscriber"
+{
+    EventSubscriberInstance = Manual;
+
+    [EventSubscriber(ObjectType::Codeunit, Codeunit::"Y2 Chain", 'OnY2Step', '', false, false)]
+    local procedure HandleStep()
+    var
+        Single: Codeunit "Y2 Single";
+    begin
+        Single.AddHit();
+    end;
+}
+
+codeunit 51024 "Y2 Single"
+{
+    SingleInstance = true;
+
+    var
+        Value: Text;
+        Hits: Integer;
+        Left: Codeunit "Y2 Subscriber";
+
+    procedure SetValue(V: Text)
+    begin
+        Value := V;
+    end;
+
+    procedure GetValue(): Text
+    begin
+        exit(Value);
+    end;
+
+    procedure AddHit()
+    begin
+        Hits += 1;
+    end;
+
+    procedure TakeHits(): Integer
+    var
+        R: Integer;
+    begin
+        R := Hits;
+        Hits := 0;
+        exit(R);
+    end;
+
+    // a binding that outlives the test that made it (the sensitivity smoke)
+    procedure BindAndLeave()
+    begin
+        BindSubscription(Left);
+    end;
+}
+
+table 51000 "Y2 Blob Row"
+{
+    fields
+    {
+        field(1; "Code"; Code[20]) { }
+        field(2; Blob; Blob) { }
+    }
+    keys { key(PK; "Code") { Clustered = true; } }
+}
+
+// the census readers (Family.readers): each answer is folded into the observation the census compares
+codeunit 51025 "Y2 Probe"
+{
+    procedure EventRan(): Text
+    var
+        Chain: Codeunit "Y2 Chain";
+        Single: Codeunit "Y2 Single";
+        Dummy: Integer;
+    begin
+        Dummy := Single.TakeHits();
+        Chain.RaiseProbe();
+        exit(Format(Single.TakeHits()));
+    end;
+
+    procedure SingleValue(): Text
+    var
+        Single: Codeunit "Y2 Single";
+    begin
+        exit(Single.GetValue());
+    end;
+
+    procedure XmlText(): Text
+    var
+        Doc: XmlDocument;
+        Root: XmlElement;
+        Nodes: XmlNodeList;
+        T: Text;
+    begin
+        if not XmlDocument.ReadFrom('<r a="1"><c>x</c><c>y</c></r>', Doc) then
+            exit('readfail');
+        if not Doc.GetRoot(Root) then
+            exit('noroot');
+        Root.SetAttribute('b', '2');
+        if not Root.SelectNodes('c', Nodes) then
+            exit('noselect');
+        Doc.WriteTo(T);
+        exit(T + ' n=' + Format(Nodes.Count()));
+    end;
+}
+`,
+  readers: [
+    { name: "y2event", vars: ['Y2P1: Codeunit "Y2 Probe";'], expr: "Y2P1.EventRan()" },
+    { name: "y2single", vars: ['Y2P2: Codeunit "Y2 Probe";'], expr: "Y2P2.SingleValue()" },
+    { name: "y2xml", vars: ['Y2P3: Codeunit "Y2 Probe";'], expr: "Y2P3.XmlText()" },
+  ],
+  handles: {},
+  cells: [
+    y2("UnassignedNodeAfterChildren", "W.UnassignedAfterChildren();", [], ["W.Init();"]),
+    y2(
+      "UnassignedNodeByVar",
+      "W2.UseNode();",
+      ['W2: Codeunit "Y2 Xml Node";'],
+      ["W.Init();", "W.SkipSetter(W2);"],
+    ),
+    y2(
+      "UnassignedNodeByValue",
+      "W.CopyUnassignedInto(W2);",
+      ['W2: Codeunit "Y2 Xml Node";'],
+      ["W.Init();", "W2.Init();"],
+    ),
+    y2("UnassignedElementSetAttr", "W.SetAttributeOnUnassigned();"),
+    y2("UnassignedElementHasAttrs", "W.HasAttributesOnUnassigned();"),
+    y2("NodeAsContent", "W.AddUnassignedToDocument();"),
+    y2("AttrCollectionGet", "W.GetFromUnassignedCollection();"),
+    y2Name("Name1Plus", "'+'"),
+    y2Name("NameDigitStart", "'1abc'"),
+    y2Name("NameImageJpeg", "'image/jpeg'"),
+    y2Name("NamePdf", "'application/pdf'"),
+    y2Name("Name16Eq", "W.AlphabetName(15) + '='"),
+    y2Name("Name76", "W.AlphabetName(75) + '='"),
+    y2Name("Name1336", "W.AlphabetName(1336)"),
+    y2Name("Name2000", "W.AlphabetName(2000)"),
+    y2("NodeAsSecondContent", "W.MultiContentWithUnassigned();"),
+    y2("DeepNodeAsContent", "Chain.ContentDeep(W);", Y2_DEEP_VARS, Y2_DEEP_SETUP),
+    y2("DeepName76", "Chain.NameDeep(W, W.AlphabetName(75) + '=');", Y2_DEEP_VARS, Y2_DEEP_SETUP),
+    // controls (passing; the census ignores them): where each XmlNode cell refuses
+    y2("CtlByVarSetterOnly", "W.SkipSetter(W2);", ['W2: Codeunit "Y2 Xml Node";'], ["W.Init();"]),
+    y2(
+      "CtlByValueSetOnly",
+      "W.SetOnlyInto(W2);",
+      ['W2: Codeunit "Y2 Xml Node";'],
+      ["W.Init();", "W2.Init();"],
+    ),
+    y2("CtlDeepSetupOnly", "W.AssertDeepState(Single);", Y2_DEEP_VARS, [
+      ...Y2_DEEP_SETUP,
+      "Single.TakeHits();",
+      "Chain.NoopDeep(W);",
+    ]),
+  ],
+};
+
+/**
+ * PR-195: the collation refusal DO's y2 window closed on (`ordering of the character U+516C (no collation weight)`), driven by
+ * an invented cell (no corpus source text). `InRange` is written in the shape the mutant has: `Ch >= 'A'` turned into
+ * `Ch >= ''`, so a Char compare becomes a Text compare. Depth 3: test -> Derive -> Clean -> InRange. Cell i is codeunit
+ * BASE_ID + 1 + i (51001 to 51007); the support codeunits are 51000 and 51008 to 51009 (`extraIds`).
+ */
+const y2c = (method: string, code: string, setup: string[] = [], vars: string[] = []): Cell =>
+  t9("Collation", method, "y2c", "W.SetOverride(7); Result := W.Derive(T);", {
+    vars: ['W: Codeunit "Y2C Derive";', "Ch: Char;", "T: Text;", "Result: Text;", ...vars],
+    setup: [`Ch := ${code};`, "T := Format(Ch) + 'AB';", ...setup],
+  });
+const Y2C_ROW = ['Row: Record "Y2C Row";'];
+const Y2C_ROW_SETUP = ["Row.Init();", "Row.Code := 'R1';", "Row.Insert();"];
+const Y2C_SINGLE = ['Single: Codeunit "Y2C Single";'];
+const Y2C_SINGLE_SETUP = ["Single.SetValue('x');"];
+export const Y2_COLLATION: Family = {
+  name: "y2-collation",
+  issue: "https://github.com/aldevtools/BusinessCentral.AL.Runner/issues/8203",
+  known: [],
+  extraIds: 2,
+  testPermissions: "Disabled",
+  support: `codeunit 51000 "Y2C Derive"
+{
+    SingleInstance = true;
+
+    var
+        Override: Integer;
+
+    procedure SetOverride(N: Integer)
+    begin
+        Override := N;
+    end;
+
+    procedure GetOverride(): Integer
+    begin
+        exit(Override);
+    end;
+
+    procedure Derive(Name: Text): Text
+    begin
+        exit(Clean(Name));
+    end;
+
+    local procedure Clean(Value: Text): Text
+    var
+        Result: TextBuilder;
+        Ch: Char;
+        i: Integer;
+    begin
+        Value := UpperCase(Value);
+        for i := 1 to StrLen(Value) do begin
+            Ch := Value[i];
+            if InRange(Ch) then
+                Result.Append(Format(Ch))
+            else
+                Result.Append('-');
+        end;
+        exit(Result.ToText());
+    end;
+
+    local procedure InRange(Ch: Char): Boolean
+    begin
+        exit(((Ch >= '') and (Ch <= 'Z')) or ((Ch >= '0') and (Ch <= '9')));
+    end;
+}
+
+codeunit 51008 "Y2C Single"
+{
+    SingleInstance = true;
+
+    var
+        Value: Text;
+
+    procedure SetValue(V: Text)
+    begin
+        Value := V;
+    end;
+
+    procedure GetValue(): Text
+    begin
+        exit(Value);
+    end;
+}
+
+codeunit 51009 "Y2C Probe"
+{
+    procedure SingleValue(): Text
+    var
+        Single: Codeunit "Y2C Single";
+    begin
+        exit(Single.GetValue());
+    end;
+
+    // PR-195 build review MED-2: the rows the "after an insert" cells write, so a row that outlived a refusal shows.
+    procedure RowCount(): Text
+    var
+        Row: Record "Y2C Row";
+    begin
+        exit(Format(Row.Count()));
+    end;
+
+    procedure OverrideValue(): Text
+    var
+        D: Codeunit "Y2C Derive";
+    begin
+        exit(Format(D.GetOverride()));
+    end;
+
+    // text al-runner already orders: reported, so a change in it shows in the census
+    procedure OrderText(): Text
+    var
+        Row: Record "Y2C Order Row" temporary;
+        Acute: Text;
+        Tilde: Text;
+        R: Text;
+    begin
+        Acute := 'é';
+        Tilde := '~';
+        R := Format(Acute > 'Z') + Format(Acute < 'a') + Format(Acute > 'z') + Format(Acute < 'z');
+        R += '|' + Format(Tilde > 'a') + Format(Tilde < 'a') + Format(Tilde > 'Z') + Format(Tilde < 'Z');
+        Row.Code := 'Z';
+        Row.Insert();
+        Row.Code := 'É';
+        Row.Insert();
+        R += '|';
+        if Row.FindSet() then
+            repeat
+                R += Row.Code + ',';
+            until Row.Next() = 0;
+        exit(R);
+    end;
+}
+
+table 51000 "Y2C Row"
+{
+    fields
+    {
+        field(1; "Code"; Code[20]) { }
+    }
+    keys { key(PK; "Code") { Clustered = true; } }
+}
+
+table 51001 "Y2C Order Row"
+{
+    fields
+    {
+        field(1; "Code"; Code[20]) { }
+    }
+    keys { key(PK; "Code") { Clustered = true; } }
+}
+`,
+  readers: [
+    { name: "y2single", vars: ['Y2P1: Codeunit "Y2C Probe";'], expr: "Y2P1.SingleValue()" },
+    { name: "y2cover", vars: ['Y2P2: Codeunit "Y2C Probe";'], expr: "Y2P2.OverrideValue()" },
+    { name: "y2order", vars: ['Y2P3: Codeunit "Y2C Probe";'], expr: "Y2P3.OrderText()" },
+    { name: "y2rows", vars: ['Y2P4: Codeunit "Y2C Probe";'], expr: "Y2P4.RowCount()" },
+  ],
+  handles: {},
+  cells: [
+    y2c("CjkPlain", "20844"),
+    y2c("CyrillicPlain", "1050"),
+    y2c("CjkAfterInsert", "20844", Y2C_ROW_SETUP, Y2C_ROW),
+    y2c("CyrillicAfterInsert", "1050", Y2C_ROW_SETUP, Y2C_ROW),
+    y2c("CjkAfterSingle", "20844", Y2C_SINGLE_SETUP, Y2C_SINGLE),
+    y2c("CyrillicAfterSingle", "1050", Y2C_SINGLE_SETUP, Y2C_SINGLE),
+    // control (passing; the census ignores it): ASCII only, so no collation weight is needed. The expected text follows the
+    // AL above: UpperCase, then every character kept. The mutated shape compares as Text, and ' ' >= '' and ' ' <= 'Z' hold,
+    // so the space is kept too (measured on al-runner). It errors only on a mismatch.
+    t9(
+      "Collation",
+      "CtlAscii",
+      "y2c",
+      "Result := W.Derive('ABC 12'); if Result <> 'ABC 12' then Error('Derive gave [%1], expected [ABC 12]', Result);",
+      { vars: ['W: Codeunit "Y2C Derive";', "Result: Text;"] },
+    ),
+  ],
+};
+
 export const FAMILIES: Readonly<Record<string, Family>> = {
   [UNTOUCHED_HANDLE.name]: UNTOUCHED_HANDLE,
   [DOTNET_NO_OBJECT.name]: DOTNET_NO_OBJECT,
@@ -4731,6 +5740,16 @@ export const FAMILIES: Readonly<Record<string, Family>> = {
   [T10_REFUSALS.name]: T10_REFUSALS,
   // PR-105: appended (BC-check number 18): the refusal texts t12 and t13 still closed on, for a keep census
   [T12_REFUSALS.name]: T12_REFUSALS,
+  // PR-133: appended (BC-check number 19): the two refusal texts DO's x2 window closed on, for a keep census
+  [X2_REFUSALS.name]: X2_REFUSALS,
+  // PR-139: appended (BC-check number 20): the NUL-run Evaluate widths DO's x3 window closed on, for a keep census
+  [X3_REFUSALS.name]: X3_REFUSALS,
+  // PR-159: appended (BC-check number 21): the two sibling texts DO's y1 window closed on, for a keep census
+  [Y1_REFUSALS.name]: Y1_REFUSALS,
+  // PR-191: appended (BC-check number 22): the XML refusal texts DO's y2 window closed on, for a keep census
+  [Y2_XML.name]: Y2_XML,
+  // PR-195: appended (BC-check number 23): the collation refusal DO's y2 window closed on, for a keep census
+  [Y2_COLLATION.name]: Y2_COLLATION,
 };
 
 /** The first codeunit id; cell i is `BASE + 1 + i`. */
@@ -4850,7 +5869,7 @@ ${tests}${handlers.map((h) => `\n${h}`).join("")}}
         platform: "28.0.0.0",
         runtime: "17.0",
         ...(f.target !== undefined ? { target: f.target } : {}),
-        idRanges: [{ from: BASE_ID, to: BASE_ID + 1 + f.cells.length }],
+        idRanges: [{ from: BASE_ID, to: BASE_ID + 1 + f.cells.length + (f.extraIds ?? 0) }],
         features: ["NoImplicitWith"],
         ...(f.dependencies !== undefined ? { dependencies: f.dependencies } : {}),
       },

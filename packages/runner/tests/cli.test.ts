@@ -1493,6 +1493,7 @@ describe("performForceResetLease (5C-B2)", () => {
               protocolVersion: 2,
               serverGeneration: opts.serverGeneration,
               databaseId: "f".repeat(32),
+              workDate: "2026-11-19",
               tenantCountReachable: false,
               isolationModes: ["Codeunit"],
               testTypes: ["codeunit"],
@@ -1904,6 +1905,7 @@ describe("forceResetLeaseFromCli — the wiring (R51 follow-on)", () => {
               protocolVersion: 2,
               serverGeneration: liveGen,
               databaseId: "f".repeat(32),
+              workDate: "2026-11-19",
               tenantCountReachable: false,
               isolationModes: ["Codeunit"],
               testTypes: ["codeunit"],
@@ -1986,6 +1988,7 @@ describe("forceResetLeaseFromCli — the wiring (R51 follow-on)", () => {
               protocolVersion: 2,
               serverGeneration: "d".repeat(32),
               databaseId: "f".repeat(32),
+              workDate: "2026-11-19",
               tenantCountReachable: false,
               isolationModes: ["Codeunit"],
               testTypes: ["codeunit"],
@@ -2067,6 +2070,7 @@ describe("forceResetLeaseFromCli — the wiring (R51 follow-on)", () => {
               protocolVersion: 2,
               serverGeneration: "d".repeat(32),
               databaseId: "f".repeat(32),
+              workDate: "2026-11-19",
               tenantCountReachable: false,
               isolationModes: ["Codeunit"],
               testTypes: ["codeunit"],
@@ -3568,6 +3572,22 @@ const INVOCATIONS: ReadonlyArray<{ readonly sub: string; readonly argv: readonly
     argv: ["run", "--project", "P", "--tests", "T", "--backend", "bcdev", "--workers", "1"],
   },
   { sub: "run", argv: ["run", "--project", "P", "--dry-run"] },
+  // PR-171: --confirm-sample and --confirm-seed are read only beside --confirm-from.
+  {
+    sub: "run",
+    argv: [
+      "run",
+      "--project",
+      "P",
+      "--tests",
+      "T",
+      "--backend",
+      "bcdev",
+      "--confirm-from",
+      "v3.json",
+    ],
+  },
+  { sub: "confirm-merge", argv: ["confirm-merge", "v3.json", "bc.json", "--out", "c.json"] },
   { sub: "init", argv: ["init", "--project", "P"] },
   { sub: "clear-quarantine", argv: ["clear-quarantine", "--server", "S", "--instance", "I"] },
   { sub: "clear-quarantine", argv: ["clear-quarantine", "--config", "C"] },
@@ -3656,6 +3676,7 @@ const VALUE: Readonly<Record<string, string>> = {
   "table-id": "50102",
   format: "mutation-elements",
   "max-new-tests": "60",
+  "confirm-sample": "5",
   // R1086: two environment variable NAMES.
   "credentials-env": "BC_USER,BC_PASSWORD",
   // R654: valid on every platform, so the dry-run invocation (no --backend) reads it everywhere.
@@ -3846,7 +3867,8 @@ describe("C02-07: flags are read or refused, never ignored", () => {
     }
     // R917: --tests and --allow-large-run left the list (a dry run reads them).
     // PR-77: --fail-on-survivors joined it (a dry run prints no survivors).
-    expect(DRY_RUN_REFUSED.length).toBe(17);
+    // PR-171: --confirm-from, --confirm-sample and --confirm-seed joined it.
+    expect(DRY_RUN_REFUSED.length).toBe(20);
   });
 
   test("R377: --dry-run reads an optional --backend, validated as run validates it", () => {

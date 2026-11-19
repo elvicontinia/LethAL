@@ -59,6 +59,14 @@ const CLASSIFIED: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   "campaign-freeze.ts": { 'if (report.backend === "al-runner-v3") {': "v3" },
   // PR-77: only an al-runner-v3 report can put a survivor apart.
   "changed-line-survivors.ts": { 'const v3 = report.backend === "al-runner-v3";': "v3" },
+  // PR-171 (R1122): `--confirm-from` reads a v3 report only; `measuredBy` is the confirmation
+  // artifact's own field (`confirmation-field`), not a backend-identity read.
+  "confirm.ts": {
+    'if (r.backend !== "al-runner-v3") throw new ConfirmInputNotV3Error(r.backend);': "v3",
+    '(m) => m.finalVerdict === "survived" && m.measuredBy === "bcdev",': "confirmation-field",
+    'if (m.measuredBy === "bcdev" && isKill(m.finalVerdict) && m.v3Verdict !== m.finalVerdict) {':
+      "confirmation-field",
+  },
   "line-map.ts": {
     'case "bcdev":': "exhaustive-switch",
     'case "al-runner-v3":': "exhaustive-switch",
@@ -98,13 +106,19 @@ const CLASSIFIED: Readonly<Record<string, Readonly<Record<string, string>>>> = {
     'if (values["isolate-tests"] === true && backendArg !== "al-runner-v3") {': "v3",
     'instrumentedDir: join(scratchDir, "al-runner-v3"),': "path-name",
     'if (parsed.backendKind === "al-runner-v3") {': "v3",
+    // PR-212: the dry run's company-writes line is for BC backends only
+    'if (parsed.backendKind !== "al-runner-v3") {': "v3",
     // R1018: the al-runner binary is pinned once per run, on v3 only
     'if (parsed.backendKind !== "al-runner-v3" || typeof section !== "object" || section === null)':
       "v3",
+    // PR-144: the withheld-kill recheck exists on v3 only
+    'if (a.parsed.backendKind !== "al-runner-v3") return undefined;': "v3",
     '} else if (paths.backendKind === "al-runner-v3") {': "v3",
     'if (backendKind === "al-runner-v3") {': "v3",
     'if (configured !== "al-runner") return { mode: configured, offFiles: [] };': "coverage-mode",
     'if (backendArg === "bcdev" && workers > 1) {': "bcdev",
+    // PR-132 (R1113): the whole-suite note is bcdev's, where one hanging baseline test quarantines the run
+    'return backendKind === "bcdev" ? [head, BASELINE_WHOLE_SUITE_NOTE] : [head];': "bcdev",
     'if (parsed.backendKind !== "bcdev" || configFile.envTool === undefined) {': "bcdev",
     'if (parsed.backendKind !== "bcdev") return {};': "bcdev",
     // PR-42: the bcdev section's stopHungSessions applies on bcdev only

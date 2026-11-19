@@ -100,6 +100,13 @@ one failed.
   or `too-old`. It does not check the dependencies of those dependencies, or the implicit
   `application` and `platform` ones. It is skipped, with a reason, without `--project` or on an
   `envTool` config.
+- `text-search-dependencies` (R1110) scans the dependency closure of the target (and of the test app,
+  with `--tests`) in `packageCachePath` for table fields with `OptimizeForTextSearch`. Installing such
+  an app needs SQL Server Full-Text Search, which doctor cannot read on the server. It fails when an
+  app that declares one is not installed on the server at the cached version or newer (an older
+  installed version fails too: the upgrade installs the fields). A pass says only that the install
+  succeeded, never that the server has Full-Text Search. It lists packages it could not read. It is
+  skipped, with a reason, without `--project` or on an `envTool` config.
 - `credentials-env` (R1086) appears when the config has `bcdev.credentialsEnv`. It shows the variable
   names and whether each is set, never a value.
 
@@ -150,6 +157,11 @@ suspect, not a proven cause. The 512 KB is not a measured limit: it is the size 
 and the warning refuses nothing. If a run is quarantined because a run's fate on the server is unknown, as when the tier stops, and
 its batch holds such a method, the quarantine reason names that method as one suspect. To shrink the method, leave out the
 operators the warning lists, with one `--exclude-operator` each, or narrow the run with `--only`.
+- **What each would save (R1118):** the warning gives, per file, the largest method with each listed operator left out, and with all
+  of them out together. Each figure is a real emit, so pick from it rather than trying one dry run per operator.
+- **`--lines` is not the lever here:** it narrows which mutants run, but a fold inside one procedure shrinks only guard by guard.
+- **Measured once:** a 23.9 MB method's publish was refused on BC 29 for Linux (System.OutOfMemoryException), and the tier stayed up
+  (R826).
 
 **Know which flags can move a verdict.** `--only`, `--exclude`, `--operator`, `--exclude-operator`, `--lines` and
 `--changed-since` select which
@@ -224,6 +236,12 @@ a daemon is reused, one whose resident memory passed the size, or that served th
 fresh daemon (close reason `recycle`, one warm-up each). Measured verdict-neutral with a recycle after every request. A
 daemon already over the size right after its warm-up is the project's working set: the size bound is then turned off for
 the session, said once as `al-runner-v3-daemon-recycle-off`.
+`"recheckWithheldKills"` (default `true` since PR-182; `false` opts out and saves about 10% of a run with many withheld
+rows) and `"recheckBudgetSeconds"` (default 3600) control and bound the recheck of withheld-kill rows after the main
+pass (PR-144; README, al-runner-v3 config list). Kills it recovers are not measured against BC and may be false where an
+earlier test that al-runner refused would have set state on BC. A row the recheck does not recover stays `error`:
+unmeasured, never a kill. Evidence (PR-170): 42 of 58 recovered kills confirmed on BC, 0 false, 16 unmeasurable (9
+TestPage-only killers, 7 killers red at BC's baseline).
 **Runs stored before this change.** A serve-entries session now records ` baseline-daemon` in its lending build
 (`runs.runner_build`), because its baseline comes from a daemon, not from one process per codeunit, and a verdict or
 baseline snapshot should be lent only to a session whose baseline came the same way. So a run stored by an earlier
@@ -239,7 +257,7 @@ A run prints one line, `[lethal] al-runner: <path> (<version>)`, naming the bina
 
 **Cost.** On `bcdev` a mutant's covering tests run in ONE call to the server (one per mutant, not
 one per test), stopping at the first failure, so a survivor with forty covering tests costs one
-round trip instead of forty. This needs LethAL Control 1.0.0.26 or newer on the server; an older
+round trip instead of forty. This needs LethAL Control 1.0.0.28 or newer on the server; an older
 one is refused before any test runs. The report's `groupedCalls` says how many such calls were
 made. Three flags touch it and you should not need them: `--max-methods-per-call <n>` caps one
 call, `--request-ceiling-ms <n>` bounds one call (keep it under the hosting gateway's idle
@@ -264,7 +282,7 @@ has the complete set.
 | `--tests` | `run`, `doctor`, `verify` |
 | `--config` | `run`, `clear-quarantine`, `clear-ceiling`, `force-reset-lease`, `doctor`, `verify` |
 | `--db` | `run`, `clear-ceiling`, `verify` |
-| `--out` | `run`, `init`, `export` |
+| `--out` | `run`, `init`, `export`, `confirm-merge` |
 | `--credentials-env` | `init` |
 | `--progress-out` | `run` |
 | `--json` | `doctor`, `campaign` |
@@ -414,7 +432,7 @@ code.
 Each surface below is versioned separately and has a published JSON Schema in [`../schemas/`](../schemas/):
 
 - the report: [../schemas/report-v3.schema.json](../schemas/report-v3.schema.json)
-- `lethal explain`: [../schemas/explain-v29.schema.json](../schemas/explain-v29.schema.json)
+- `lethal explain`: [../schemas/explain-v33.schema.json](../schemas/explain-v33.schema.json)
 - the event stream: [../schemas/stream-v1.schema.json](../schemas/stream-v1.schema.json)
 - `lethal doctor --json`: [../schemas/doctor-v1.schema.json](../schemas/doctor-v1.schema.json),
   as the `data` of [../schemas/cli-envelope-v1.schema.json](../schemas/cli-envelope-v1.schema.json)
@@ -462,7 +480,7 @@ some mutants at all, and they read `no-coverage` rather than `survived`.
 
 ### `lethal explain report.json`: what it MEANS (checked)
 
-`explainSchemaVersion: 29`. The top level carries `contract`, `score`, `survivors`, `notMeasured`,
+`explainSchemaVersion: 33`. The top level carries `contract`, `score`, `survivors`, `notMeasured`,
 `survivorSelection` and `markIdentityScheme`. Each `survivors` row carries `executionProven`,
 `reach` and `markKey`. The top level can also carry `markKeysStale`. Each `survivors` row can
 also carry `mark`. Explain writes it for a report that records its numbering facts.
@@ -541,10 +559,10 @@ Each `gaps` row can also carry `source`. Given `--project`, it holds `startLine`
 member in `members` order, each `{ mutantCode, startLine, startColumn, endLine, endColumn }`. Lines and
 columns start at 1; a column counts UTF-16 code units (a tab is one), and the end is exclusive, so a
 site can span lines. Explain first hashes `<dir>` the way the run hashed its source (every .al
-file the target build compiles plus app.json, raw bytes, with the config's preprocessor symbols)
+file the target build compiles plus app.json without its version field, with the config's preprocessor symbols)
 and compares that with the report's sourceSha256. Any difference refuses by name (a
 ProjectSourceRefusedError, reason source-mismatch) with nothing on stdout: a CRLF/LF checkout
-difference, an app.json version bump, a changed preprocessor symbol or an edit to a test project
+difference, a changed app.json id or dependency, a changed preprocessor symbol or an edit to a test project
 nested inside the target all count. A report from before R274 has no sourceSha256 and refuses with
 reason no-source-hash. The output then holds TARGET SOURCE: do not publish it for a third party's
 code.
@@ -615,7 +633,9 @@ readable file.
 **Every verdict line is PROVISIONAL until `session-finished` appears.** A `batch-invalidated` event
 can supersede a verdict already written to the file: a lease loss, or a deploy that turns out
 unsound, sends its batch round again. Acting on a `survived` line that a later event retracts means
-acting on a fact the run itself no longer stands behind.
+acting on a fact the run itself no longer stands behind. The same holds for `mutant-rechecked` (PR-144, on by default;
+`alRunnerV3.recheckWithheldKills`): it replaces the verdict of an earlier `mutant-scored` `error` row (a withheld kill)
+with `killed`, so a consumer that ignores it reads `error` where the report says `killed`.
 
 Unknown event types are ignored by design, so a future event type does not break a consumer.
 
@@ -624,6 +644,17 @@ Unknown event types are ignored by design, so a future event type does not break
 The loop that turns a survivor into a killed mutant: `lethal run`, `lethal explain`, write a test
 that should kill a survivor, `lethal verify`, and repeat until verify exits `0`. Then a fresh
 `lethal run` makes the record. LethAL never writes the test; you do.
+
+### Writing a test whose failure says what it found (guidance)
+
+When a test fails on BC, the failure message LethAL records (`killingTestFailure`, a baseline
+failure) keeps only the FIRST line of the test's `Error()` text, followed by the call stack.
+Anything after a line feed is lost. So a test that collects several findings, such as every field
+that did not survive an export and an import, should join them on one line (`; ` between items),
+not one per line. Otherwise the report says that the test failed but not what it found.
+- **Measured on a BC 29 server** (coord PR-67), with an app's real export/import round-trip tests: the list after the first
+  line feed was gone.
+- **Joined with `; `,** the whole list came back on al-runner v3. The joined form was not re-run on BC.
 
 ### From an explain row to a verify command (checked)
 
@@ -695,7 +726,7 @@ normal republish is not refused; for the target app, see [Restoring your app aft
 
 ### Reading a verify result (checked)
 
-`verifySchemaVersion: 8`. Schema: [../schemas/verify-v8.schema.json](../schemas/verify-v8.schema.json).
+`verifySchemaVersion: 9`. Schema: [../schemas/verify-v9.schema.json](../schemas/verify-v9.schema.json).
 
 | field | values |
 |---|---|

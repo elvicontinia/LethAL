@@ -119,10 +119,10 @@ export {
 const REPO = join(import.meta.dir, "..");
 export const SECRET_PATH = "/coord/secrets/bc-linux.env";
 export const EXPECTED_KEYS = ["BC_DEV_USER", "BC_DEV_PASSWORD"] as const;
-// R-990 (R969, R999): the 1.0.0.26 build (`databaseId`, `InherentPermissions = X` on LC Control
-// State), compiled clean with alc 18.1.43.
-export const CONTROL_APP = "/coord/handoff/R-990/control/LethAL_LethAL Control_1.0.0.26.app";
-export const CONTROL_SHA256 = "12dafd1212d87a83a4860769957bd947af799284c1b7358ba2658a5a08e8701d";
+// PR-196 (R1131): the 1.0.0.28 build (every answer that ran a method returns its start `workDate`),
+// compiled clean with alc 18.1.43 against the 28.4 packages (`/coord/handoff/PR-196/control/alc.log`).
+export const CONTROL_APP = "/coord/handoff/PR-196/control/LethAL_LethAL Control_1.0.0.28.app";
+export const CONTROL_SHA256 = "5198d446fd872a939722f42ecd72967c1c978508e61fa92021b27d6f0858dc7f";
 const TOKEN_DIR = "/coord/handoff/R-589";
 const STATE_ROOT = join(REPO, ".kraken-local", "bc-linux");
 const BC_DEV_MCP = "/home/dev/src/bc-dev-mcp";
@@ -454,6 +454,8 @@ export async function withLease<T>(
   deps: LeaseDeps,
   body: () => Promise<T>,
   heartbeatMs: number = HEARTBEAT_MS,
+  /** On a failed body keep the lease (print its token and the release command) instead of releasing. */
+  keepOnFailure = false,
 ): Promise<T> {
   const token = await deps.take(server);
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -480,11 +482,17 @@ export async function withLease<T>(
     result = { ok: false, error };
   }
   if (timer !== undefined) clearInterval(timer);
-  try {
-    await deps.release(server, token);
-  } catch (err) {
-    if (result.ok) throw err;
-    console.error(`  [FAIL] releasing ${server} failed too: ${errText(err)}`);
+  if (!result.ok && keepOnFailure) {
+    console.error(
+      `  lease KEPT: ${token}\n  release it when the server is known healthy: kraken coord release ${server} ${token}`,
+    );
+  } else {
+    try {
+      await deps.release(server, token);
+    } catch (err) {
+      if (result.ok) throw err;
+      console.error(`  [FAIL] releasing ${server} failed too: ${errText(err)}`);
+    }
   }
   if (!result.ok) throw result.error;
   return result.value;
@@ -983,7 +991,7 @@ export function readContinia(app: (typeof CONTINIA_APPS)[number]): Buffer {
  * `a < b`, part by part. Not `compareAppVersions`: that refuses a part above 65535 (LethAL's own
  * minted versions), and Continia's builds carry revisions like 336834.
  */
-function versionBelow(a: string, b: string): boolean {
+export function versionBelow(a: string, b: string): boolean {
   const pa = a.split(".").map(Number);
   const pb = b.split(".").map(Number);
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {

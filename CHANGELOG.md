@@ -13,6 +13,21 @@ each one, and [`ROADMAP.md`](ROADMAP.md) indexes them.
 
 ### Added
 
+- **A BC run leaves out test methods that write the Company table; `--keep-company-tests` runs them** (PR-212, R1113).
+  Found by parse, in the method or one test-app procedure it calls. They are named in `excludedTests` (reason
+  `company-write`), flagged `tests-narrowed`, and a warning `company-write-tests-left-out` lists each with its path and
+  `commits` (with the flag, `company-write-tests-kept`). A no-coverage mutant in an object they name (under coverage
+  `none`, a survived one) reads `error` / `left-out-test-reach`. Explain schema v33, verify schema v9. PR-197's HTTP
+  line no longer cites R1113. No fixture writes a company, so no BC gate leg sees either warning (R736).
+  **An unfinished store made before this change, on a project with company-writing tests, no longer resumes** (the
+  config digest changed): run again, or pass `--keep-company-tests`, which keeps the old test set.
+- **Eight capability facts for `al-runner-v3`, and a gate leg for the daemon baseline over several test codeunits** (PR-114a,
+  the first half of R1106). Leg C of `itest:alrunner-v3` goes from 28 to 36 facts: a new kind, `capability`, checks that
+  no state crosses test codeunits in one request, that an excluded OnRun carries nothing, and how the SingleInstance
+  lane behaves. A capability fact that does not read `matches` fails the update gate; it never stops a session. Leg
+  `DBM` runs the daemon baseline over `sandbox-optin`'s four codeunits against the one-shot baseline. **No behaviour
+  change:** nothing batches the baseline yet, and the session details now say `baseline batching: off (<reason>)`.
+  Sessions re-run their contract probe once, for the new facts.
 - **`--resume-run` keeps its verdicts across `force-reset-lease` on a database that survived** (R969). LethAL Control
   1.0.0.26 reports a database id that a lease reset does not change; a run records it, and a resume across a changed
   server generation carries verdicts only when the id is the same, with a `resume-across-lease-reset` warning. A lost
@@ -66,6 +81,18 @@ each one, and [`ROADMAP.md`](ROADMAP.md) indexes them.
 
 ### Changed
 
+- **`bcdev` starts every test on the WorkDate a BC client session gets at login** (R1127, coord PR-180). In a demo
+  company such as CRONUS, that is the last G/L entry's posting date (Base Application's `GetDefaultWorkDate`), as BC's
+  own test runner and `al-runner-v3` see it. Before, it was the OData session's Today, so a test that reads the default
+  WorkDate could give a different verdict on the two backends. A non-demo company is unchanged. Needs LethAL Control
+  1.0.0.27: the minimum is now 1.0.0.27 (`MIN_CONTROL_VERSION`).
+- **`bcdev` refuses a start WorkDate that moved during a run** (R1131, coord PR-196). The control app now returns the
+  start date each test ran under. A batch's baseline fixes one date; a later answer on another date, and the rest of that
+  batch, is `error` / `workdate-changed` (never a kill or a survivor), and the report names `baselineWorkDate` (the first
+  batch's). Two baseline calls inside one batch that disagree stop the session (`BaselineWorkDateUnstableError`). A
+  `--resume` baseline snapshot, batch 0's included, is reused only when the server's start date, read by `HarnessInfo` at
+  that batch's deploy, equals the date stored with the snapshot; otherwise the baseline runs again. A snapshot with no
+  date is never reused. Needs LethAL Control 1.0.0.28: the minimum is now 1.0.0.28. The explain schema is v32.
 - **tree-sitter-al 4.5.0 to 4.6.0** (R855, coord R-861). Valid AL that 4.5.0 could not read now parses: long `if` chains with `#if` inside, `end;` in both arms of a `#if/#else`, `#if` regions in routine headers and var sections, qualified and numeric `extends`, and split procedure preambles. A dotted base name is read by its last segment (a numeric one by object id), so refusals such as R487's still fire. A member with two `#if` var blocks, or a nested one, gets one latch with every arm's `var` blanked, proved with `alc`. No mutant identity moves: the five-set diff is identical on 575 projects.
 
 - **The README's operator counts are per tier** (R868). Opt-in operators now sit in Tier 1 as well as Tier 2, so each tier's

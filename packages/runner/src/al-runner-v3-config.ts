@@ -19,6 +19,8 @@
  *     "daemonMaxRequests": 0,                                 // R952 (R948); a serve daemon is replaced after this many requests. 0 (default) = off
  *     "license": "<optional .bclicense file>",             // R956; passed as --license on every al-runner call that runs tests; its sha256 is in the fingerprint and the report
  *     "dotnetSidecar": "<optional AlDotNetSidecar.dll>"      // R886; passed as --dotnet-sidecar. Absent: the pinned build's own sidecar, when its .gated names one; false: none (gates)
+ *     "recheckWithheldKills": true,                          // PR-144, ON by default (PR-182); false opts out and saves about 10% of a run with many withheld rows (nothing when there are none). After the main pass, re-run the withheld-kill rows under method isolation. A row the recheck does not recover stays `error`: unmeasured, never a kill. Evidence (PR-170): 42 of 58 recovered kills confirmed on BC, 0 false, 16 unmeasurable (9 TestPage-only killers, 7 killers red at BC's baseline). Warning: kills recovered this way are not measured against BC; they may be false where an earlier test that al-runner refused would have set state on BC.
+ *     "recheckBudgetSeconds": 3600                           // PR-144; the recheck's own time budget (the main pass's --time-budget does not cover it)
  *   }
  *
  * `serverMode` and `selectorMode` are refused by name (the static selector only, and no v2-style serve).
@@ -80,7 +82,32 @@ export interface AlRunnerV3ConfigSection {
   readonly extraArgs: readonly string[];
   /** Fork: run an al-runner build the gate manifest does not list (e.g. a self-built fork). */
   readonly allowUngated: boolean;
+  /** PR-144: re-run the withheld-kill rows alone after the main pass. Default `true` (PR-182); `false` opts out. See `RECHECK_WARNING`. */
+  readonly recheckWithheldKills: boolean;
+  /** PR-144: the recheck's own time budget, whole seconds. Default `V3_RECHECK_BUDGET_SECONDS_DEFAULT`. */
+  readonly recheckBudgetSeconds: number;
 }
+
+/**
+ * PR-144: the warning every description of `alRunnerV3.recheckWithheldKills` must carry, verbatim. The recheck
+ * recovers a withheld kill by running it under method isolation, which removes the state an earlier refused
+ * test left; it does not give BC's state back.
+ */
+export const RECHECK_WARNING =
+  "kills recovered this way are not measured against BC; they may be false where an earlier test that al-runner refused would have set state on BC.";
+
+/**
+ * PR-144: said beside `RECHECK_WARNING` wherever it is. The al-runner-v3 gate's leg RC (PR-162) runs it live, and
+ * PR-170 measured it against BC on a DO sample.
+ */
+export const RECHECK_UNEXERCISED =
+  "The recheck is exercised live by the al-runner-v3 gate's leg RC (PR-162) on a fixture built to withhold a kill, and measured against BC on a DO sample (PR-170: 42 of 58 recovered kills confirmed, 0 false).";
+
+/** PR-182 (owner ruling): THE default of `alRunnerV3.recheckWithheldKills`. The only place it is decided; `false` opts out. */
+export const V3_RECHECK_DEFAULT = true;
+
+/** PR-144: THE default of `alRunnerV3.recheckBudgetSeconds`. */
+export const V3_RECHECK_BUDGET_SECONDS_DEFAULT = 3600;
 
 /**
  * R956: the license file's identity as the report and the fingerprint carry it: its path and the
@@ -126,6 +153,8 @@ export const V3_ISOLATION_DEFAULT = "auto";
 const KEYS = [
   "extraArgs",
   "allowUngated",
+  "recheckWithheldKills",
+  "recheckBudgetSeconds",
   "memoryHeadroomGb",
   "daemonMaxRssGb",
   "daemonMaxRequests",
@@ -345,9 +374,26 @@ export function validateAlRunnerV3Config(
       `al-runner-v3-config-refused: "alRunnerV3.allowUngated" must be a boolean, got ${JSON.stringify(r.allowUngated)}.`,
     );
   }
+  if (r.recheckWithheldKills !== undefined && typeof r.recheckWithheldKills !== "boolean") {
+    throw new Error(
+      `al-runner-v3-config-refused: "alRunnerV3.recheckWithheldKills" must be a boolean, got ${JSON.stringify(r.recheckWithheldKills)} (PR-144). Note: ${RECHECK_WARNING}`,
+    );
+  }
+  if (
+    r.recheckBudgetSeconds !== undefined &&
+    (typeof r.recheckBudgetSeconds !== "number" ||
+      !Number.isInteger(r.recheckBudgetSeconds) ||
+      r.recheckBudgetSeconds < 1)
+  ) {
+    throw new Error(
+      `al-runner-v3-config-refused: "alRunnerV3.recheckBudgetSeconds" must be a positive whole number of seconds, got ${JSON.stringify(r.recheckBudgetSeconds)} (PR-144).`,
+    );
+  }
   return {
     extraArgs: (r.extraArgs as string[] | undefined) ?? [],
     allowUngated: (r.allowUngated as boolean | undefined) ?? false,
+    recheckWithheldKills: r.recheckWithheldKills ?? V3_RECHECK_DEFAULT,
+    recheckBudgetSeconds: r.recheckBudgetSeconds ?? V3_RECHECK_BUDGET_SECONDS_DEFAULT,
     memoryHeadroomGb: r.memoryHeadroomGb ?? MEMORY_HEADROOM_GB_DEFAULT,
     daemonMaxRssGb: r.daemonMaxRssGb ?? V3_DAEMON_MAX_RSS_GB_DEFAULT,
     daemonMaxRequests: r.daemonMaxRequests ?? 0,

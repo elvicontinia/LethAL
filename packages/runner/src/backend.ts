@@ -248,6 +248,19 @@ export interface TestVerdict {
   readonly testRunsBefore?: number;
   readonly sessionId?: number;
   /**
+   * R1131 (control app 1.0.0.28), bcdev answers that RAN a method (not hub mode): the start WorkDate the
+   * method ran under, an ISO date text (`2026-11-19`). The backend compares it with the batch's baseline
+   * date. Absent on al-runner, on hub mode and on every answer where no test ran.
+   */
+  readonly workDate?: string;
+  /**
+   * R1131: set (with outcome `error`) by the bcdev backend on an answer whose `workDate` differs from the
+   * batch's baseline date, or that follows such an answer in the same batch. The orchestrator lifts it
+   * into the step's cause, as it does `stopRefusal`; the row is `error` / `workdate-changed`, never a
+   * kill, a survivor or `unstable`.
+   */
+  readonly workDateRefusal?: "workdate-changed";
+  /**
    * R-204b (R202): what became of the stop LethAL sent for THIS call, settled before the call
    * returned. Absent: no stop was sent. On a grouped call, `refused` only if EVERY stop attempt in
    * it was refused. The orchestrator retries a lost answer only when this is absent or `refused`:
@@ -425,7 +438,8 @@ export type RunManyCause =
   | "group-run-error"
   | "group-answer-malformed"
   | "stopped-after-completion"
-  | "stop-outcome-unconfirmed";
+  | "stop-outcome-unconfirmed"
+  | "workdate-changed";
 
 export type RunManyResult =
   | {
@@ -556,7 +570,8 @@ export type V3Timings = {
  * the request. `cause` is set on warm-ups only.
  */
 export type V3RequestTimed = {
-  readonly kind: "warmup" | "prefetch" | "live";
+  /** PR-113: `baseline` is a baseline `plain()` request (the daemon baseline fill), never a coverage or echo window. */
+  readonly kind: "warmup" | "prefetch" | "live" | "baseline";
   readonly lane: number;
   readonly wallMs: number;
   readonly entries: number;
@@ -568,10 +583,26 @@ export type V3RequestTimed = {
   readonly timings?: V3Timings;
 };
 
+/**
+ * PR-113: one baseline one-shot process (a fresh `--codeunit` run during the daemon baseline), timed. `reason`:
+ * `cross-check` (an R948/R951 sample), `too-slow` (R790's re-run) or `other`. Also the body of the
+ * `baseline-one-shot-timed` event.
+ */
+export type V3BaselineOneShotTimed = {
+  readonly codeunit: number;
+  readonly wallMs: number;
+  readonly reason: "cross-check" | "too-slow" | "other";
+};
+
 export interface ExecutionBackend {
   capabilities(): BackendCapabilities;
   /** Releases what the backend holds open (bcdev's MCP child, v3's serve daemon). R775: the CLI calls it. */
   close?(): Promise<void>;
+  /**
+   * PR-144: closes the backend's serve daemons now, before the withheld-kill recheck starts its own, and
+   * nothing else: `close()` stays the one place that prints the stats line. Absent: nothing to close.
+   */
+  closeDaemons?(): Promise<void>;
   /**
    * R516 I1: true when the run's own in-run stop is the budget it was sent (bcdev; al-runner
    * one-shot, static or resource selector), so a larger budget really lets the test run longer.
@@ -640,6 +671,11 @@ export interface ExecutionBackend {
    * fingerprint; such a run neither lends nor borrows history or a baseline snapshot.
    */
   readonly isolationAuto?: boolean;
+  /**
+   * PR-144: the session runs the serve-entries transport (a daemon answers every request). Read after
+   * `decideTransport`. Absent counts as false (one-shot, or a backend with no such choice).
+   */
+  readonly serveEntries?: boolean;
   /**
    * R517, OPTIONAL: the in-run stop LethAL configured for the whole session, timed on the test's
    * own body, enforced whatever budget a run is sent. al-runner `--server` answers it once
@@ -721,6 +757,8 @@ export interface ExecutionBackend {
    * (events stream only, not the report).
    */
   setRequestTimedSink?(sink?: (timed: V3RequestTimed) => void): void;
+  /** PR-113, OPTIONAL: where the backend reports each baseline one-shot call (al-runner-v3 only); a `baseline-one-shot-timed` event. */
+  setBaselineOneShotSink?(sink?: (timed: V3BaselineOneShotTimed) => void): void;
   activate(mutantId: string | null): Promise<void>;
   run(ref: TestMethodRef, opts: RunOpts): Promise<TestVerdict>;
   /**
@@ -945,6 +983,20 @@ export interface ExecutionBackend {
   baselinePhase?(on: boolean): void | Promise<void>;
 
   /**
+   * R1131, OPTIONAL (bcdev outside hub mode): the start WorkDate the current batch's baseline ran under (its
+   * baseline calls, or a reused snapshot's verdicts), or `undefined` when none is known. Read when the batch's
+   * baseline ends; it travels on `baseline-batch-finished` as `workDate`.
+   */
+  batchWorkDate?(): string | undefined;
+
+  /**
+   * R1131, OPTIONAL (bcdev outside hub mode): why a stored snapshot whose baseline ran on `snapshotWorkDate`
+   * (`undefined`: a snapshot from before control 1.0.0.28) is NOT reused, or `undefined` when it is. Reuse needs
+   * an equal date: a snapshot measured on another day's start date is not this session's baseline.
+   */
+  refuseReusedBaselineDate?(snapshotWorkDate: string | undefined): string | undefined;
+
+  /**
    * R948, OPTIONAL (al-runner v3): the session's stop state, given once with the budget floor. The
    * backend asks `spent()` before each request of a baseline it runs ahead of the orchestrator's
    * own loop (R955: no new call once the budget is out or a stop signal came), `signalled()` after
@@ -1042,4 +1094,12 @@ export interface ExecutionBackend {
    * before.
    */
   sendKillPair?(mutantId: string, ref: TestMethodRef): Promise<void>;
+
+  /**
+   * PR-81 (R1066), OPTIONAL: drop the kill pair `sendKillPair` left pending for this mutant. The
+   * covering loop calls it before it re-activates a mutant after a cold confirm that did not pass
+   * (a held error), so the next `activate(mutantId)` is not read as the pair's reproduction. A
+   * no-op when no pair is pending for that mutant. bcdev has no pair and does not implement it.
+   */
+  dropPendingPair?(mutantId: string): void;
 }

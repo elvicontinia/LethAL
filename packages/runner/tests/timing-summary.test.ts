@@ -5,11 +5,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunEvent } from "../src/events";
-import { foldTiming, foldTimingFile } from "../src/timing-summary";
+import { createTimingFold, foldTiming, foldTimingFile } from "../src/timing-summary";
 
 const ev = (e: Record<string, unknown>): RunEvent => e as unknown as RunEvent;
 const phase = (p: string, elapsedMs: number) => ev({ type: "phase-left", phase: p, elapsedMs });
 const timed = (e: Record<string, unknown>) => ev({ type: "serve-request-timed", ...e });
+const oneShot = (e: Record<string, unknown>) => ev({ type: "baseline-one-shot-timed", ...e });
 const closed = (e: Record<string, unknown>) => ev({ type: "serve-daemon-closed", ...e });
 let nextMutant = 0;
 const scored = (verdict: string, mutantId = `M${nextMutant++}`, batchIndex = 0) =>
@@ -22,6 +23,26 @@ const FIXED: RunEvent[] = [
   phase("baseline", 300_600),
   phase("mutants", 1_830_000),
   phase("teardown", 0),
+  // PR-113: two baseline requests with al-runner timings, three baseline one-shot calls
+  timed({
+    kind: "baseline",
+    lane: 0,
+    wallMs: 3_000,
+    entries: 1,
+    tests: 4,
+    timings: { setupMs: 100, engineMs: 200 },
+  }),
+  timed({
+    kind: "baseline",
+    lane: 0,
+    wallMs: 4_000,
+    entries: 1,
+    tests: 2,
+    timings: { engineMs: 300 },
+  }),
+  oneShot({ codeunit: 1, wallMs: 5_000, reason: "cross-check" }),
+  oneShot({ codeunit: 2, wallMs: 6_000, reason: "cross-check" }),
+  oneShot({ codeunit: 3, wallMs: 20_000, reason: "too-slow" }),
   timed({ kind: "warmup", lane: 0, wallMs: 2_500, entries: 1, tests: 1, cause: "first" }),
   timed({ kind: "warmup", lane: 0, wallMs: 2_600, entries: 1, tests: 1, cause: "first" }),
   timed({ kind: "warmup", lane: 0, wallMs: 10_200, entries: 1, tests: 1, cause: "after-refusal" }),
@@ -73,14 +94,42 @@ describe("PR-100: foldTiming", () => {
       [
         "TIMING",
         "  phases: generate 9.9 s, deploy 26.4 s, baseline 300.6 s, mutants 1,830.0 s, teardown 0.0 s",
-        "  serve requests: warm-up 4 (22.1 s), prefetch 2 (1,231.5 s), live 2 (574.0 s); selected-only 2",
+        "  serve requests: baseline 2 (7.0 s), warm-up 4 (22.1 s), prefetch 2 (1,231.5 s), live 2 (574.0 s); selected-only 2",
         "    warm-ups by cause: first 2 (5.1 s), after-refusal 1 (10.2 s), recycle 1 (6.8 s)",
-        "    al-runner inside them: setup 1.2 s, compile 12.0 s, engine 3.1 s, baseline 1.9 s, tests 1,600.0 s, coverage 0.0 s, other 7.3 s",
+        "    al-runner inside baseline requests: setup 0.1 s, engine 0.5 s",
+        "    al-runner inside prefetch requests: setup 1.0 s, tests 900.0 s, coverage 0.0 s",
+        "    al-runner inside live requests: setup 0.2 s, compile 12.0 s, engine 3.1 s, baseline 1.9 s, tests 700.0 s, other 7.3 s",
+        "  baseline one-shots: 3 (31.0 s; cross-check 2, too-slow 1, other 0)",
         "  daemon restarts: 4 — refusal/WithEvents subscriber … in prefetch 2, recycle 1, timeout in live 1",
         "  timeouts: 1 mutant timeout-killed, 1 answer cut at a timeout row",
         "  per covered mutant: 457.50 s (4 scored with coverage over the mutants phase)",
       ].join("\n"),
     );
+  });
+
+  test("PR-113: no baseline one-shots, no line; baseline timings do not enter the live line", () => {
+    const text = foldTiming([
+      timed({
+        kind: "baseline",
+        lane: 0,
+        wallMs: 1_000,
+        entries: 1,
+        tests: 1,
+        timings: { engineMs: 900 },
+      }),
+      timed({
+        kind: "live",
+        lane: 0,
+        wallMs: 1_000,
+        entries: 1,
+        tests: 1,
+        timings: { engineMs: 100 },
+      }),
+      finished,
+    ]);
+    expect(text).not.toContain("baseline one-shots");
+    expect(text).toContain("al-runner inside baseline requests: engine 0.9 s");
+    expect(text).toContain("al-runner inside live requests: engine 0.1 s");
   });
 
   test("counts take the plural form from 2 up, and a baseline-phase restart reads 'in baseline'", () => {
@@ -272,5 +321,104 @@ describe("PR-100: foldTimingFile streams the events file", () => {
     } finally {
       cut.done();
     }
+  });
+});
+
+describe("R1119 (PR-150): per-lane busy and idle time over the mutants phase", () => {
+  const at = (atMs: number, e: Record<string, unknown>) => ev({ ...e, atMs });
+  const req = (lane: number, endMs: number, wallMs: number) =>
+    at(endMs, { type: "serve-request-timed", kind: "live", lane, wallMs, entries: 1, tests: 1 });
+  const bracket = (inner: RunEvent[], toMs: number) => [
+    at(0, { type: "phase-entered", phase: "mutants" }),
+    ...inner,
+    at(toMs, { type: "phase-left", phase: "mutants", elapsedMs: toMs }),
+    finished,
+  ];
+  const laneLine = (s: string | undefined) =>
+    (s ?? "").split("\n").find((l) => l.includes("lanes over the mutants phase")) ?? "";
+
+  test("a balanced run: every lane busy all phase, no wait, nothing after its last request", () => {
+    const evs: RunEvent[] = [];
+    for (let t = 1_000; t <= 100_000; t += 1_000) evs.push(req(0, t, 1_000), req(1, t, 1_000));
+    const line = laneLine(foldTiming(bracket(evs, 100_000)));
+    expect(line).toContain("lane 0 busy 100.0 s (100.0%), waiting at window boundaries 0 (0.0 s)");
+    expect(line).toContain(
+      "lane 1 busy 100.0 s (100.0%), waiting at window boundaries 0 (0.0 s), after its last request 0.0 s",
+    );
+  });
+
+  test("a held lane: idle after its last request, a boundary wait, and the hold counted", () => {
+    const evs: RunEvent[] = [
+      req(0, 10_000, 10_000),
+      req(1, 10_000, 10_000),
+      req(0, 40_000, 20_000), // lane 0 waits 10 s at a boundary, then works
+      req(0, 100_000, 60_000),
+      at(41_000, { type: "warning", code: "al-runner-v3-lane-memory-hold", message: "x" }),
+      at(42_000, { type: "serve-daemon-closed", reason: "lane-idle", lane: 1, phase: "idle" }),
+    ];
+    const out = foldTiming(bracket(evs, 100_000)) ?? "";
+    const line = laneLine(out);
+    expect(line).toContain("lane 0 busy 90.0 s (90.0%), waiting at window boundaries 1 (10.0 s)");
+    expect(line).toContain(
+      "lane 1 busy 10.0 s (10.0%), waiting at window boundaries 0 (0.0 s), after its last request 90.0 s (90.0%)",
+    );
+    expect(out).toContain("lane memory holds 1 (printed once per session), idle daemons closed 1");
+  });
+
+  test("two batches: each mutants phase counts, the time between them does not", () => {
+    const evs: RunEvent[] = [
+      at(0, { type: "phase-entered", phase: "mutants" }),
+      req(0, 10_000, 10_000),
+      req(1, 10_000, 10_000),
+      at(10_000, { type: "phase-left", phase: "mutants", elapsedMs: 10_000 }),
+      at(20_000, { type: "phase-entered", phase: "mutants" }),
+      req(0, 30_000, 10_000), // lane 1 has no request in batch 2
+      at(30_000, { type: "phase-left", phase: "mutants", elapsedMs: 10_000 }),
+      finished,
+    ];
+    const line = laneLine(foldTiming(evs));
+    expect(line).toContain("lanes over the mutants phase (20.0 s)");
+    expect(line).toContain("lane 0 busy 20.0 s (100.0%), waiting at window boundaries 0 (0.0 s)");
+    expect(line).toContain(
+      "lane 1 busy 10.0 s (50.0%), waiting at window boundaries 0 (0.0 s), after its last request 10.0 s (50.0%)",
+    );
+  });
+
+  test("lethal run's own fold (no atMs) reads the clock it is given", () => {
+    let now = 0;
+    const f = createTimingFold({ now: () => now });
+    f.add(ev({ type: "phase-entered", phase: "mutants" }));
+    for (const lane of [0, 1]) {
+      now = 5_000;
+      f.add(
+        ev({
+          type: "serve-request-timed",
+          kind: "live",
+          lane,
+          wallMs: 5_000,
+          entries: 1,
+          tests: 1,
+        }),
+      );
+    }
+    now = 10_000;
+    f.add(ev({ type: "phase-left", phase: "mutants", elapsedMs: 10_000 }));
+    expect(laneLine(f.render())).toContain("lane 1 busy 5.0 s (50.0%)");
+    // without a clock or atMs it says so, rather than printing zeros
+    const g = createTimingFold();
+    g.add(ev({ type: "phase-entered", phase: "mutants" }));
+    for (const lane of [0, 1])
+      g.add(
+        ev({
+          type: "serve-request-timed",
+          kind: "live",
+          lane,
+          wallMs: 5_000,
+          entries: 1,
+          tests: 1,
+        }),
+      );
+    g.add(ev({ type: "phase-left", phase: "mutants", elapsedMs: 10_000 }));
+    expect(g.render()).toContain("lanes: no per-lane times");
   });
 });

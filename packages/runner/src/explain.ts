@@ -280,8 +280,20 @@ import { refuseRetiredV2Report } from "./v2-retired";
  *
  * 29: PR-45 (R1049) added the caveat value `nondebuggable-no-coverage` to `$.caveats[].caveat`. A new value, so it
  * bumps (R233); v28 is frozen.
+ *
+ * 30: PR-116 (R1108) added the caveat value `withheld-kills` to `$.caveats[].caveat`. A new value, so it
+ * bumps (R233); v29 is frozen.
+ *
+ * 31: PR-144 added the caveat value `isolated-recheck-kills` to `$.caveats[].caveat`. A new value, so it
+ * bumps (R233); v30 is frozen.
+ *
+ * 32: PR-196 (R1131) added the cause value `workdate-changed` to `$.notMeasured[].cause` and the caveat value
+ * `workdate-changed` to `$.caveats[].caveat`. New values, so it bumps (R233); v31 is frozen.
+ *
+ * 33: PR-212 (R1113) added the cause value `left-out-test-reach` to `$.notMeasured[].cause`. A new value, so it
+ * bumps (R233); v32 is frozen.
  */
-export const EXPLAIN_SCHEMA_VERSION = 29;
+export const EXPLAIN_SCHEMA_VERSION = 33;
 
 /**
  * Thrown when the input is not an explainable `SessionReport` — a caller-contract violation, not a
@@ -1905,7 +1917,7 @@ function verifiedProjectText(
   if (actual !== report.sourceSha256) {
     throw new ProjectSourceRefusedError(
       "source-mismatch",
-      `lethal explain --project: the project is not the source this report's positions refer to (sourceSha256 ${report.sourceSha256}, the project hashes to ${actual}). Every .al file the target build compiles and app.json are hashed as raw bytes, with the config's preprocessor symbols: a CRLF/LF checkout difference, an app.json version bump, a changed symbol, or an edit to a test project nested inside the target all count. Check out the commit the run measured.`,
+      `lethal explain --project: the project is not the source this report's positions refer to (sourceSha256 ${report.sourceSha256}, the project hashes to ${actual}). Every .al file the target build compiles and app.json (without its version) are hashed, with the config's preprocessor symbols: a CRLF/LF checkout difference, a changed app.json id or dependency, a changed symbol, or an edit to a test project nested inside the target all count. Check out the commit the run measured.`,
     );
   }
   return new Map([...files].map(([rel, bytes]) => [rel, decodeSource(bytes)]));

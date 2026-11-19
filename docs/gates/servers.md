@@ -255,6 +255,14 @@ is republished. `lethal run` refuses at that point with `UpgradeNotRestoredError
    the old target build, after a strip with dependents ("a newer version ... was already installed"), and the same dependent build
    ("A duplicate package ID is detected") unless it was unpublished first.
 
+### BC for Linux cannot render RDLC reports (R908, R1121)
+Every server here runs BC for Linux. Its startup hook stubs out the Windows Reporting Service, so any test that renders an RDLC
+report fails with "RDLC report rendering is not implemented on Linux BC".
+- **At baseline**, such a test is red and is left out (R908).
+- **Under a mutant**, a test that newly reaches a render fails on the stub, not on an assertion. LethAL keeps the kill and lists it
+  under `platformArtifactKills`, mechanism `linux-rdlc-stub` (R1121), so a reader can discount it.
+- **To score these mutants honestly**, use BC for Windows, or tests that do not render the report.
+
 ## How a gate reads a server
 
 - `LETHAL_ITEST_CONFIG=lethal.config.<x>.json` selects the config file in one of the four fixture
@@ -297,7 +305,32 @@ pair is one ordinary run of the gate there; add the pair to this table when it p
 
 ### server1 (192.168.2.157), the default host since 2026-11-05
 
-**The current proof is R-990's, on 2026-11-14, under LethAL Control 1.0.0.26 (the table right below).** Head c13e4d0d (branch
+**The current proof for `bc1`-`bc3` is coord PR-198's, on 2026-11-19, under the control build of coord PR-196 (R1131)** (the
+first table below). Driver: `/coord/handoff/PR-198/prove.sh`, one server at a time per worktree, each under its own coord lease.
+- **Setup:** `bc-linux-setup.ts --held-lease` upgraded each server and read the build back by sha256: bc2 and bc3 from 1.0.0.27,
+  bc1 from 1.0.0.26. The tests fixtures' `.alpackages` were filled from each server first.
+- **Gates:** every gate's first line named its server, and each passed its own comparison with its baseline. `lethal doctor`
+  was clean, and each lease was released healthy.
+- **bc3 ran in three parts:**
+  1. `itest:hang`, `itest:bcdev` and `itest:lend` passed in PR-196's own live check, at its head 1d438f3d
+     (`/coord/handoff/PR-196-gate/`).
+  2. `bcdev-names` passed at master 3cc7997e.
+  3. `bcdev-wrapped` first failed at 3cc7997e on its pinned warning set: PR-196's new `workdate-not-compared` code, pinned by
+     PR-203. With the pin in place, it and the other nine passed at c73eb7ac.
+
+  The merges between these heads changed no runner code beyond PR-203's pin (the owner's no-re-gate rule).
+- **bc1, before setup:** PR-176's three scratch app ids were read on it by id, and none was there
+  (`/coord/handoff/PR-198/bc1-pr176-read.txt`).
+
+| server | gate | LethAL Control | proof (log) |
+|---|---|---|---|
+| `bc1` | setup; `itest:bcdev`, `bcdev-names`, `bcdev-wrapped`, `tables`, `chunked`, `harden`, `lend`, `lease`, `verify`, `testapp`, `agreement`, `verify-scale`, `stale-publish` | 1.0.0.28 | `/coord/handoff/PR-198/bc1/<gate>.log`, `run.log`, `setup.log` beside them |
+| `bc2` | setup; the same 13, and `itest:hang` | 1.0.0.28 | `/coord/handoff/PR-198/bc2/<gate>.log`, `run.log`, `setup.log` beside them |
+| `bc3` | setup; the same 13, and `itest:hang` | 1.0.0.28 | `/coord/handoff/PR-198/bc3/<gate>.log` (`bcdev-names`, then `bcdev-wrapped` onward), `/coord/handoff/PR-196-gate/` (`hang`, `bcdev`, `lend`); `run.log` and `setup.log` beside them |
+
+**The proof before it, coord PR-189's (2026-11-19, 1.0.0.27, `bc2` and `bc3` only; `/coord/handoff/PR-189/`),** is history.
+
+**The previous proof, R-990's, on 2026-11-14, under LethAL Control 1.0.0.26 (the table right below)** is kept as history. Head c13e4d0d (branch
 lethal/r-990, whose client requires 1.0.0.26), one server at a time under one coord lease each (`bc-linux-setup.ts --held-lease`),
 released after a clean `lethal doctor`. Setup upgraded each server from 1.0.0.25. Every gate's first line named its server, and each
 passed its own comparison with its baseline; `verify-scale` is measurement mode. The tests fixtures' `.alpackages` were filled from
@@ -569,27 +602,83 @@ nothing about them changes.
   the table below is not proven on bc4: use bc4 only for read-only predicts and the work R833 names.
 - **The 408 form is not measured on bc4.** Every hang on bc4 answered the 400 (GitHub #49). `itest:hang` accepts
   the 400 form on bc4 and the 408 form on bc1-bc3 (`stopFormFor`, which also checks the config's port).
+- **bc4's SQL Server has Full-Text Search, and bc4 carries the Continia 30 stack** (coord PR-67, 2026-11-17).
+  - **The first attempt:** Continia Customer Onboarding 30.0.0.0 was refused with HTTP 422 ("Text optimized index ... the SQL
+    Server Full-Text Search component is not installed").
+  - **The owner's fix** (q-20261117T183405-4c6fee36): bc4-sql-1 was recreated on `bclan/mssql-fts:16.0.4305.5`
+    (`FULLTEXTSERVICEPROPERTY('IsFullTextInstalled')=1`), and bc4-bc-1 restarted, giving a fresh CRONUS.
+  - **The database is in memory:** a host restart loses it, and so do the apps. bc1-bc3 are unchanged and have no Full-Text
+    Search.
+  - **A BC-only restart is never safe on the bclan servers** (owner, q-20261117T220300-9c964f63, 2026-11-17):
+    - the bc-runner entrypoint deletes the test framework apps from SQL on every start, then republishes them;
+    - with SQL kept, that republish is blocked, because AI Test Toolkit still depends on Test Runner;
+    - so Test Runner stays uninstalled, and every BC API call fails with HTTP 400 ("metadata object Table 130450 was not found").
 
-### bc4 proof table (R-826b, 2026-11-07, LethAL Control 1.0.0.25)
+    Kraken now always restarts SQL, then BC. That wipes the in-memory database, so after ANY restart, re-run
+    `bc-linux-setup.ts --server <bcN>` and republish every app the server carried. On 2026-11-17 bc4 was recreated twice; the
+    second time, setup, Continia 30 ×7, DO and DO Test were republished under one held lane-code lease (PR-67).
+  - **Then, under the lane-code lease (attempt 045, released):**
+    - `bun scripts/bc-linux-setup.ts --server bc4` published the LethAL Control build that `extensions/lethal-control/app.json` names and every fixture app (doctor ok for all
+      four fixtures);
+    - PR-67's `scripts/bc-continia-publish.ts` published all 7 Continia 30 apps (System Application, Core, Connector App,
+      Customer Onboarding, Delivery Network, Delivery Network - Onboarding, Core Internal Activation App 30.0.0.35781). Each was
+      read back: equal sha256, installed, one row.
 
-The 13 non-hang gates passed at master 86d13b68, R-826b's final build, on 2026-11-07, one coord lease per gate, each released. Each log's first line names `bc4`. They also passed at d3ab3c20, before that build (`/coord/handoff/R-826b/bc4/<gate>.log`).
+    Evidence: `/coord/handoff/PR-67/bc4/setup.log`, `publish2.log`.
+  - **Re-proved on the fresh database with the Continia apps** (2026-11-18, the table below).
+  - **A user's dependency that needs Full-Text Search** is now a doctor check: R1110, coord PR-128.
+
+### bc4 proof table (2026-11-19, LethAL Control 1.0.0.28; the earlier proofs are kept below it)
+
+**Under 1.0.0.28 (coord PR-198):**
+- **The build:** master c73eb7ac, in its own worktree (bc4's BC 29 symbols must not overwrite a 28.4 worktree's), after
+  `bc-linux-setup.ts --held-lease` upgraded bc4 from 1.0.0.27 (read back by sha256).
+- **The gates:** the 13 gates and `itest:hang` (400 form) under one coord lease (`/coord/handoff/PR-198/prove.sh bc4`). Each
+  log's `[itest target]` line names `bc4`. Then `doctor` was ok, and the lease was released healthy.
 
 | server | gate | LethAL Control | proof (log) |
 |---|---|---|---|
-| `bc4` | `itest:bcdev` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/bcdev.log` |
-| `bc4` | `itest:bcdev-wrapped` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/bcdev-wrapped.log` |
-| `bc4` | `itest:bcdev-names` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/bcdev-names.log` |
-| `bc4` | `itest:tables` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/tables.log` |
-| `bc4` | `itest:verify` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/verify.log` |
-| `bc4` | `itest:verify-scale` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/verify-scale.log` |
-| `bc4` | `itest:stale-publish` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/stale-publish.log` |
-| `bc4` | `itest:testapp` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/testapp.log` |
-| `bc4` | `itest:lease` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/lease.log` |
-| `bc4` | `itest:chunked` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/chunked.log` |
-| `bc4` | `itest:harden` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/harden.log` |
-| `bc4` | `itest:agreement` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/agreement.log` |
-| `bc4` | `itest:lend` | 1.0.0.25 | `/coord/handoff/R-826b/final/bc4-13/lend.log` |
-| `bc4` | `itest:hang` (400 form) | 1.0.0.25 | at eae3eaff: `/coord/handoff/R-658/hang-bc4-20261106T210015Z-2373536/`; at 883963a6, before the R-826b review fixes: `/coord/handoff/R-658/hang-bc4-20261106T203052Z-2289735/` |
+| `bc4` | setup; the 13 gates and `itest:hang` (400 form) | 1.0.0.28 | `/coord/handoff/PR-198/bc4/<gate>.log`, `run.log`, `setup.log` beside them |
+
+**Under 1.0.0.27 (coord PR-180):**
+- **The build:** branch lethal/pr-180 at 8e62c9d6, after `bc-linux-setup.ts` upgraded bc4 from 1.0.0.26 (read back by sha256).
+- **The 13 non-hang gates:** run under one held coord lease by lethal-code (`/coord/handoff/PR-180/gates/run.sh`, `run.log`).
+  Each log's `[itest target]` line names `bc4`, and each passed its own comparison with its baseline.
+- **After the 13:** `doctor` was ok and the lease was released healthy. Then the hang gate ran under its own lease and passed.
+
+| server | gate | LethAL Control | proof (log) |
+|---|---|---|---|
+| `bc4` | setup; `itest:bcdev`, `bcdev-names`, `bcdev-wrapped`, `tables`, `chunked`, `harden`, `lend`, `lease`, `verify`, `testapp`, `agreement`, `verify-scale`, `stale-publish` | 1.0.0.27 | `/coord/handoff/PR-180/gates/<gate>.log`, `run.log`, `setup.log` beside them |
+| `bc4` | `itest:hang` (400 form) | 1.0.0.27 | `/coord/handoff/R-658/hang-bc4-20261118T225101Z-2029916/` (log `/coord/handoff/PR-180/gates/hang.log`) |
+
+**Under 1.0.0.26, the re-proof earlier that day:**
+- **The build:** master 2f8e2ee7, on the fresh database with the Continia 30 stack and DO installed.
+- **The 13 non-hang gates:** run under one held coord lease by lethal-code (`/coord/handoff/bc4-reproof/run.sh`, `rest.sh`,
+  `run.log`). Each log's `[itest target]` line names `bc4`.
+- **One driver slip:** `itest:verify-scale` first stopped at once because `LETHAL_VERIFY_SCALE_OUT` was unset. The lease was
+  kept, and the gate passed on its rerun.
+- **After the 13:** `doctor` was ok and the lease was released healthy. Then the hang gate ran under its own lease
+  (`scripts/r658-hang-gate.sh bc4`).
+
+The R-826b proof (2026-11-07, LethAL Control 1.0.0.25, master 86d13b68) predates the fresh database. Its logs stay under
+`/coord/handoff/R-826b/final/bc4-13/`.
+
+| server | gate | LethAL Control | proof (log) |
+|---|---|---|---|
+| `bc4` | `itest:bcdev` | 1.0.0.26 | `/coord/handoff/bc4-reproof/bcdev.log` |
+| `bc4` | `itest:bcdev-wrapped` | 1.0.0.26 | `/coord/handoff/bc4-reproof/bcdev-wrapped.log` |
+| `bc4` | `itest:bcdev-names` | 1.0.0.26 | `/coord/handoff/bc4-reproof/bcdev-names.log` |
+| `bc4` | `itest:tables` | 1.0.0.26 | `/coord/handoff/bc4-reproof/tables.log` |
+| `bc4` | `itest:verify` | 1.0.0.26 | `/coord/handoff/bc4-reproof/verify.log` |
+| `bc4` | `itest:verify-scale` | 1.0.0.26 | `/coord/handoff/bc4-reproof/verify-scale.log` |
+| `bc4` | `itest:stale-publish` | 1.0.0.26 | `/coord/handoff/bc4-reproof/stale-publish.log` |
+| `bc4` | `itest:testapp` | 1.0.0.26 | `/coord/handoff/bc4-reproof/testapp.log` |
+| `bc4` | `itest:lease` | 1.0.0.26 | `/coord/handoff/bc4-reproof/lease.log` |
+| `bc4` | `itest:chunked` | 1.0.0.26 | `/coord/handoff/bc4-reproof/chunked.log` |
+| `bc4` | `itest:harden` | 1.0.0.26 | `/coord/handoff/bc4-reproof/harden.log` |
+| `bc4` | `itest:agreement` | 1.0.0.26 | `/coord/handoff/bc4-reproof/agreement.log` |
+| `bc4` | `itest:lend` | 1.0.0.26 | `/coord/handoff/bc4-reproof/lend.log` |
+| `bc4` | `itest:hang` (400 form) | 1.0.0.26 | `/coord/handoff/R-658/hang-bc4-20261118T203110Z-3879484/` (log `/coord/handoff/bc4-reproof/hang.log`) |
 
 ## bc-demo: not a gate server (R663)
 
