@@ -71,8 +71,15 @@ export function collectWarnings(): WarningCollector {
  * R852: seen, printed, never a mismatch. One renew blip is a brief moment on the server, not a
  * property of the build, so a gate must not fail on it. The gate's log shows one line per leg that
  * had any, because the collector keeps the first message of each code.
+ * PR-264 (PR-252 amendment 3): `run-suspended` too. server1 suspends (the owner keeps it on), and
+ * deadlines are monotonic, so a sleep cannot move a verdict; its message carries the length.
+ * PR-294: `al-runner-v3-pinned-not-current` too: a private gate of a gated non-current build is on purpose.
  */
-export const LOGGED_ONLY: ReadonlySet<string> = new Set(["lease-renew-blip"]);
+export const LOGGED_ONLY: ReadonlySet<string> = new Set([
+  "lease-renew-blip",
+  "run-suspended",
+  "al-runner-v3-pinned-not-current",
+]);
 
 export function assertGateWarnings(
   gate: string,

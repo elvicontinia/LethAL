@@ -617,6 +617,130 @@ describe("runSession", () => {
     expect(backend.deploys.length).toBeGreaterThan(0);
   });
 
+  test("PR-247: one test-costs event, summing exactly the mutant rows the store wrote (not baseline rows)", async () => {
+    const dirs = await makeProject();
+    // The first mutant that becomes active is killed; every later one survives.
+    let killed: string | undefined;
+    const backend = new StubBackend(
+      CAPS_NST,
+      (mutant) => {
+        if (mutant === null) return "pass";
+        killed ??= mutant;
+        return mutant === killed ? "fail" : "pass";
+      },
+      ["IsOverBudget"],
+    );
+    const store = new ResultsStore(":memory:");
+    const events: RunEvent[] = [];
+    const report = await runSession({
+      backend,
+      store,
+      ...dirs,
+      selectorIds,
+      emit: [createEmitter([(e) => events.push(e)])],
+    });
+    expect(report.counts.killed).toBeGreaterThan(0);
+    expect(report.counts.survived).toBeGreaterThan(0);
+    const costEvents = events.filter((e) => e.type === "test-costs");
+    expect(costEvents.length).toBe(1);
+    const [ev] = costEvents;
+    if (ev === undefined || ev.type !== "test-costs") throw new Error("no test-costs event");
+    // The event sits after the mutant phase and before session-finished.
+    const types = events.map((e) => e.type);
+    expect(types.indexOf("test-costs")).toBeLessThan(types.indexOf("session-finished"));
+    expect(types.indexOf("test-costs")).toBeGreaterThan(types.lastIndexOf("mutant-scored"));
+    // The oracle: the store's own mutant rows, joined to the mutant's verdict.
+    const rows = store.db
+      .query(
+        `SELECT t.codeunit_name || '.' || t.method AS test, COUNT(*) AS runs,
+                SUM(COALESCE(t.own_duration_ms, t.duration_ms)) AS own,
+                SUM(CASE WHEN m.verdict = 'survived' THEN COALESCE(t.own_duration_ms, t.duration_ms) ELSE 0 END) AS surv
+           FROM test_results t JOIN mutants m ON m.id = t.mutant_row_id
+          WHERE t.mutant_code IS NOT NULL GROUP BY test ORDER BY test`,
+      )
+      .all() as Array<{ test: string; runs: number; own: number; surv: number }>;
+    // The unmutated confirmation rows (a kill's NONE confirm) sit on a mutant's row but carry no mutant
+    // code: they exist here, and must NOT be counted.
+    const confirm = store.db
+      .query(
+        "SELECT COUNT(*) AS n FROM test_results WHERE mutant_row_id IS NOT NULL AND mutant_code IS NULL",
+      )
+      .get() as { n: number };
+    expect(confirm.n).toBeGreaterThan(0);
+    // Baseline rows exist too, and must NOT be in the event.
+    const baseline = store.db
+      .query("SELECT COUNT(*) AS n FROM test_results WHERE mutant_row_id IS NULL")
+      .get() as { n: number };
+    expect(baseline.n).toBeGreaterThan(0);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(ev.tests).toEqual(
+      rows.map((r) => ({
+        test: r.test,
+        batchIndex: 0,
+        runs: r.runs,
+        ownMs: r.own,
+        msUnderSurvivors: r.surv,
+      })),
+    );
+    expect(ev.tests.some((t) => t.msUnderSurvivors > 0)).toBe(true);
+    expect(ev.tests.some((t) => t.msUnderSurvivors < t.ownMs)).toBe(true);
+    // And the folded report carries the section.
+    expect(report.costlyTests?.totalOwnMs).toBe(rows.reduce((s, r) => s + r.own, 0));
+    store.close();
+  });
+
+  test("PR-247: rows of one call with no own time charge the call's wall once, not once per row", async () => {
+    const dirs = await makeProject(TWO_TEST_AL);
+    // Every row costs 100 ms of wall and has no own time. A mutant's two tests share ONE call id.
+    class OneCallBackend extends StubBackend {
+      override async run(ref: TestMethodRef, opts: RunOpts): Promise<TestVerdict> {
+        const v = await super.run(ref, opts);
+        return { ...v, durationMs: 100, callId: `call-${this.activations.length}` };
+      }
+    }
+    const backend = new OneCallBackend(CAPS_NST, () => "pass", ["IsOverBudget"]);
+    const store = new ResultsStore(":memory:");
+    const events: RunEvent[] = [];
+    await runSession({
+      backend,
+      store,
+      ...dirs,
+      selectorIds,
+      emit: [createEmitter([(e) => events.push(e)])],
+    });
+    const ev = events.find((e) => e.type === "test-costs");
+    if (ev === undefined || ev.type !== "test-costs") throw new Error("no test-costs event");
+    const rowsPerMutant = store.db
+      .query(
+        "SELECT COUNT(*) AS rows, COUNT(DISTINCT mutant_row_id) AS mutants FROM test_results WHERE mutant_code IS NOT NULL",
+      )
+      .get() as { rows: number; mutants: number };
+    // Two rows per mutant, so charging per row would give twice the per-call total.
+    expect(rowsPerMutant.rows).toBe(2 * rowsPerMutant.mutants);
+    expect(ev.tests.reduce((s, t) => s + t.runs, 0)).toBe(rowsPerMutant.rows);
+    expect(ev.tests.reduce((s, t) => s + t.ownMs, 0)).toBe(100 * rowsPerMutant.mutants);
+    store.close();
+  });
+
+  test("PR-247: a session that ran no mutant test emits no test-costs", async () => {
+    const dirs = await makeProject();
+    // A red baseline: no test is green, so no mutant is run against any test.
+    const backend = new StubBackend(CAPS_NST, () => "fail", ["IsOverBudget"]);
+    const store = new ResultsStore(":memory:");
+    const events: RunEvent[] = [];
+    const report = await runSession({
+      backend,
+      store,
+      ...dirs,
+      selectorIds,
+      emit: [createEmitter([(e) => events.push(e)])],
+    });
+    expect(events.filter((e) => e.type === "test-costs")).toEqual([]);
+    expect(report.costlyTests).toBeUndefined();
+    expect(events.some((e) => e.type === "session-finished")).toBe(true);
+    store.close();
+  });
+
   test("survive: tests pass under every mutant", async () => {
     const dirs = await makeProject();
     const backend = new StubBackend(CAPS_NST, () => "pass", ["IsOverBudget"]);
@@ -686,6 +810,8 @@ describe("runSession", () => {
       store,
       ...dirs,
       selectorIds,
+      // PR-307: the unparsable test file is session-kind-unreadable on v3, so a run needs the setting.
+      ciSessionKind: "headless",
       emit: [createEmitter([(e) => events.push(e)])],
     });
     expect(report.counts.killed).toBeGreaterThan(0);
@@ -4045,7 +4171,8 @@ describe("R-236c: a test with a reachable call that may open a TestPage is refus
     const dirs = await makeProject(testAl);
     await Bun.write(join(dirs.projectDir, "SandboxLogic.Codeunit.al"), TWO_PROC_AL);
     await Bun.write(join(dirs.testDir, "app.json"), testAppJson());
-    return dirs;
+    // PR-307: a TestPage test is session-kind-sensitive on an al-runner-v3 stub, so a run needs the setting.
+    return { ...dirs, ciSessionKind: "headless" as const };
   }
   const FENCED = { ...CAPS_NST, coverage: "fenced" as const };
 
@@ -4088,6 +4215,87 @@ describe("R-236c: a test with a reachable call that may open a TestPage is refus
     for (const m of report.mutants.filter((m) => m.procedureName === "IsUnderBudget"))
       expect(m.verdict).toBe("no-coverage");
     expect(report.testPageRefused?.tests).toEqual(["Sandbox Tests.UnsupportedTest"]);
+  });
+
+  // PR-387 test 8 (against empty-vs-empty): the real session, bcdev kind, writes the list through the
+  // fold and the report builder, so a shut `caps.kind` gate in `buildReport` fails here.
+  test("PR-387: a bcdev session names the refused test in notRunAtBaseline", async () => {
+    const dirs = await project();
+    const report = await runSession({
+      backend: new RecordingBackend(FENCED),
+      store: new ResultsStore(":memory:"),
+      ...dirs,
+      selectorIds,
+    });
+    expect(report.notRunAtBaseline).toEqual(["Sandbox Tests.UnsupportedTest"]);
+  });
+
+  test("PR-387: a green bcdev baseline writes notRunAtBaseline as [] (present, not absent)", async () => {
+    const dirs = await makeProject(PAGE_TEST_AL.replace("Card.OpenView();", ""));
+    await Bun.write(join(dirs.projectDir, "SandboxLogic.Codeunit.al"), TWO_PROC_AL);
+    await Bun.write(join(dirs.testDir, "app.json"), testAppJson());
+    const report = await runSession({
+      backend: new RecordingBackend(FENCED, undefined, "pass"),
+      store: new ResultsStore(":memory:"),
+      ...dirs,
+      ciSessionKind: "headless" as const,
+      selectorIds,
+    });
+    expect("notRunAtBaseline" in report).toBe(true);
+    expect(report.notRunAtBaseline).toEqual([]);
+  });
+
+  // PR-387 test 9: a row whose body never ran gets `notRun: true` on the event; a red test's `error` does not.
+  const baselineRowFor = async (answer: Partial<TestVerdict>, caps: BackendCapabilities = FENCED) => {
+    const dirs = await makeProject(PAGE_TEST_AL.replace("Card.OpenView();", ""));
+    await Bun.write(join(dirs.projectDir, "SandboxLogic.Codeunit.al"), TWO_PROC_AL);
+    await Bun.write(join(dirs.testDir, "app.json"), testAppJson());
+    const stub = new RecordingBackend(caps, undefined, "pass");
+    const scripted = stub.run.bind(stub);
+    const backend = Object.assign(stub, {
+      run: async (ref: TestMethodRef, opts: RunOpts): Promise<TestVerdict> =>
+        ref.method === "UnsupportedTest" && (stub.activations.at(-1) ?? null) === null
+          ? { ref, outcome: "error", durationMs: 1, ...answer }
+          : scripted(ref, opts),
+    });
+    const events: RunEvent[] = [];
+    const report = await runSession({
+      backend,
+      store: new ResultsStore(":memory:"),
+      ...dirs,
+      ciSessionKind: "headless" as const,
+      selectorIds,
+      emit: [createEmitter([(e) => events.push(e)])],
+    });
+    const row = events
+      .flatMap((e) => (e.type === "baseline-batch-finished" ? e.verdicts : []))
+      .find((v) => v.name === "Sandbox Tests.UnsupportedTest");
+    return { row, report };
+  };
+  test("PR-387: each body-never-ran kind sets notRun on the event and counts; a red error does not", async () => {
+    for (const answer of [
+      { bodyNeverRan: true as const, failureMessage: "tool error" },
+      { operation: "pre-dispatch-rejected" as const },
+      { operation: "completed-effect-unknown" as const },
+    ]) {
+      const { row, report } = await baselineRowFor(answer);
+      expect(row?.notRun).toBe(true);
+      expect(report.notRunAtBaseline).toEqual(["Sandbox Tests.UnsupportedTest"]);
+    }
+    const red = await baselineRowFor({ failureMessage: "Assert.AreEqual failed." });
+    expect(red.row?.notRun).toBeUndefined();
+    expect(red.report.notRunAtBaseline).toEqual([]);
+  });
+
+  // A v3 row with an `operation` (completed-accepted: the runner-test-error row) DID run: no notRun.
+  test("PR-387: a v3 completed-accepted baseline row gets no notRun on the event", async () => {
+    const v3 = { ...FENCED, kind: "al-runner-v3" as const, authoritative: false };
+    const { row } = await baselineRowFor(
+      { operation: "completed-accepted", failureMessage: "runner test error" },
+      v3,
+    );
+    expect(row).toBeDefined();
+    expect(row?.notRun).toBeUndefined();
   });
 
   test("a non-authoritative backend is unchanged: no scan, the test is sent", async () => {
@@ -9474,11 +9682,14 @@ describe("runSession — Task 12 quarantine on in-flight-unknown deadline", () =
   });
 
   // R692: "raise the floor with --mutant-timeout-ms" is advice for a budget overrun only.
-  const strandReason = async (v: {
-    outcome: "error" | "deadline-exceeded";
-    durationMs: number;
-    failureMessage: string;
-  }): Promise<string> => {
+  const strandReason = async (
+    v: {
+      outcome: "error" | "deadline-exceeded";
+      durationMs: number;
+      failureMessage: string;
+    },
+    stopHungSessions = false,
+  ): Promise<string> => {
     let activeMutant: string | null = null;
     const backend = fakeBackend({
       capabilities: () => ({
@@ -9499,6 +9710,7 @@ describe("runSession — Task 12 quarantine on in-flight-unknown deadline", () =
     const report = await runSessionForTest(backend, {
       quarantineDir: freshTmpDir(),
       nowIso: () => "2026-07-20T12:00:00.000Z",
+      ...(stopHungSessions ? { stopHungSessions: true } : {}),
     });
     return report.quarantined?.reason ?? "";
   };
@@ -9530,6 +9742,36 @@ describe("runSession — Task 12 quarantine on in-flight-unknown deadline", () =
       failureMessage: "RunMutant failed: HTTP 408",
     });
     expect(reason).toContain("raise the floor with --mutant-timeout-ms");
+  });
+
+  // PR-301 (GitHub #52): an overrun may be a hang, which only the hung-session stop can score. The note
+  // named the budget and never the stop, so a user whose mutant looped had no way to learn of it.
+  test("PR-301: a budget overrun names --stop-hung-sessions and its config field (revert: the hint)", async () => {
+    const reason = await strandReason({
+      outcome: "deadline-exceeded",
+      durationMs: 999_999_999,
+      failureMessage: "RunMutant failed: HTTP 408",
+    });
+    expect(reason).toContain("--stop-hung-sessions");
+    expect(reason).toContain("bcdev.stopHungSessions");
+  });
+
+  test("PR-301: with --stop-hung-sessions ON, an overrun does not tell the user to turn it on (revert: the setting check)", async () => {
+    const reason = await strandReason(
+      { outcome: "deadline-exceeded", durationMs: 999_999_999, failureMessage: "RunMutant failed: HTTP 408" },
+      true,
+    );
+    expect(reason).toContain("raise the floor with --mutant-timeout-ms");
+    expect(reason).not.toContain("--stop-hung-sessions");
+  });
+
+  test("PR-301: a fast failure inside the budget does not name the stop (not a hang)", async () => {
+    const reason = await strandReason({
+      outcome: "error",
+      durationMs: 40,
+      failureMessage: "RunMutant failed: HTTP 500",
+    });
+    expect(reason).not.toContain("--stop-hung-sessions");
   });
 
   test("a plain deadline-exceeded (no in-flight-unknown operation) stays an ordinary error — no quarantine, session continues", async () => {
@@ -25055,5 +25297,94 @@ describe("R907: --no-client in a session", () => {
       expect(m.cause).toBe("runner-refused");
     }
     expect(report.counts.killed).toBe(0);
+  });
+});
+
+// PR-315 (GitHub #52, R1171). With the stop off, a mutant that never ends quarantines the tier.
+// The warning says so once, before anything is deployed, on bcdev only.
+describe("PR-315: stop-hung-sessions-off warning", () => {
+  async function warningsOf(
+    backend: ExecutionBackend,
+    overrides: Partial<SessionConfig> = {},
+  ): Promise<{ events: RunEvent[]; warnings: Extract<RunEvent, { type: "warning" }>[] }> {
+    const events: RunEvent[] = [];
+    await runSessionForTest(backend, {
+      quarantineDir: freshTmpDir(),
+      emit: [createEmitter([(e) => events.push(e)])],
+      ...overrides,
+    });
+    const warnings = events.filter(
+      (e): e is Extract<RunEvent, { type: "warning" }> =>
+        e.type === "warning" && e.code === "stop-hung-sessions-off",
+    );
+    return { events, warnings };
+  }
+
+  test("emitted once, before the first deployment, for a bcdev session with the stop off", async () => {
+    const { events, warnings } = await warningsOf(fakeBackend());
+    expect(warnings.length).toBe(1);
+    const at = events.findIndex((e) => e.type === "warning" && e.code === "stop-hung-sessions-off");
+    const firstDeploy = events.findIndex((e) => e.type === "batch-published");
+    expect(firstDeploy).toBeGreaterThanOrEqual(0);
+    expect(at).toBeLessThan(firstDeploy);
+  });
+
+  test("the message names the flag, the config field and #52", async () => {
+    const { warnings } = await warningsOf(fakeBackend());
+    const m = warnings[0]?.message ?? "";
+    expect(m).toContain("--stop-hung-sessions");
+    expect(m).toContain('"stopHungSessions": true');
+    expect(m).toContain("#52");
+    expect(m).toContain("lethal clear-quarantine");
+    expect(m).toContain("lethal force-reset-lease");
+    expect(m).toContain("envTool");
+  });
+
+  test("not emitted when the stop is on", async () => {
+    const { warnings } = await warningsOf(fakeBackend(), { stopHungSessions: true });
+    expect(warnings.length).toBe(0);
+  });
+
+  test("not emitted for al-runner-v3", async () => {
+    const backend = fakeBackend({
+      capabilities: () => ({
+        coverage: "none",
+        deploy: "none",
+        isolation: "session",
+        kind: "al-runner-v3",
+        authoritative: false,
+      }),
+    });
+    const { events, warnings } = await warningsOf(backend);
+    // The session ran far enough to reach the generate phase, so the zero is not a crash.
+    expect(events.some((e) => e.type === "mutation-set-generated")).toBe(true);
+    expect(warnings.length).toBe(0);
+  });
+
+  // runNamedMutants (and so `lethal verify`) has no stop setting: it asks the backend.
+  async function namedWarnings(stops: boolean | undefined): Promise<number> {
+    const fx = await installedFixture();
+    const events: RunEvent[] = [];
+    const base = fx.cfg.backend;
+    const backend = (
+      stops === undefined
+        ? base
+        : Object.assign(Object.create(base), { stopsHungSessions: () => stops })
+    ) as ExecutionBackend;
+    await runNamedMutants({ ...fx.cfg, backend, emit: [(e) => events.push(e)] });
+    return events.filter((e) => e.type === "warning" && e.code === "stop-hung-sessions-off")
+      .length;
+  }
+
+  test("runNamedMutants: emitted once on bcdev with the stop off", async () => {
+    expect(await namedWarnings(false)).toBe(1);
+  });
+
+  test("runNamedMutants: a backend that cannot say is read as off", async () => {
+    expect(await namedWarnings(undefined)).toBe(1);
+  });
+
+  test("runNamedMutants: not emitted when the backend's stop is on", async () => {
+    expect(await namedWarnings(true)).toBe(0);
   });
 });

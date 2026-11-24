@@ -260,6 +260,166 @@ baseline leg is narrowed; same-tier dedup collisions throw. The must-changes bel
   - line 141 `condition-true` killPosition 2 (recorded).
   - **The settling evidence is the hang record's baseline diff:** the line-147 row must be byte-identical, killing test
     included. A different killer there is a BLOCK.
+  - **Settled:** the hang record (bc2) kept the line-147 row byte-identical, killed by `SpinUntilReachesTheTarget`.
+
+## 0g. Amendment 6 (2026-11-19, before the v3 WR and T records): the v3 pre-commitments for those two legs
+- **State:** every BC leg recorded and confirmed (all 8 PASS at lethal/pr209-figs 4960b3ff1). A v3 run at d6b04f87e
+  (`/coord/handoff/PR-209/v3rec2/run.log`): L1, MO, MOE and DBM PASS under amendment 4.
+- **1. WR's WrappedArms count moves 3 → 4 (missed by amendment 4).** `judgeWrArms` pins exactly three rows in
+  `src/WrappedArms.Codeunit.al`. PR-209 adds `condition-true` in `Pick` there: the BC twin `bcdev.wrapped.baseline.json`
+  (recorded on bc3) now holds four `Wrapped Arms|Pick` rows (empty-block, return-value, condition-true,
+  conditional-boundary), three before. **Pre-committed:** exactly FOUR rows, each still `no-coverage` with the refusal
+  note, and no other row carrying it. The rule is unchanged; only the count follows the generated set.
+- **2. O1 and D1's checkout is `/work/lethal-wt/cdo-r396`** (at 5f2a71d, with the 17 pinned `Test/.alpackages` apps), as
+  docs/gates/alrunner-v3.md names it. Amendment 4 item 5 named `/work/src/do-lethal`, which has no `.alpackages`: wrong
+  again; the run refused it by name (0 of 17 apps).
+- **3. T's expected file** (`packages/runner/itest/expected/al-runner-v3.tables.baseline.json`, committed with this
+  amendment, before any T record):
+  - the 418 committed v3 rows verbatim;
+  - the 32 added rows (23 condition-true, 9 blank-argument): the key and `mutatedTextSha256` from the refused record's dump
+    (keys and hashes can only come from a run; R849 step 6); verdict, killingTest, coverageFiltered and errorClass from the
+    BC twin row in `tables.baseline.json` (recorded on bc2);
+  - order: the gate's own (`sortedForDisk`).
+  - **Disclosed:** the dump's 32 rows already equal their BC twins on every field. So the file equals that run's rows; it
+    is built from the twins, not copied.
+- **4. T's hand-pin counts** (`legT.counts` of the readings the current pin uses, total 418 → 450) are NOT predicted here.
+  They are read from the T record run's printed count line, then pinned. That moves the readings digest, so the manifest
+  rows are re-gated with `--refresh-rows` (as R-965 did), in the window the orchestrator sets: after y3, before the
+  redeploy, not across lethal-bugs' daily update (next 2026-11-20 ~07:47Z).
+- **5. WR's expected file** follows the same construction from `bcdev.wrapped.baseline.json` once a WR record run past
+  item 1 dumps its keys. It lands in its own master commit before WR's record, with WR's `assertCounts` figures.
+  - **Landed** (`packages/runner/itest/expected/al-runner-v3.wrapped.baseline.json`): the 102 committed rows verbatim; 14
+    added `condition-true` rows, key and hash from the refused record's dump, verdicts from the BC twins (2 killed, 12
+    survived), except WrappedArms' new `Pick` row: no-coverage, `coverageFiltered` true, no killer, by item 1's refusal
+    rule, like its three siblings (BC: survived).
+  - **WR's `assertCounts`: 64 / 39 / 13 over 116** (was 62 / 28 / 12 over 102). That is the twins plus the refusal rule,
+    and equals the printed reading (`/coord/handoff/PR-209/v3rec2/wr-d1.log`).
+  - **Disclosed:** the dump's rows already equal this file. It is built from the twins and the rule, not copied.
+  - D1 and D1c PASS slim (53 / 12 / 0 and 53 / 8 / 4 over 65), amendment 7 confirmed.
+
+## 0i. Amendment 8 (2026-11-19, before any itest:verify run): the verify gate, missed by §3 and §4
+- **The miss:** `itest:verify` (`verify.itest.ts`, `verify-gaps.ts`) runs `fixtures/sandbox-app` on BC with the default set,
+  and agentflow's gate table routes sandbox-app changes to it. §3's table and §4's BC legs never named it. The Opus build
+  review found it still pinned to the old set (14 gap members, a 5-key `DiscountedPrice` no-coverage block).
+- **What these figures rest on (not blind):** derived from the code (an Opus read-only pass) AND checked against
+  bcdev's recorded twin. `bcdev.baseline.json` (bc1, 2026-11-19) runs the same fixture with the same set and is on
+  master, so the verdicts below are known before verify runs. Numbers taken FROM THE TWIN:
+  - the 4 added rows' verdicts: `ClampPercent` condition-true, `ApplyAudit` blank-argument and `LogAudit` condition-true
+    survived; `DiscountedPrice` condition-true no-coverage;
+  - their keys (hash prefixes `241fff…`, `68eef1…`, `5cba65…`, `4b61c0…`);
+  - survived 17 in total.
+- **Numbers from the CODE** (where each row lands, and what does not move):
+  - a gap id hashes the block (`gapIdOf`: file, first and last line, block text), never its members, and the fixture is
+    unchanged, so all 5 gap ids stay;
+  - the four rows join EXISTING blocks: ClampPercent ct shares the line-12 condition's block (`CLAMP_GAP`); ApplyAudit ba
+    sits in the procedure body (`APPLY_GAP`); LogAudit ct's condition is outside its then-block (`LOG_BODY_GAP`;
+    `LOG_THEN_GAP` unchanged); DiscountedPrice ct joins that no-coverage block. No-coverage rows are never gap members.
+- **Pre-committed:**
+  - `CLAMP_GAP` 7 → 8 keys, `APPLY_GAP` 2 → 3, `LOG_BODY_GAP` 3 → 4, `LOG_THEN_GAP` 2 (unchanged); still exactly 4
+    gaps, each `unobservedBlock`, per-gap survived = its keys;
+  - `memberTotal` 14 → 17, equal to `counts.survived`;
+  - `PREDICTED_NO_COVERAGE_KEYS` 5 → 6 (+ `DiscountedPrice` condition-true); still exactly 1 no-coverage block;
+  - unchanged: the 3 `IsOverBudget` rows (killed), `OVER_BUDGET_GAP`, the REACH_* strings (they count only the
+    survivors each verify call names), steps 3-5's counts and refusals, `GATE_WARNINGS` verify/* all `[]`;
+  - `packages/runner/tests/gap-pins.test.ts` returns to the default set (its `SLIM_OPTIONS` removed): the offline proof of
+    the four keys and the unchanged ids.
+- **Run:** `LETHAL_ITEST_VERIFY=1 LETHAL_ITEST_CONFIG=lethal.config.bc1.json` `itest:verify`, on bc1 (its proven server),
+  against `bcdev.baseline.json`. Any difference is a BLOCK. (Corrected 2026-11-19: this line first said
+  `LETHAL_ITEST_BCDEV=1`, under which the gate skips; that attempt measured nothing.)
+- **The other gates not yet run under PR-209** (same method: an Opus read of each itest, figures from the code and the
+  recorded twins):
+  - **itest:agreement** (`sandbox-harden`; twin `harden.baseline.json`, 23 rows, recorded on bc3) MOVES:
+    - step 1, A: 21 → 23 mutants; killed / survived / no-coverage [16, 5, 0] → [18, 5, 0] (FROM THE TWIN: the two added
+      `condition-true` rows, `HardenLogic` lines 23 and 41, killed);
+    - step 4, B: 21 → 23 mutants; [20, 1, 0] → [22, 1, 0]. From the code: the two rows' recorded killers
+      (`FirstAmountReadsARow`, `BonusForPaysOnlyAboveTen`, FROM THE TWIN) are in the scratch suite (`SCRATCH_TESTS`);
+    - unchanged: the five planted keys, `REACH_STEP3`, steps 3 and 5, warning sets (`HARDEN_DEPENDENTS`).
+  - **itest:verify-scale** (`sandbox-data`; twin `tables.baseline.json`, recorded on bc2) MOVES: `SURVIVORS` 73 → 83
+    (FROM THE TWIN). Steps 3 and 7 follow the re-recorded baseline. It also requires one batch (needs its run's reading).
+  - **itest:testapp** follows `bcdev.baseline.json` by row (no count pinned; its step-3 key suffixes stay unique). It
+    assumes one batch (needs its run's reading). **itest:stale-publish**, **itest:lease** and **itest:growth** pin
+    nothing the set moves (by procedure+operator; no mutants; print only).
+  - **itest:envtool** (host-only) was already stale before PR-209 (master generates 22 against its 19). Its own rule
+    re-records only against a same-day bcdev run, through the owner; not moved here.
+- **Runs** (each its proven server, bc1 per `docs/gates/servers.md`): `itest:verify` (`LETHAL_ITEST_VERIFY=1`),
+  `itest:agreement` (`LETHAL_ITEST_AGREEMENT=1`), `itest:verify-scale` (`LETHAL_ITEST_VERIFY_SCALE=1` and
+  `LETHAL_VERIFY_SCALE_OUT=<file>`, which it requires), `itest:testapp` (`LETHAL_ITEST_TESTAPP=1`), all with
+  `LETHAL_ITEST_CONFIG=lethal.config.bc1.json`. Any difference is a BLOCK. (Corrected 2026-11-19: verify's and
+  verify-scale's variables; the first attempts skipped or refused before measuring anything.)
+
+## 0h. Amendment 7 (2026-11-19): D1 and D1c run slim, RULED (b) by the orchestrator
+- **Observed** (`/coord/handoff/PR-209/v3rec2/o1d1.log`, checkout `/work/lethal-wt/cdo-r396`): O1 PASS; D1 63 / 15 / 0 over
+  78, pinned 53 / 12 / 0 over 65.
+- **Why not re-pin:** D1 and D1c compare per mutant with R594's BC oracle (`docs/measurements/r594/bc3-A.report.json`,
+  `bc3-B.report.json`), recorded with the OLD operator set; the 13 new mutants have no oracle row. A dry-run diff of the
+  slice (default against `--profile slim`) names them: `CDORecipientMgt.Codeunit.al` lines 15, 28, 34, 36, 44, 60, 64, 70,
+  78, 85 condition-true and 36, 40, 42 blank-argument; slim has no mutant the default lacks.
+- **RULED (b)**, as for MO: the run has been seen, so a prediction of the new rows cannot be blind, and D1's job is v3
+  against BC on a real slice, not the operator set.
+- **Pre-committed:**
+  - D1 and D1c run `--profile slim`; their counts stay (53 / 12 / 0 and 53 / 8 / 4 over 65) and so does the oracle;
+  - their warning sets (`CDO_D`, shared by both) gain `operator-narrowed-run`;
+  - nothing else in the legs moves.
+- **The gap this leaves:** nothing compares the two default-on operators with BC on real code. Filed as R1139 (in
+  PR-209's branch): re-measure the CDO slice on BC with the default set and extend R594's oracle by the 13 rows. BC is
+  the oracle, so it needs no blind prediction. Scheduled by the orchestrator after PERF-10.
+
+## 0j. Amendment 9 (2026-11-19, before the manifest re-gate): the v3 legs the earlier rounds never ran in full
+- **How it was found:** the `--refresh-rows` re-gate's first row (alpha.12) gate-failed, and a full v3 gate on `current`
+  at lethal/pr209 0d355f18b (`/coord/handoff/PR-209/regate/full-current.log`) then separated PR-209's moves from the old
+  build's. On `current`: C, DBM, S3, N1, N1E, N1S, O1, X, L1, Y-A, Y-B, MO, WR, MOE, RC, D1, D1c, T PASS. Only the legs
+  below fail. Earlier rounds ran only the legs this PR changed; the full gate had not run on the branch.
+- **S1, S1E, DB, DBI, ISO, K** compare with `bcdev.baseline.json` (amendment 4 item 4 said so, but their hand-written
+  `assertCounts` stayed at 3 / 14 / 5 over 22). **Pre-committed: 3 / 17 / 6 over 26**, FROM THE TWIN (bcdev's recorded
+  table); every one of them read exactly that on `current` and on alpha.12.
+- **WRE's serve counters** (R918): `entriesSent` 430 → **464** and `pairRequests` 62 → **64**; the rest unchanged
+  (warmups 1, liveRequests 1, boundChecks 4, echoMismatches 0). `pairRequests` is one per WR kill (62 → 64 killed,
+  amendment 6). `entriesSent` is READ, not predicted: the same 464 on `current` and on alpha.12.
+- **Not PR-209's:** alpha.12 also fails leg C (it refuses `strictOrder`, PR-114a's capability facts of 2026-11-17) and X
+  (no `alone-confirm`). Both pass on `current`. Whether old manifest rows can be refreshed at all after PR-114a is a
+  separate question for the orchestrator; no figure here depends on it.
+- **Addendum (2026-11-19, the measure-only refresh probe on `current` at cb5155ee2):** the counts above passed, and
+  three checks they had hidden then failed (a leg stops at its first failed check):
+  - **S1E and DB** (`S1E_PINS`): `entriesSent` 48 → **54**. READ on `current`, not predicted.
+  - **K** (`judgeLegK`): no-coverage mutants 5 → **6**, all still in `SandboxPricing.Codeunit.al`. FROM THE TWIN: the
+    sixth is `DiscountedPrice` condition-true, no-coverage in `bcdev.baseline.json`.
+  - **The rule for what follows:** before any refresh, the full v3 gate on `current` at the branch head must PASS every
+    leg, so no hidden check is left for a refresh to find.
+
+## 0k. Amendment 10 (2026-11-19): the gate manifest's 18 rows, RULED (b) by the owner (q-20261119T154107-12f69ed1)
+- **The problem:** all 18 rows of `al-runner-v3-gated-builds.json` read one hand-pin readings object, and PR-209 moves its
+  leg-T counts, so every row's digest moves (e8ce7f40 → df57baf0). A refresh re-gates a row's kept binary at today's
+  head, and old builds fail leg C facts added after they were gated.
+- **The ruling (b):** a row that cannot pass a refresh keeps a FROZEN copy of today's readings under its own pin id,
+  labelled frozen with the reason; a row that passes moves to the new readings. Nothing is retired.
+- **The measurement** (full v3 gate on `current` at lethal/pr209 938376c68: 25/25 PASS; then a measure-only
+  `--refresh-rows` probe of the 17 older rows, newest first, at the same head, stopping at the first failure;
+  `/coord/handoff/PR-209/regate/probe2.log`):
+  - **PASS, move to the new readings (7):** edge-4ebfe7913 (`current`, by the full gate), edge-5a58a0f16, edge-a184cfc79,
+    edge-847b1fa5a, edge-c8fe56e05, edge-736fc7677, edge-2bd87774f.
+  - **FAIL, frozen (measured, 2):** edge-42af5d384 (leg C: `serve-keep-reasons` unkept, a refusal its build predates,
+    R1000) and alpha.12-d4bc8d3a5 (leg C: refuses `strictOrder`, PR-114a's capability facts; first refresh attempt,
+    `/work/tools/al-runner-v3/refresh/refresh-alpha.12-d4bc8d3a5@0d355f18…`).
+  - **Not re-gated, frozen (9):** edge-3138effad, edge-3096bf68f, edge-9597b4a01, edge-05d692e5e, edge-897b441eb,
+    edge-6bb821b98, edge-a0825f1d9, alpha.14-ef00a6a8f, alpha.13-23e7631be. All are older than edge-42af5d384. Freezing
+    is the conservative direction: a frozen row keeps exactly the claim it was gated with and asserts nothing new, so
+    it needs no gate; only a move needs a pass. Each is labelled "not re-gated" (not "fails"), so the label claims no
+    measurement.
+- **Pre-committed build:**
+  - a frozen readings object, byte-equal to today's (master) readings; a red-going test pins its digest to e8ce7f40;
+  - frozen pin ids, one per distinct pin a frozen row read, each with `frozen: { reason }`. A frozen pin is reachable
+    ONLY through a manifest row's `readingsFrom`, never by `findV3Pin`, so a live run of any build never judges by
+    frozen readings;
+  - the 11 frozen rows' `readingsFrom` move to their frozen pin; their `readingsDigest` and `lethalCommit` stay as they
+    are (still e8ce7f40);
+  - R814's digest test accepts both kinds: every row's digest equals its (live or frozen) hand pin's today. Red tests
+    each way: a frozen row with the new digest fails, and a live row with the old digest fails;
+  - the 7 passing rows: the tool-written diff `probe2-manifest.diff` (sha256 prefix 78cb22439bbbd8ab, 6 rows: the probe's
+    six) applied byte for byte, plus `current`'s own row by one `--refresh-rows edge-4ebfe7913` run on the final head (the
+    probe skipped it because the full gate had just passed there). No hand edit to any refreshed row.
+  - **Gated at 938376c68:** the six probe rows record lethalCommit 938376c68. The result lists every commit between it and
+    the submitted head, with why none moves a gate leg's reading; any that does re-runs those rows (orchestrator's
+    condition). The full v3 gate runs on the final head before submit.
 
 ## 1. What is true today (read from master 8ddd1736)
 - Three operators are opt-in (`optIn: true`): `swap-workdate-today`, `condition-true` and `blank-argument`. An opt-in

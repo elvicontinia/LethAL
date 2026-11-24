@@ -306,6 +306,7 @@ describe("R403 phase A: the resume fingerprint carries the test app's set (plan 
       identityScheme: IDENTITY_SCHEME,
       coverageMode: "procedure",
       selectorIds: { selectorId: 50147, controlId: 50148, tableId: 50149 },
+      defaultOperators: 2, // PR-209: what a default run computes now
     });
     expect(store.getRun(1)?.configFingerprint).toBe(preR403);
   });
@@ -501,7 +502,8 @@ describe("R403 phase B: bcdev's compiled-membership check (plan §3(b))", () => 
       ],
     };
     const backend = new PkgBackend(compiledPkg([...BUILT_NONE, handled]));
-    await session(root, new ResultsStore(":memory:"), backend);
+    // PR-307: a handler-bound test is session-kind-sensitive, so a run needs the setting.
+    await session(root, new ResultsStore(":memory:"), backend, { ciSessionKind: "headless" });
     expect([...new Set(backend.baselineMethods)].sort()).toEqual(["Decorated", "PlainDoubles"]);
   });
 
@@ -605,6 +607,7 @@ describe("R403 phase B: bcdev's compiled-membership check (plan §3(b))", () => 
       identityScheme: IDENTITY_SCHEME,
       coverageMode: "procedure",
       selectorIds: { selectorId: 50147, controlId: 50148, tableId: 50149 },
+      defaultOperators: 2, // PR-209: what a default run computes now
     } as const;
     expect(store.getRun(1)?.configFingerprint).toBe(
       sessionFingerprint({ ...base, testDiscovery: "arms-v1" }),

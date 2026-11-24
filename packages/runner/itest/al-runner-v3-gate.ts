@@ -15,6 +15,7 @@
 import { writeFile } from "node:fs/promises";
 import { AlRunnerCoverageFrameError } from "../src/al-runner-coverage";
 import type { AlRunnerV3Config, V3EntriesStats } from "../src/al-runner-v3-backend";
+import { STOP_GROUPS_FACT } from "../src/al-runner-v3-contract";
 import { applyTPin, pinnedFactMatches } from "../src/al-runner-v3-pins";
 import type { V3BuildPin, XbPin } from "../src/al-runner-v3-pins";
 import { AlRunnerV3CoverageJoinError } from "../src/al-runner-v3-sleep";
@@ -303,10 +304,11 @@ function differenceKey(d: string, keys: ReadonlySet<string>): string | undefined
  */
 
 /**
- * Leg T's committed own baseline, unpinned: 298 / 54 / 66 over 418 (R975 moved 6 Data Main rows to
- * no-coverage; 298 / 60 / 60 before). A build pin replaces it with its own counts.
+ * Leg T's committed own baseline, unpinned: 318 / 64 / 68 over 450 (PR-209 added 32 rows, their BC twins' 20 / 10 / 2;
+ * 298 / 54 / 66 over 418 before, after R975 moved 6 Data Main rows to no-coverage). A build pin replaces it with its own
+ * counts.
  */
-export const LEG_T_OWN_COUNTS = { killed: 298, survived: 54, noCoverage: 66, total: 418 } as const;
+export const LEG_T_OWN_COUNTS = { killed: 318, survived: 64, noCoverage: 68, total: 450 } as const;
 type LegTJudgement = {
   readonly outcome: "pass" | "held" | "gate-fail";
   readonly lines: readonly string[];
@@ -621,7 +623,7 @@ export function knownDifferencesRefusal(
 
 /**
  * Leg C's defect facts: each must read `defect-present` (r6; `none-selected-exit` since r7, R632;
- * `refusal-row-shape` since r9, R639). Every other fact of the 36 is a contract or capability fact and
+ * `refusal-row-shape` since r9, R639). Every other fact of the 38 is a contract or capability fact and
  * must read `matches`, except the warn facts.
  */
 export const V3_DEFECT_FACTS = [
@@ -641,9 +643,13 @@ export const V3_DEFECT_FACTS = [
  * Leg C's pre-committed fact count: 9 defect, 18 contract, 1 warn, 8 capability (PR-114a: the eight
  * `batch-*` facts of `V3_CAPABILITY_FACTS`; a capability fact not reading `matches` is a gate-fail
  * here, never a session refusal). r13 (R590, the contract fact `dependency-skip-line`) had 28; r12
- * (R667, `message-has-no-type-prefix`) had 27, r9 had 26.
+ * (R667, `message-has-no-type-prefix`) had 27, r9 had 26. PR-340: 37, the ninth `batch-*` fact
+ * `batch-sequential-carry` (`V3_CARRY_FACT`, outside `V3_CAPABILITY_FACTS`; pre-committed `matches`).
+ * PR-342: 38, the fact `stop-groups` (`STOP_GROUPS_FACT`, also outside `V3_CAPABILITY_FACTS`; its
+ * `diverged` only keeps PR-256's flag off). So: 9 defect, 18 contract, 1 warn, 8 capability, the carry
+ * fact and stop-groups.
  */
-export const V3_LEG_C_FACTS = 36;
+export const V3_LEG_C_FACTS = 38;
 
 /** F4 (R639): leg C's per-fact log line, with `measured` whole. */
 export const legCFactLine = (f: {
@@ -752,6 +758,10 @@ export function classifyLegC(
         infra = true;
         lines.push(`infra-fail: ${f.fact}: diverged and its alone reference ran nothing${m}`);
       }
+    } else if (f.fact === STOP_GROUPS_FACT && f.verdict === "diverged") {
+      // PR-342: a build without #8564 (or with a stop PR-256 cannot read) keeps `alRunnerV3.stopGroups` refused,
+      // through its record; the flag is off by default, so it costs the build nothing.
+      lines.push(`al-runner-v3-stop-groups-off: ${f.fact}: diverged${m}`);
     } else if (want === "defect-present" && f.verdict === "gone") {
       held = true;
       lines.push(`held: ${f.fact}: defect-present -> gone (an upstream fix; re-pre-commit)${m}`);

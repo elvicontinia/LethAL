@@ -117,6 +117,7 @@ describe("R654 S2: the leg sets", () => {
       "MOE", // R918: also in V3_GATE_LEGS (MO and WR on serve-entries)
       "WRE",
       "RC", // PR-144: the withheld-kill recheck; not in V3_GATE_LEGS
+      "TC", // PR-347: the refused-cut tail; not in V3_GATE_LEGS
       "K",
     ]);
     expect(v3DefaultLegs({ cdo: true, tables: true })).toEqual([
@@ -141,6 +142,7 @@ describe("R654 S2: the leg sets", () => {
       "MOE",
       "WRE",
       "RC",
+      "TC",
       "K",
       "D1",
       "D1c",
@@ -196,6 +198,7 @@ describe("R654 S2, condition (1): on a candidate K is skipped with its summary, 
     ISO: "pass", // R857: a default leg outside V3_GATE_LEGS
     DB: "pass", // R948: so is DB
     RC: "pass", // PR-144: and RC
+    TC: "pass", // PR-347: and TC
     DBI: "pass", // and DBI
     DBM: "pass", // and DBM (PR-114a)
     ...(k !== undefined ? { K: k } : {}),
@@ -359,7 +362,9 @@ describe("R654 S2 leg K: the config it builds from, and what it judges", () => {
     serveSpawns: 2,
     oneShotTestCalls: 1,
     warned: true,
+    // PR-209 amendment 9 addendum: six (DiscountedPrice condition-true), five before.
     noCoverageFiles: [
+      "src/SandboxPricing.Codeunit.al",
       "src/SandboxPricing.Codeunit.al",
       "src/SandboxPricing.Codeunit.al",
       "src/SandboxPricing.Codeunit.al",
@@ -381,6 +386,13 @@ describe("R654 S2 leg K: the config it builds from, and what it judges", () => {
     expect(judgeLegK({ ...good, oneShotTestCalls: 12 })).toHaveLength(1);
     expect(judgeLegK({ ...good, warned: false })).toHaveLength(1);
     expect(judgeLegK({ ...good, noCoverageFiles: [] })).toHaveLength(1);
+    expect(judgeLegK({ ...good, noCoverageFiles: good.noCoverageFiles.slice(1) })).toHaveLength(1);
+    expect(
+      judgeLegK({
+        ...good,
+        noCoverageFiles: [...good.noCoverageFiles, "src/SandboxPricing.Codeunit.al"],
+      }),
+    ).toHaveLength(1);
     expect(
       judgeLegK({ ...good, noCoverageFiles: [...good.noCoverageFiles.slice(1), "src/Other.al"] }),
     ).toHaveLength(1);

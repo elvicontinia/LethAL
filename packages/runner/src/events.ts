@@ -69,7 +69,8 @@ export interface StreamCapabilities {
 const _streamCapsCover = (c: BackendCapabilities): StreamCapabilities => c;
 void _streamCapsCover;
 
-export type RunPhase = "generate" | "deploy" | "baseline" | "mutants" | "teardown";
+/** PR-370 (R1189): `recheck` is the withheld-kill recheck's nested session, after `teardown`. */
+export type RunPhase = "generate" | "deploy" | "baseline" | "mutants" | "teardown" | "recheck";
 
 /**
  * Why a baseline test did not pass — see `baseline-batch-finished`'s `verdicts[].classification`.
@@ -182,7 +183,13 @@ export type RunEventInput =
       readonly testCount?: number;
       readonly batchIndex?: number;
     }
-  | { readonly type: "phase-left"; readonly phase: RunPhase; readonly elapsedMs: number }
+  | {
+      readonly type: "phase-left";
+      readonly phase: RunPhase;
+      readonly elapsedMs: number;
+      /** PR-370: the `recheck` phase's nested session split ("nested: generate 12.0 s, ..."). */
+      readonly detail?: string;
+    }
   | {
       readonly type: "mutation-set-generated";
       readonly siteCount: number;
@@ -293,6 +300,22 @@ export type RunEventInput =
       }>;
     }
   | {
+      /**
+       * PR-307 (R1168): the tests of this run's FINAL list that can change with the session kind (a client session or a headless
+       * one), emitted once, before anything is sent, only when there is at least one and `ciSessionKind` is set (unset, the
+       * session was refused). `backendSessionKind` is what this run's backend is; `ciSessionKind` is what the config says the
+       * user's CI runs. A label only; no verdict reads it. See `session-kind.ts`.
+       */
+      readonly type: "tests-session-kind-sensitive";
+      readonly tests: ReadonlyArray<{
+        readonly test: string;
+        readonly reasons: ReadonlyArray<"handlers" | "testpage" | "unreadable">;
+        readonly scanError?: string;
+      }>;
+      readonly backendSessionKind: "client" | "headless";
+      readonly ciSessionKind: "client" | "headless";
+    }
+  | {
       readonly type: "batch-published";
       readonly batchIndex: number;
       readonly guardCount: number;
@@ -385,6 +408,9 @@ export type RunEventInput =
         readonly flagged?: true;
         /** R949: a `pass` a serve daemon answered: its flagged state is unknown. Absent otherwise. */
         readonly flaggedUnknown?: true;
+        /** PR-387: the test body never ran (a rejected or unanswered call, a line-count answer). Not
+         *  a statement about the test. Absent otherwise. */
+        readonly notRun?: true;
       }[];
     }
   | {
@@ -680,7 +706,7 @@ export type RunEventInput =
        * throughout: the daemon's `floor` and `start` resident size, the `sampledPeak` of the 200 ms
        * sampler, `hwm` (`VmHWM`, present only when its reset was verified) and `g` (the peak less the
        * floor). `peakSource` says which the estimator used. `calls` lists each call with its test
-       * entries in the request and its highest cost per entry after the reading. Debug: events stream
+       * entries in the request and its recent price per entry (max of the last K readings; PR-246) after the reading. Debug: events stream
        * only, not the report.
        */
       readonly type: "serve-request-sized";
@@ -712,6 +738,30 @@ export type RunEventInput =
         readonly boundBytes: number;
         readonly source: string;
       };
+      /** PR-250: present when the daemon-churn guard stopped the session: the lane, and its daemon closes in a row with no mutant scored. */
+      readonly stoppedByDaemonChurn?: { readonly lane: number; readonly closes: number };
+      /** PR-277: the stop came after the main pass scored every mutant: nothing left out, the run finished, nothing to resume. */
+      readonly afterMainPass?: true;
+    }
+  | {
+      /**
+       * PR-247: once per session, after the mutant phase and before `session-finished`; not emitted when no
+       * mutant test ran (a quarantined session still emits it: the time was spent). One entry per test per
+       * batch that ran under at least one mutant THIS session, sorted by `batchIndex` then `test` (code units).
+       * Only rows that carry a mutant code count (the mutant's own runs and its R577 reproduction); the
+       * unmutated confirmation rows (the NONE confirm, the warm-kill replay, `confirmFoundNone`), the baseline
+       * and the withheld-kill recheck are left out. `ownMs` is charged as R963 does: a row's own time, else
+       * its call's wall once per call, else its `durationMs`. `msUnderSurvivors` is the part of `ownMs` whose
+       * mutant was scored `survived`.
+       */
+      readonly type: "test-costs";
+      readonly tests: readonly {
+        readonly test: string;
+        readonly batchIndex: number;
+        readonly runs: number;
+        readonly ownMs: number;
+        readonly msUnderSurvivors: number;
+      }[];
     }
   | { readonly type: "session-finished"; readonly elapsedMs: number };
 

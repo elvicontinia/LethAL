@@ -326,7 +326,8 @@
             "deploy",
             "baseline",
             "mutants",
-            "teardown"
+            "teardown",
+            "recheck"
           ]
         },
         "detail": {
@@ -366,11 +367,15 @@
             "deploy",
             "baseline",
             "mutants",
-            "teardown"
+            "teardown",
+            "recheck"
           ]
         },
         "elapsedMs": {
           "type": "number"
+        },
+        "detail": {
+          "type": "string"
         },
         "seq": {
           "type": "number"
@@ -960,6 +965,72 @@
       "additionalProperties": false,
       "required": [
         "type",
+        "tests",
+        "backendSessionKind",
+        "ciSessionKind",
+        "seq"
+      ],
+      "properties": {
+        "type": {
+          "const": "tests-session-kind-sensitive"
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "test",
+              "reasons"
+            ],
+            "properties": {
+              "test": {
+                "type": "string"
+              },
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "handlers",
+                    "testpage",
+                    "unreadable"
+                  ]
+                }
+              },
+              "scanError": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "backendSessionKind": {
+          "type": "string",
+          "enum": [
+            "client",
+            "headless"
+          ]
+        },
+        "ciSessionKind": {
+          "type": "string",
+          "enum": [
+            "client",
+            "headless"
+          ]
+        },
+        "seq": {
+          "type": "number"
+        },
+        "atMs": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
         "batchIndex",
         "guardCount",
         "elapsedMs",
@@ -1092,6 +1163,9 @@
                 "const": true
               },
               "flaggedUnknown": {
+                "const": true
+              },
+              "notRun": {
                 "const": true
               }
             }
@@ -2370,6 +2444,30 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "extra": {
+              "type": "object",
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": [
+                      "number",
+                      "string",
+                      "boolean"
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": [
+                        "number",
+                        "string",
+                        "boolean"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
             "setupMs": {
               "type": "number"
             },
@@ -2667,6 +2765,76 @@
             },
             "source": {
               "type": "string"
+            }
+          }
+        },
+        "stoppedByDaemonChurn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "lane",
+            "closes"
+          ],
+          "properties": {
+            "lane": {
+              "type": "number"
+            },
+            "closes": {
+              "type": "number"
+            }
+          }
+        },
+        "afterMainPass": {
+          "const": true
+        },
+        "seq": {
+          "type": "number"
+        },
+        "atMs": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "tests",
+        "seq"
+      ],
+      "properties": {
+        "type": {
+          "const": "test-costs"
+        },
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "test",
+              "batchIndex",
+              "runs",
+              "ownMs",
+              "msUnderSurvivors"
+            ],
+            "properties": {
+              "test": {
+                "type": "string"
+              },
+              "batchIndex": {
+                "type": "number"
+              },
+              "runs": {
+                "type": "number"
+              },
+              "ownMs": {
+                "type": "number"
+              },
+              "msUnderSurvivors": {
+                "type": "number"
+              }
             }
           }
         },

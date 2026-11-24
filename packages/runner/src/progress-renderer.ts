@@ -30,6 +30,7 @@
  * `RunEvent["type"]`; the event types this renderer deliberately does not surface (the `default`
  * case below) fall through silently rather than throwing on a shape it doesn't handle.
  */
+import { monoNow } from "./clock";
 import type { EventSubscriber, RunEvent } from "./events";
 import { httpPolicyLines } from "./http-policy";
 
@@ -84,7 +85,7 @@ export function createProgressRenderer(
   const noteMutantResolved = (durationMs?: number): void => {
     mutantsDone += 1;
     if (durationMs !== undefined) scoredDurationsMs.push(durationMs);
-    const now = Date.now();
+    const now = monoNow();
     if (lastMutantRenderAt === undefined || now - lastMutantRenderAt >= opts.heartbeatMs) {
       lastMutantRenderAt = now;
       renderMutantProgress();
@@ -167,9 +168,11 @@ export function createProgressRenderer(
         const head =
           event.stoppedByMemory !== undefined
             ? "STOPPED BY THE MEMORY GUARD"
-            : event.stoppedBySignal === true
-              ? "STOPPED BY SIGNAL (SIGTERM or SIGINT)"
-              : "TIME BUDGET REACHED";
+            : event.stoppedByDaemonChurn !== undefined
+              ? "STOPPED BY THE DAEMON-CHURN GUARD"
+              : event.stoppedBySignal === true
+                ? "STOPPED BY SIGNAL (SIGTERM or SIGINT)"
+                : "TIME BUDGET REACHED";
         if (event.baselineStopped !== undefined) {
           write(
             `${head} IN THE ${event.baselineStopped.inAutoRebaseline === true ? "AUTO ISOLATION RE-" : ""}BASELINE: ${event.baselineStopped.testsRun} of ${event.baselineStopped.testsTotal} test(s) ran.`,
@@ -178,7 +181,9 @@ export function createProgressRenderer(
         const why =
           head === "TIME BUDGET REACHED" ? `--time-budget ${event.budgetSeconds} s used up; ` : "";
         write(
-          `${head}: ${why}${event.unscheduledCount} mutant(s) left out of this report, and ${event.batchesNotStarted} later batch(es) never started. Run with --resume to continue.`,
+          event.afterMainPass === true
+            ? `${head} AFTER THE MAIN PASS: every mutant was scored; the run is finished and there is nothing to resume (PR-277).`
+            : `${head}: ${why}${event.unscheduledCount} mutant(s) left out of this report, and ${event.batchesNotStarted} later batch(es) never started. Run with --resume to continue.`,
         );
         break;
       }

@@ -30,7 +30,9 @@
  *   one-shot): `LETHAL_ITEST_V3_TRANSPORT=one-shot|serve-entries`,
  *   `LETHAL_ITEST_V3_SECOND_ECHO=0|1` (serve-entries only), refused by name otherwise
  *   (`v3ItestTransport`); `LETHAL_ITEST_V3_REPORT_DIR=<dir>` writes each session's report as
- *   `<dir>/<leg>.report.json` before any assertion; `LETHAL_ITEST_V3_CONTROL_DIR=<dir>` first
+ *   `<dir>/<leg>.report.json` before any assertion on it (the warning set, the control compare, the leg's tables: R1196,
+ *   `writeReportThenCheck`), so a failing leg keeps its report; a session that throws has none to write;
+ *   `LETHAL_ITEST_V3_CONTROL_DIR=<dir>` first
  *   compares each session per mutant with `<dir>/<leg>.report.json` (the edge one-shot control).
  * - R586c: a build with a per-build pin (`al-runner-v3-pins.ts`, matched on the exact version line
  *   AND sha256) is judged against it; the first line says so. `LETHAL_ITEST_V3_K_ON_CANDIDATE=1`
@@ -63,7 +65,10 @@ import {
 import { MEMORY_HEADROOM_GB_DEFAULT, baselineSampleIds } from "../src/al-runner-v3-baseline-check";
 import { AL_RUNNER_V3_NOT_AUTHORITATIVE } from "../src/al-runner-v3-config";
 import {
+  STOP_GROUPS_FACT,
+  type V3KeepApp,
   V3_CAPABILITY_FACTS,
+  V3_CARRY_FACT,
   runV3ContractProbe,
   v3DefectWarnings,
 } from "../src/al-runner-v3-contract";
@@ -95,7 +100,12 @@ import { AlcCompileError, ArtifactCompiler, defaultArtifactIo } from "../src/art
 import { type RunCliConfig, buildBackend, v3RecheckOf } from "../src/cli";
 import type { EventSubscriber } from "../src/events";
 import { formatFailure } from "../src/format-failure";
-import { BASELINE_TIMEOUT_DEFAULT, type SessionConfig, runSession } from "../src/orchestrator";
+import {
+  BASELINE_TIMEOUT_DEFAULT,
+  SLIM_OPTIONS,
+  type SessionConfig,
+  runSession,
+} from "../src/orchestrator";
 import { effectiveBuildSymbols } from "../src/preprocessor-symbols";
 import { type SpawnFn, defaultSpawn } from "../src/publisher";
 import type { MutantOutcome, SessionReport } from "../src/report";
@@ -149,6 +159,7 @@ import {
   O1_PLAN,
   O1_SEED_CODEUNIT,
   O1_SEED_TEST,
+  type TcSession,
   type V3RowFacts,
   V3_DBI_LEG,
   V3_DBM_LEG,
@@ -162,6 +173,7 @@ import {
   V3_O1_LEG,
   V3_RC_LEG,
   V3_S1E_LEG,
+  V3_TC_LEG,
   V3_WR_KILLERS,
   V3_WR_STATE_NOTES,
   combineO1Sets,
@@ -177,12 +189,14 @@ import {
   judgeRecheckBaseline,
   judgeRecheckLeg,
   judgeStateNotes,
+  judgeTailcutLeg,
   judgeWrArms,
   legKSection,
   moWrTransportRefusal,
   o1CdoApps,
   o1CommitRuns,
   o1LoginWorkDate,
+  o1PartnerLogin,
   v3DefaultLegs,
   v3ItestFailures,
   v3KOnCandidate,
@@ -219,13 +233,14 @@ import {
   settleThrown,
 } from "./gate-warnings";
 import {
-  LAYOUT_MAX_GUARDS,
   LAYOUT_PROJECT_DIR,
   LAYOUT_SELECTOR_IDS,
+  LAYOUT_SESSION_OPTIONS,
   LAYOUT_TEST_DIR,
   assertLayoutRun,
   printLayoutTable,
 } from "./layout-fixture";
+import { writeReportThenCheck } from "./leg-report";
 import { compareMutants, keyOf, normalizeForComparison } from "./mutant-equality";
 import { assertSymbolBuild, printSymbolTable } from "./symbol-fixture";
 import {
@@ -259,6 +274,8 @@ const MULTIOBJECT_BASELINE_PATH = join(HERE, "al-runner-v3.multiobject.baseline.
 const WRAPPED_BASELINE_PATH = join(HERE, "al-runner-v3.wrapped.baseline.json");
 // PR-144: leg RC (the withheld-kill recheck), recorded once under R332 by the owner of the live gate.
 const RECHECK_BASELINE_PATH = join(HERE, "al-runner-v3.recheck.baseline.json");
+// PR-347: leg TC (the refused-cut tail), TC-on's table, recorded once under R332 by the owner of the live gate.
+const TAILCUT_BASELINE_PATH = join(HERE, "al-runner-v3.tailcut.baseline.json");
 // R814: resolved once, so `current` moving during a gate cannot swap the binary under it.
 const BIN = resolveV3Binary(process.env.LETHAL_ALRUNNER_V3_PATH ?? AL_RUNNER_V3_DEFAULT_PATH);
 const CANDIDATE = process.env.LETHAL_ALRUNNER_V3_CANDIDATE === "1";
@@ -323,8 +340,8 @@ const ORACLE_BC_BUILD: Record<string, string> = {
   DB: "bc1 BC 28.4.53241.56590 W1 (bcdev.baseline.json reproduced live, cited)",
   DBI: "bc1 BC 28.4.53241.56590 W1 (bcdev.baseline.json reproduced live, cited)",
   N1: "bc1 BC 28.4.53241.56590 W1 (bcdev.names.baseline.json reproduced live, cited)",
-  D1: "bc3 BC 28.4 W1, Microsoft apps 28.4.53241.56646 (docs/measurements/r594/bc3-A)",
-  D1c: "bc3 BC 28.4 W1, Microsoft apps 28.4.53241.56646 (docs/measurements/r594/bc3-B)",
+  D1: "bc3 BC 28.4 W1, Microsoft apps 28.4.53241.56646 (docs/measurements/r594/bc3-A.default)",
+  D1c: "bc3 BC 28.4 W1, Microsoft apps 28.4.53241.56646 (docs/measurements/r594/bc3-B.default)",
   T: "none (own baseline; BC cross-check suspended)",
 };
 
@@ -445,17 +462,6 @@ async function session(
   // R785: a `LETHAL_ITEST_V3_WORKERS > 1` D-leg run also says how many lanes started; that one code is
   // expected on top of the leg's N = 1 set. Unset (the gate), the pinned set is checked unchanged.
   const pinned = GATE_WARNINGS[`al-runner-v3/${leg}`];
-  if (V3_WORKERS > 1 && cfg.workers !== undefined && !observeRequested()) {
-    assertGateWarnings(
-      "al-runner-v3",
-      leg,
-      gateWarnings.codes(),
-      pinned === undefined ? undefined : [...pinned, "al-runner-v3-lanes-started"],
-      gateWarnings.examples(),
-    );
-    // PR-98: the notice must also report as many lanes as asked, or the leg fails by name.
-    assertLanesStarted(gateWarnings.examples()["al-runner-v3-lanes-started"], V3_WORKERS);
-  } else checkGateWarnings("al-runner-v3", leg, gateWarnings);
   const serveLeg = v3ItestLegTransport(leg, process.env).transport !== undefined;
   if (serveLeg) {
     console.log(`  ${leg}: entries ${JSON.stringify(backend.entriesStats())}`);
@@ -464,10 +470,25 @@ async function session(
   if (serveLeg || REPORT_DIR !== undefined) {
     console.log(`  ${leg}: timings ${JSON.stringify(r.timings)}`);
   }
-  if (REPORT_DIR !== undefined) {
-    await mkdir(REPORT_DIR, { recursive: true });
-    await writeFile(join(REPORT_DIR, `${leg}.report.json`), `${JSON.stringify(r, null, 2)}\n`);
-  }
+  // R1196: the report first, then the warning set, so a leg that fails its warnings still keeps its report.
+  await writeReportThenCheck({
+    leg,
+    report: r,
+    reportDir: REPORT_DIR,
+    check: () => {
+      if (V3_WORKERS > 1 && cfg.workers !== undefined && !observeRequested()) {
+        assertGateWarnings(
+          "al-runner-v3",
+          leg,
+          gateWarnings.codes(),
+          pinned === undefined ? undefined : [...pinned, "al-runner-v3-lanes-started"],
+          gateWarnings.examples(),
+        );
+        // PR-98: the notice must also report as many lanes as asked, or the leg fails by name.
+        assertLanesStarted(gateWarnings.examples()["al-runner-v3-lanes-started"], V3_WORKERS);
+      } else checkGateWarnings("al-runner-v3", leg, gateWarnings);
+    },
+  });
   if (CONTROL_DIR !== undefined) {
     const control = join(CONTROL_DIR, `${leg}.report.json`);
     must(
@@ -613,7 +634,16 @@ async function legC(scratch: string): Promise<readonly string[]> {
     f.startsWith("Microsoft_Library Assert_"),
   );
   const [libraryAssert] = assertApps;
+  // PR-363: the per-family keep apps, built by `scripts/pr363-legc-keep-apps.ts` (run as a script: packages/ cannot import scripts/).
+  const keepDir = join(scratch, "pr363-keep-apps");
+  execFileSync("bun", [join(REPO, "scripts", "pr363-legc-keep-apps.ts"), "--out", keepDir], {
+    encoding: "utf8",
+  });
+  const keepApps = JSON.parse(
+    await readFile(join(keepDir, "manifest.json"), "utf8"),
+  ) as V3KeepApp[];
   const r = await runV3ContractProbe({
+    keepApps,
     alRunnerPath: BIN,
     expectedVersion: (execFileSync(BIN, ["--version"], { encoding: "utf8" }) as string).trim(),
     packagesDir: await microsoftDeps(scratch),
@@ -635,11 +665,19 @@ async function legC(scratch: string): Promise<readonly string[]> {
   // PR-117: the capability readings, for DBM and the receipt (recorded only if DBM batches and passes).
   legCBatchFacts = Object.fromEntries(
     r.facts
-      .filter((f) => (V3_CAPABILITY_FACTS as readonly string[]).includes(f.fact))
+      // PR-340: the carry fact's reading rides beside the eight, and `.gated` records it from here.
+      // PR-342: and `stop-groups`, which PR-256's flag reads from the record.
+      .filter(
+        (f) =>
+          (V3_CAPABILITY_FACTS as readonly string[]).includes(f.fact) ||
+          f.fact === V3_CARRY_FACT ||
+          f.fact === STOP_GROUPS_FACT,
+      )
       .map((f) => [f.fact, f.verdict]),
   );
-  // RC-2 (I-2): a defect fact moving to `gone` is held; any diverged is gate-fail. 36 facts (r13,
-  // R590: 9 defect, 18 contract, 1 warn; PR-114a: 8 capability, each must read matches); a warn fact (V3_WARN_FACTS) only adds its line, except
+  // RC-2 (I-2): a defect fact moving to `gone` is held; any diverged is gate-fail. 38 facts (r13,
+  // R590: 9 defect, 18 contract, 1 warn; PR-114a: 8 capability, each must read matches; PR-340: the
+  // carry fact, which must read matches too; PR-342: stop-groups, whose diverged only adds its line); a warn fact (V3_WARN_FACTS) only adds its line, except
   // `unkept` (R1000), which is gate-fail.
   const c = classifyLegC(
     r.facts,
@@ -672,7 +710,8 @@ const S1E_PINS = {
   // (docs/superpowers/specs/2026-11-14-r987-request-sizing-precommitment.md, master 2c0976bc).
   boundChecks: 4,
   warmups: 1,
-  entriesSent: 48,
+  // PR-209 amendment 9 addendum: 54 (read on current; was 48).
+  entriesSent: 54,
   pairBatchRequests: 1,
   pairBatchStored: 3,
   pairBatchServed: 3,
@@ -729,7 +768,8 @@ async function legS1(
     }
     throw e;
   }
-  assertCounts(r, leg, 3, 14, 5, 22);
+  // PR-209 amendment 9: bcdev.baseline.json's table under the default set (was 3 / 14 / 5 over 22).
+  assertCounts(r, leg, 3, 17, 6, 26);
   await assertPerMutant(r, join(HERE, "bcdev.baseline.json"), leg);
   must(
     r.baselineGreen && r.unsupportedTests.length === 0,
@@ -843,7 +883,7 @@ async function legDBI(scratch: string, version: string): Promise<void> {
     }
     throw e;
   }
-  assertCounts(r, "DBI", 3, 14, 5, 22);
+  assertCounts(r, "DBI", 3, 17, 6, 26); // PR-209 amendment 9 (was 3 / 14 / 5 over 22)
   await assertPerMutant(r, join(HERE, "bcdev.baseline.json"), "DBI");
   must(r.validity.executionContexts[0]?.isolateTests === true, "DBI: the report hides the mode");
   must(tagged(r, V3_STATE_NOTE_TAG).length === 0, "DBI: a state note under --isolate-tests");
@@ -1492,7 +1532,7 @@ async function legISO(scratch: string, version: string): Promise<void> {
     testDir: fixture("sandbox-tests"),
     selectorIds: { selectorId: 79199, controlId: 79198, tableId: 79197 },
   });
-  assertCounts(r, "ISO", 3, 14, 5, 22);
+  assertCounts(r, "ISO", 3, 17, 6, 26); // PR-209 amendment 9 (was 3 / 14 / 5 over 22)
   await assertPerMutant(r, join(HERE, "bcdev.baseline.json"), "ISO");
   must(r.validity.executionContexts[0]?.isolateTests === true, "ISO: the report hides the mode");
   must(tagged(r, V3_STATE_NOTE_TAG).length === 0, "ISO: a state note under --isolate-tests");
@@ -1627,18 +1667,20 @@ async function legO1(scratch: string, version: string): Promise<void> {
       );
     for (const d of stamp()) dates.add(d);
     for (const rq of done) {
-      const reads = rq.entries
-        .filter((e) => e.kind !== "W")
-        .map((e) => {
-          const msgs = rq.lines
-            .filter((l) => l.entry === e.id)
-            .map((l) =>
-              e.kind === "C"
-                ? `${l.status}${l.message ? ` (${l.message})` : ""}`
+      // PR-233: W entries are printed too (test=status), so a refused writer is named in the log, not only in the
+      // failure text (which the receipt and the leg line cut short).
+      const reads = rq.entries.map((e) => {
+        const msgs = rq.lines
+          .filter((l) => l.entry === e.id)
+          .map((l) =>
+            e.kind === "C"
+              ? `${l.status}${l.message ? ` (${l.message})` : ""}`
+              : e.kind === "W"
+                ? `${l.name.slice(l.name.lastIndexOf(".") + 1)}=${l.status}`
                 : (l.message ?? l.status),
-            );
-          return `${e.id}: ${msgs.join(" ")}`;
-        });
+          );
+        return `${e.id}: ${msgs.join(" ")}`;
+      });
       console.log(`  O1: ${rq.label}: ${reads.join(" | ")}`);
     }
     // R771 addendum 2: a pinned build's login WorkDate, for the CDO set only (it holds Base Application).
@@ -1651,7 +1693,13 @@ async function legO1(scratch: string, version: string): Promise<void> {
     console.log(
       `  O1: ${set.name} set: commit kind judged as ${runs ? "runs (pin: commit-under-test-isolation gone)" : "refused (pin does not record commit-under-test-isolation gone)"}`,
     );
-    const j = judgeOrderProbe(done, [...dates], login, runs);
+    // PR-233: the CDO set (the one with partner apps) judges the f9116dc96 row-insert refusal; the own set never does.
+    const partner = o1PartnerLogin(set.name, activePin);
+    if (partner !== undefined)
+      console.log(
+        `  O1: ${set.name} set: partner-login row inserts judged as ${partner.pinned !== undefined ? `refused (pin ${activePin?.id}, ${activePin?.o1?.partnerLoginRefusal?.issue})` : "pass, or held when refused by exactly the f9116dc96 text (no pin field)"}`,
+      );
+    const j = judgeOrderProbe(done, [...dates], login, runs, partner);
     console.log(`  O1: ${set.name} set: ${j.outcome} (${done.length} requests, one daemon)`);
     results.push({ set: set.name, ...j });
   }
@@ -1727,7 +1775,9 @@ function assertCleanLeg(
  * target file's coverage in the batch's EMITTED line numbers, so batch 1 must read it through its own
  * coverage index. It proves both index guards together, `resetLayoutState()` clearing the index AND
  * `deploy()` assigning the new one; removing both (L-R3) turns 1/M0007 and 1/M0008 survived, covered
- * by GrowAboveTen. Removing either alone stays green (R-654 S2 L-R1, L-R2). See
+ * by GrowAboveTen. PR-209: L1 runs under `--profile slim` (LAYOUT_SESSION_OPTIONS), because the default
+ * set's added guard stretches Grow past the verbatim file and breaks the span premise.
+ * Removing either alone stays green (R-654 S2 L-R1, L-R2). See
  * docs/gates/alrunner-v3.md.
  */
 async function legL1(scratch: string): Promise<SessionReport> {
@@ -1743,8 +1793,7 @@ async function legL1(scratch: string): Promise<SessionReport> {
   const r = await session(scratch, b, {
     projectDir: LAYOUT_PROJECT_DIR,
     testDir: LAYOUT_TEST_DIR,
-    selectorIds: LAYOUT_SELECTOR_IDS,
-    maxGuardsPerBatch: LAYOUT_MAX_GUARDS,
+    ...LAYOUT_SESSION_OPTIONS,
   });
   printLayoutTable(r, "L1");
   assertCounts(r, "L1", 8, 3, 0, 11);
@@ -1840,7 +1889,8 @@ async function legMO(scratch: string, serve = false): Promise<SessionReport> {
       ...(serve ? { transport: "serve-entries" as const } : {}),
     }),
   );
-  const r = await session(scratch, b, { projectDir, testDir, selectorIds: ids });
+  // PR-209 amendment 4 (§0e item 3, RULED (b)): MO and MOE run `--profile slim`, so the baseline stays 14 rows.
+  const r = await session(scratch, b, { projectDir, testDir, selectorIds: ids, ...SLIM_OPTIONS });
   assertKillers(r, b, leg, V3_MO_KILLERS);
   assertCounts(r, leg, 7, 1, 6, 14);
   assertCleanLeg(r, b, leg);
@@ -1871,6 +1921,7 @@ async function legRC(scratch: string): Promise<SessionReport> {
         sourceProjectDir: projectDir,
         transport: "serve-entries",
         isolation,
+        refusedCutTail: false, // PR-347: RC measures PR-144's recheck on a cut it cannot make; the tail route is TC's
       }),
     );
   const mainConfig = {
@@ -1918,6 +1969,94 @@ async function legRC(scratch: string): Promise<SessionReport> {
   return r;
 }
 
+/**
+ * PR-347, leg TC: `sandbox-tailcut` on serve-entries, three sessions on the same build (spec
+ * `docs/superpowers/specs/2026-11-23-pr347-refused-cut-tail-default.md`): off (`refusedCutTail: false`), on (the key
+ * absent: the default) and alone (`isolateTests`). Each has its own scratch directory, so GATE_WARNINGS keys on
+ * `TC-off`, `TC-on` and `TC-alone`. `judgeTailcutLeg` runs FIRST, by name; the own-baseline compare (TC-on's table) follows.
+ * Returns TC-on's report.
+ */
+async function legTC(scratch: string): Promise<SessionReport> {
+  const projectDir = fixture("sandbox-tailcut");
+  const testDir = fixture("sandbox-tailcut-tests");
+  const ids = { selectorId: 76149, controlId: 76148, tableId: 76147 };
+  const packagesDir = await microsoftDeps(scratch);
+  const run = async (name: TcSession) => {
+    const dir = join(scratch, name);
+    await mkdir(dir, { recursive: true });
+    const b = new AlRunnerV3Backend(
+      backendCfg({
+        instrumentedDir: join(dir, "backend"),
+        testDir,
+        packagesDir,
+        bcVersion: SANDBOX_BC,
+        selectorObjectId: ids.selectorId,
+        sourceProjectDir: projectDir,
+        transport: "serve-entries",
+        ...(name === "TC-off" ? { refusedCutTail: false } : {}),
+        ...(name === "TC-alone" ? { isolateTests: true } : {}),
+      }),
+    );
+    const tailNotices: string[] = [];
+    const t0Notices: string[] = [];
+    const r = await session(dir, b, { projectDir, testDir, selectorIds: ids, workers: 1 }, (e) => {
+      if (e.type !== "warning") return;
+      if (e.code === "al-runner-v3-refused-cut-tail") tailNotices.push(e.message);
+      if (e.code === "al-runner-v3-baseline-refused-cut") t0Notices.push(e.message);
+    });
+    return { r, b, tailNotices, t0Notices };
+  };
+  const off = await run("TC-off");
+  const on = await run("TC-on");
+  const alone = await run("TC-alone");
+  const t0Evidence = (s: { r: SessionReport; t0Notices: string[] }): string =>
+    `refused at baseline: ${s.r.unsupportedTests.join(", ") || "none"}; ${s.t0Notices.join(" | ") || "no baseline-refused-cut notice"}`;
+  // Recorded, never judged (amendment 3): TC-on's pack stats (PR-344) and each session's `sharingACodeunit`.
+  const packs = on.b.refusedCutTailStats();
+  console.log(
+    `  TC recorded: TC-on pack stats packs ${packs.packs}, failedPacks ${packs.failedPacks}, servedFromPack ${packs.servedFromPack}`,
+  );
+  for (const [name, s] of [
+    ["TC-off", off],
+    ["TC-on", on],
+    ["TC-alone", alone],
+  ] as const)
+    console.log(
+      `  TC recorded: ${name} sharingACodeunit ${s.r.survivorsBesideUnrunTests?.sharingACodeunit ?? "absent"}`,
+    );
+  const notRunOf = (s: { r: SessionReport }) => ({
+    notRunAtBaseline: s.r.notRunAtBaseline,
+    caveat:
+      s.r.survivorsBesideUnrunTests === undefined
+        ? undefined
+        : {
+            survivors: s.r.survivorsBesideUnrunTests.survivors,
+            notRunTests: s.r.survivorsBesideUnrunTests.notRunTests,
+          },
+  });
+  const fails = judgeTailcutLeg({
+    notRun: { "TC-off": notRunOf(off), "TC-on": notRunOf(on), "TC-alone": notRunOf(alone) },
+    rows: { "TC-off": off.r.mutants, "TC-on": on.r.mutants, "TC-alone": alone.r.mutants },
+    cutEntries: {
+      off: off.b.entriesStats().refusedCutEntries,
+      on: on.b.entriesStats().refusedCutEntries,
+    },
+    tailCalls: packs,
+    tailNotices: on.tailNotices,
+    t0Evidence: {
+      off: t0Evidence(off),
+      on: t0Evidence(on),
+    },
+  });
+  for (const f of fails) console.log(`    - ${f}`);
+  const [first] = fails;
+  if (first !== undefined) throw new LegFailure(first);
+  console.log(
+    `  TC: off ${off.r.mutants.filter((m) => m.verdict === "killed").length} killed, on ${on.r.mutants.filter((m) => m.verdict === "killed").length} killed (tail alone calls ${JSON.stringify(on.b.refusedCutTailStats())}), alone ${alone.r.mutants.filter((m) => m.verdict === "killed").length} killed, as pre-committed`,
+  );
+  return on.r;
+}
+
 /** R918: the serve legs' counters, pre-committed in
  *  `docs/superpowers/specs/2026-11-11-r918-moe-wre-precommitment.md` (master e1ca5d11). */
 const MOE_WRE_PINS: Record<"MOE" | "WRE", Readonly<Record<string, number>>> = {
@@ -1935,8 +2074,9 @@ const MOE_WRE_PINS: Record<"MOE" | "WRE", Readonly<Record<string, number>>> = {
     boundChecks: 4, // R987: 3 -> 4 (pre-commitment master 2c0976bc)
     // R975 (R-965 amendment 4): 448 until the 6 twin OnOpenPage mutants read no-coverage and were not sent.
     // R976 (R-973): 436 until the 3 twin OnOpenPage empty-block mutants read no-coverage too.
-    entriesSent: 430,
-    pairRequests: 62,
+    // PR-209 amendment 9: 464 (read on current and alpha.12; was 430) and 64 pair requests, one per WR kill (was 62).
+    entriesSent: 464,
+    pairRequests: 64,
     echoMismatches: 0,
   },
 };
@@ -1963,7 +2103,7 @@ function logServeCounters(b: AlRunnerV3Backend, leg: "MOE" | "WRE"): void {
 
 /**
  * WR (R602): `sandbox-wrapped` whole, config symbol WRAPDEF, coverage ON. 102 mutants (R855: was 98): the 8
- * single-wrapper files score as `none` does (killer constant), and the three `WrappedArms` mutants
+ * single-wrapper files score as `none` does (killer constant), and the four `WrappedArms` mutants (three before PR-209)
  * (the two-arm control, which the index has no rule for) read no-coverage with the refusal sentence.
  * That refusal costs 2 kills `none` finds (M0001, M0003), named, not hidden. Pre-committed 62 / 37 / 3
  * (R855: was 58 / 37 / 3).
@@ -1999,7 +2139,9 @@ async function legWR(scratch: string, serve = false): Promise<SessionReport> {
   must(arms.length === 0, `${leg}: the WrappedArms refusal differs: ${arms.join("; ")}`);
   // R975 (R-965 amendment 2): 6 unwrapped twin OnOpenPage mutants read no-coverage by line attribution;
   // R976 (R-973): their 3 empty-block mutants too (62 / 31 / 9 before).
-  assertCounts(r, leg, 62, 28, 12, 102);
+  // PR-209 (amendments 4 and 6): +14 condition-true rows, the BC twins' 2 killed and 12 survived, except WrappedArms'
+  // new `Pick` row, no-coverage by the refusal (BC: survived): 64 / 39 / 13 over 116, as printed (was 62 / 28 / 12 over 102).
+  assertCounts(r, leg, 64, 39, 13, 116);
   assertCleanLeg(r, b, leg, V3_WR_STATE_NOTES);
   if (serve) logServeCounters(b, "WRE");
   return r;
@@ -2084,7 +2226,7 @@ async function legK(scratch: string): Promise<void> {
     testDir: fixture("sandbox-tests"),
     selectorIds: { selectorId: 79199, controlId: 79198, tableId: 79197 },
   });
-  assertCounts(r, "K", 3, 14, 5, 22);
+  assertCounts(r, "K", 3, 17, 6, 26); // PR-209 amendment 9 (was 3 / 14 / 5 over 22)
   await assertPerMutant(r, join(HERE, "bcdev.baseline.json"), "K");
   const facts = {
     coverage: b.capabilities().coverage,
@@ -2773,9 +2915,11 @@ async function legD(scratch: string, leg: "D1" | "D1c"): Promise<void> {
     testsOnly: ["Src/Recipients/CDORecipientMgtTests.Codeunit.al"],
     dependencyPackageDirs: [join(CDO, "Test", ".alpackages")],
     ...(V3_WORKERS > 1 ? { workers: V3_WORKERS } : {}),
+    // PR-229 (R1139): the default set, judged by the extended oracle (78 mutants: R594's 65 plus `condition-true` and
+    // `blank-argument`'s 13), measured on bc3 (docs/measurements/r594/bc3-{A,B}.default.report.json).
   });
-  if (leg === "D1") assertCounts(r, leg, 53, 12, 0, 65);
-  else assertCounts(r, leg, 53, 8, 4, 65);
+  if (leg === "D1") assertCounts(r, leg, 63, 15, 0, 78);
+  else assertCounts(r, leg, 63, 11, 4, 78);
   await assertPerMutant(
     r,
     join(
@@ -2783,14 +2927,16 @@ async function legD(scratch: string, leg: "D1" | "D1c"): Promise<void> {
       "docs",
       "measurements",
       "r594",
-      leg === "D1" ? "bc3-A.report.json" : "bc3-B.report.json",
+      leg === "D1" ? "bc3-A.default.report.json" : "bc3-B.default.report.json",
     ),
     leg,
   );
+  // PR-229: one state note per killed mutant, as before (53 of 65); measured on PR-229's v3 run of this scope.
   const STATE = [
-    ...Array.from({ length: 30 }, (_, i) => `0/M${String(i + 1).padStart(4, "0")}`),
+    ...Array.from({ length: 33 }, (_, i) => `0/M${String(i + 1).padStart(4, "0")}`),
     ...[
-      35, 36, 37, 38, 39, 41, 44, 45, 46, 47, 48, 49, 51, 52, 53, 54, 55, 56, 58, 60, 61, 62, 63,
+      35, 36, 37, 38, 43, 44, 45, 46, 47, 48, 50, 53, 54, 55, 56, 57, 58, 59, 60, 62, 63, 64, 65,
+      66, 68, 70, 72, 73, 74, 75,
     ].map((n) => `0/M${String(n).padStart(4, "0")}`),
   ].sort();
   const got = tagged(r, V3_STATE_NOTE_TAG);
@@ -2807,7 +2953,7 @@ async function legD(scratch: string, leg: "D1" | "D1c"): Promise<void> {
   must(r.baselineGreen && r.unsupportedTests.length === 0, `${leg}: baseline not green`);
   assertIndex(b, leg, 3, 0);
   assertReproduced(r, leg);
-  assertServeCounters(b, leg, 53);
+  assertServeCounters(b, leg, 63);
 }
 
 /**
@@ -2841,6 +2987,9 @@ async function legT(
     projectDir: fixture("sandbox-data"),
     testDir: fixture("sandbox-data-tests"),
     selectorIds: { selectorId: 79399, controlId: 79398, tableId: 79397 },
+    // PR-307: `Data Tests.PageActionComputesNonZero` is session-kind-sensitive on v3 (the TestPage scan), so the field is
+    // needed; this fixture's gates pin the headless behaviour.
+    ciSessionKind: "headless",
   });
   const bc = (await readGateBaseline(join(HERE, "tables.baseline.json"))).entries;
   const now = normalizeForComparison(r);
@@ -2930,6 +3079,9 @@ async function main(): Promise<void> {
   // PR-144: leg RC refuses at start while its baseline is missing (R332).
   if (LEGS.includes(V3_RC_LEG))
     preflightGateBaseline(RECHECK_BASELINE_PATH, "al-runner-v3 itest leg RC");
+  // PR-347: leg TC refuses at start while its baseline is missing (R332).
+  if (LEGS.includes(V3_TC_LEG))
+    preflightGateBaseline(TAILCUT_BASELINE_PATH, "al-runner-v3 itest leg TC");
   // R918: MOE and WRE compare with the same two files, so they refuse at start without them too.
   if (LEGS.includes("MOE"))
     preflightGateBaseline(MULTIOBJECT_BASELINE_PATH, "al-runner-v3 itest leg MOE");
@@ -2974,6 +3126,7 @@ async function main(): Promise<void> {
     ["MO", MULTIOBJECT_BASELINE_PATH],
     ["WR", WRAPPED_BASELINE_PATH],
     [V3_RC_LEG, RECHECK_BASELINE_PATH],
+    [V3_TC_LEG, TAILCUT_BASELINE_PATH],
   ]);
   const recordPaths = LEGS.flatMap((l) => {
     const p = recordBaselines.get(l);
@@ -3102,6 +3255,22 @@ async function main(): Promise<void> {
           } catch (e) {
             if (e instanceof BaselineRecordedError) throw e;
             throw new LegFailure(`RC: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        } else if (leg === V3_TC_LEG) {
+          // PR-347: the pre-committed three tables ran inside the leg (nothing is written on a difference); then
+          // the own-baseline compare (TC-on's table), which a record run writes (R332).
+          const r = await legTC(scratch);
+          try {
+            await assertGateBaseline(
+              r,
+              TAILCUT_BASELINE_PATH,
+              "al-runner-v3 itest leg TC",
+              process.env,
+              pinnedRecord(),
+            );
+          } catch (e) {
+            if (e instanceof BaselineRecordedError) throw e;
+            throw new LegFailure(`TC: ${e instanceof Error ? e.message : String(e)}`);
           }
         } else if (leg === "MOE") {
           // R918: the serve legs, compared with the ONE-SHOT legs' frozen baselines and never

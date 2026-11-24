@@ -48,20 +48,11 @@ export const SLEEPER_AL = `codeunit 79000 "Logic"
     end;
 }
 `;
-const testAl = `codeunit ${CU} "Tests${CU}"
+/** PR-250: the test codeunit with `methods` (default A and B). */
+const testAlOf = (methods: readonly string[]) => `codeunit ${CU} "Tests${CU}"
 {
     Subtype = Test;
-
-    [Test]
-    procedure A()
-    begin
-    end;
-
-    [Test]
-    procedure B()
-    begin
-    end;
-}
+${methods.map((m) => `\n    [Test]\n    procedure ${m}()\n    begin\n    end;\n`).join("")}}
 `;
 
 export interface FakeRow {
@@ -123,6 +114,12 @@ export interface Req {
   readonly mutants: string[];
   /** PR-99 test 10: the request carried `runSelectedOnly: true` (PR-94). */
   readonly selectedOnly: boolean;
+  /** PR-250: each entry's `excludeTests`, by entry id (absent: none). */
+  readonly excludes: Record<string, readonly string[]>;
+  /** PR-297: each non-echo entry's `test` (`Codeunit<n>.` whole, `Codeunit<n>.<Method>` one test alone). */
+  readonly tests: string[];
+  /** PR-250 (`honorExcludes`): excluded tests that RAN with their rows hidden (an unflagged request, R1094). */
+  readonly hiddenRan: string[];
 }
 
 export interface ServeCtl {
@@ -133,11 +130,18 @@ export interface ServeCtl {
   echo?: (m: string, daemon: number, n: number) => FakeRow;
   /** PR-98: the fake child's pid for daemon `d`; absent (as in a real fake) unless a test asks. */
   pid?: (daemon: number) => number;
+  /**
+   * PR-250: leave out the rows of an entry's `excludeTests`, by prefix as v3 does (default: rows as `rows`
+   * gives). With `runSelectedOnly` they do not run; without it they run hidden (`Req.hiddenRan`).
+   */
+  honorExcludes?: boolean;
 }
 
 function fakeServe(ctl: ServeCtl) {
   const daemons: string[][] = [];
   const requests: Req[] = [];
+  /** PR-256: each request's line as sent, by the index of `requests`. */
+  const bodies: string[] = [];
   const closes: number[] = [];
   const cwds: (string | undefined)[] = [];
   const spawn: ServerSpawnFn = (argv, opts) => {
@@ -174,9 +178,34 @@ function fakeServe(ctl: ServeCtl) {
             ids: entries.map((e) => String(e.id)),
             mutants,
             selectedOnly: body.runSelectedOnly === true,
+            excludes: Object.fromEntries(
+              entries
+                .filter((e) => Array.isArray(e.excludeTests))
+                .map((e) => [String(e.id), (e.excludeTests as string[]).map(String)]),
+            ),
+            tests: entries
+              .filter((e) => !String(e.id).endsWith("|echo"))
+              .map((e) => String(e.test)),
+            hiddenRan: [],
           };
           requests.push(req);
-          const cuOf = (t: unknown) => Number(/^Codeunit(\d+)\.$/.exec(String(t))?.[1]);
+          bodies.push(line);
+          // PR-256: upstream's stop (PR-257): with `stopAfterFirstFailure`, after the first failing row of a
+          // `stopGroup`, that group's later tests do not run and answer the pinned skip row.
+          const stop = body.stopAfterFirstFailure === true;
+          const failedIn = new Map<string, string>();
+          const stopped = (group: unknown, cu: number, r: FakeRow): FakeRow => {
+            if (!stop || typeof group !== "string") return r;
+            const f = failedIn.get(group);
+            if (f !== undefined)
+              return { method: r.method, status: "error", notRun: true, message: stopSkipText(f) };
+            if (r.status === "fail" && r.notRun !== true)
+              failedIn.set(group, `Codeunit${cu}.${r.method}`);
+            return r;
+          };
+          const cuOf = (t: unknown) => Number(/^Codeunit(\d+)\./.exec(String(t))?.[1]);
+          // PR-297: `Codeunit<n>.<Method>` selects that one test (an alone request); `Codeunit<n>.` the whole codeunit
+          const methodOf = (t: unknown) => /^Codeunit\d+\.(.+)$/.exec(String(t))?.[1];
           const lines: Record<string, unknown>[] = [];
           const sums = { passed: 0, failed: 0, errors: 0, notRun: 0, total: 0 };
           const count = (rs: FakeRow[]) => {
@@ -213,9 +242,23 @@ function fakeServe(ctl: ServeCtl) {
                       message: `LETHAL-ECHO:${m}:true`,
                     },
                   ]
-                : ctl.rows(m, cu, daemon, n);
-            for (const r of rs) lines.push(testLine(cu, r, String(e.id)));
-            per.push({ type: "entrySummary", entry: e.id, ...count(rs) });
+                : ctl.rows(m, cu, daemon, n).filter((r) => {
+                    const only = methodOf(e.test);
+                    if (only !== undefined && r.method.toLowerCase() !== only.toLowerCase())
+                      return false;
+                    const name = `Codeunit${cu}.${r.method}`;
+                    const out =
+                      ctl.honorExcludes === true &&
+                      (req.excludes[String(e.id)] ?? []).some((x) =>
+                        name.toLowerCase().startsWith(x.toLowerCase()),
+                      );
+                    // R1094: unflagged, v3 still RUNS an excluded test and only hides its row
+                    if (out && !req.selectedOnly) req.hiddenRan.push(name);
+                    return !out;
+                  });
+            const shown = rs.map((r) => stopped(e.stopGroup, cu, r)); // PR-256
+            for (const r of shown) lines.push(testLine(cu, r, String(e.id)));
+            per.push({ type: "entrySummary", entry: e.id, ...count(shown) });
           }
           lines.push(...per);
           const cached = [...selected].every((c) => compiled.has(c));
@@ -231,8 +274,12 @@ function fakeServe(ctl: ServeCtl) {
     };
     return handle;
   };
-  return { spawn, daemons, requests, closes, cwds };
+  return { spawn, daemons, requests, bodies, closes, cwds };
 }
+
+/** PR-256: upstream's skip row text (PR-257, measured), naming the test `failed` (`Codeunit<n>.<Method>`). */
+export const stopSkipText = (failed: string): string =>
+  `NotRun: out-of-scope: the test ${failed} failed before it, and stopAfterFirstFailure (--stop-after-first-failure) runs no test of its codeunit or of a later entry of its group`;
 
 function fakeOneShot(rows: RowsFn) {
   const calls: string[][] = [];
@@ -244,6 +291,9 @@ function fakeOneShot(rows: RowsFn) {
       method: r.method,
       name: `Codeunit${cu}.${r.method}`,
       status: r.status,
+      // PR-250: a refusal's text and notRun, as v3 writes them
+      ...(r.message !== undefined ? { message: r.message } : {}),
+      ...(r.notRun === true ? { notRun: true } : {}),
     }));
     return { exitCode: 0, stdout: JSON.stringify({ tests }), stderr: "" };
   };
@@ -281,6 +331,8 @@ export interface LanesRig {
   readonly serve: ReturnType<typeof fakeServe>;
   readonly one: ReturnType<typeof fakeOneShot>;
   readonly notices: string[];
+  /** PR-250: the test codeunit's tests (`SUITE` unless `methods` was given). */
+  readonly suite: readonly TestMethodRef[];
   /** `rm -rf` of the scratch root. */
   dispose(): Promise<void>;
 }
@@ -299,8 +351,19 @@ export async function lanesRig(
     afterLaneCopy?: (dir: string) => Promise<void>;
     /** R778: turn the kill-pair batch ON (default off: these tests measure today's per-kill pair). */
     pairBatch?: boolean;
+    /** PR-241: the pack cap (the backend's `packEntries` option; the env var is not read when set). */
+    packEntries?: number;
+    /** PR-250: the test codeunit's methods, in order (default A and B). */
+    methods?: readonly string[];
+    /** PR-297: `alRunnerV3.refusedCutTail`. */
+    refusedCutTail?: boolean;
+    /** PR-256: `alRunnerV3.stopGroups` (true, false or absent). */
+    stopGroups?: boolean;
+    /** PR-256: the `stop-groups` build fact (the seam; default: present when `stopGroups` is true). */
+    stopGroupsFact?: boolean;
   } = {},
 ): Promise<LanesRig> {
+  const suite = o.methods === undefined ? SUITE : o.methods.map(ref);
   await initParser();
   const root = await mkdtemp(join(tmpdir(), "lethal-v3lanes-"));
   rigRoots.push(root);
@@ -331,7 +394,7 @@ export async function lanesRig(
     join(testDir, "app.json"),
     JSON.stringify({ id: "ff7935bb-9fe2-4f7a-adf3-aa7132a41fe7", name: "Tests" }),
   );
-  await writeFile(join(testDir, `Tests${CU}.Codeunit.al`), testAl);
+  await writeFile(join(testDir, `Tests${CU}.Codeunit.al`), testAlOf(suite.map((t) => t.method)));
   const NS = 'xmlns="http://schemas.microsoft.com/navx/2015/manifest"';
   await writeFile(
     join(deps, "Microsoft_System.app"),
@@ -355,6 +418,9 @@ export async function lanesRig(
       alcPath: "/fake/alc",
       coverage: "none",
       transport: "serve-entries",
+      ...(o.packEntries !== undefined ? { packEntries: o.packEntries } : {}),
+      ...(o.refusedCutTail !== undefined ? { refusedCutTail: o.refusedCutTail } : {}), // PR-347: `false` is passed too
+      ...(o.stopGroups !== undefined ? { stopGroups: o.stopGroups } : {}),
     },
     one.spawn,
     fakeAlc(),
@@ -363,12 +429,14 @@ export async function lanesRig(
   const notices: string[] = [];
   b.setNotify((code, message) => notices.push(`${code}: ${message}`));
   b.seams.sleepRuleRetired = true;
+  if (o.stopGroupsFact !== undefined || o.stopGroups === true)
+    b.seams.stopGroupsFact = o.stopGroupsFact ?? true;
   // R778: these tests measure today's per-kill pair; the batch has its own tests.
   (b as unknown as { pairBatch: boolean }).pairBatch = o.pairBatch === true;
   if (o.afterLaneCopy !== undefined) b.seams.afterLaneCopy = o.afterLaneCopy;
   b.useBuildSymbols([]);
-  b.useDiscoveredTests(SUITE);
-  b.useSessionTests(SUITE);
+  b.useDiscoveredTests(suite);
+  b.useSessionTests(suite);
   b.useMutantBudgetFloor(1000, 1000);
   const views = o.lanes === 0 ? [] : b.lanes(o.lanes ?? 3);
   await b.deploy(batch);
@@ -381,6 +449,7 @@ export async function lanesRig(
     serve,
     one,
     notices,
+    suite,
     dispose: () => rm(root, { recursive: true, force: true }),
   };
 }
@@ -392,7 +461,7 @@ export async function laneBaseline(r: LanesRig): Promise<void> {
   r.b.baselinePhase(true);
   try {
     await v0.activate(null);
-    for (const t of SUITE) await v0.run(t, OPTS);
+    for (const t of r.suite) await v0.run(t, OPTS);
   } finally {
     r.b.baselinePhase(false);
   }

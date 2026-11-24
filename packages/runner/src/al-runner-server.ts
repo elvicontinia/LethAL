@@ -63,9 +63,12 @@
  *   (measured on 2.11.0, R319); the symbols are start-time flags, see the constructor.
  */
 
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { V3_TIMEOUT_MESSAGE, isV3RefusalText } from "./al-runner-rows";
 import type { EntriesAnswer } from "./al-runner-v3-entries";
 import { checkRunSeed, mergeChildEnv } from "./al-runner-v3-seed";
+import { monoNow } from "./clock";
 
 /** One `compilationErrors` entry, from the one-shot envelope or the `--server` summary. Moved
  *  here from `al-runner-transport.ts` by R654 S1, because the daemon (which v3 keeps) decodes it. */
@@ -234,7 +237,7 @@ export class LineReader {
    */
   /** `capMs` is the timer cap; only a test lowers it, to reach "capped timer fired early". */
   async next(deadlineMs: number, capMs: number = MAX_TIMER_MS): Promise<ReadLineOutcome> {
-    const deadline = Date.now() + deadlineMs;
+    const deadline = monoNow() + deadlineMs;
     for (;;) {
       const nl = this.buf.indexOf("\n");
       if (nl >= 0) {
@@ -251,7 +254,7 @@ export class LineReader {
         this.buf = "";
       }
       if (this.done) return { kind: "eof" };
-      const remaining = deadline - Date.now();
+      const remaining = deadline - monoNow();
       if (remaining <= 0) return { kind: "timeout" };
       let timer: ReturnType<typeof setTimeout> | undefined;
       // The read stays pending across a capped timer, so no chunk is ever dropped.
@@ -338,7 +341,15 @@ export class AlRunnerServer {
     private readonly preprocessorSymbols: readonly string[] = [],
     /** R612: v2's daemon is `--server`; v3's is `serve` (the update gate's `serve-keep-reasons`). */
     private readonly subcommand: "--server" | "serve" = "--server",
+    /**
+     * PR-227 (`alRunnerV3.daemonStderrDir`): the file that gets this daemon's FULL stderr, named once
+     * the pid is known. Absent: nothing is written (the 64 KB tail above is kept either way).
+     */
+    private readonly stderrFileFor?: (pid: number | undefined) => string,
   ) {}
+
+  /** PR-227: the file this daemon's stderr goes to, when one is named and still writable. */
+  private stderrFile: string | undefined;
 
   /**
    * Spawns the daemon and waits for its readiness line.
@@ -371,6 +382,16 @@ export class AlRunnerServer {
     ];
     const proc = this.spawn(argv);
     this.proc = proc;
+    if (this.stderrFileFor !== undefined) {
+      const file = this.stderrFileFor(proc.pid);
+      try {
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, "");
+        this.stderrFile = file;
+      } catch (err) {
+        console.warn(`[lethal] daemon stderr not written to ${file}: ${String(err)} (PR-227)`);
+      }
+    }
     this.stdout = new LineReader(proc.stdout);
     this.stderrPump = this.pumpStderr(proc.stderr);
 
@@ -410,6 +431,17 @@ export class AlRunnerServer {
         const next = await it.next();
         if (next.done === true) return;
         const value = next.value;
+        if (this.stderrFile !== undefined) {
+          try {
+            // ponytail: a sync append per chunk (measurement runs only); a write stream if a chatty daemon ever shows the cost
+            appendFileSync(this.stderrFile, value);
+          } catch (err) {
+            console.warn(
+              `[lethal] daemon stderr no longer written to ${this.stderrFile}: ${String(err)} (PR-227)`,
+            );
+            this.stderrFile = undefined;
+          }
+        }
         this.stderrText += decoder.decode(value, { stream: true });
         if (this.stderrText.length > STDERR_KEEP_BYTES) {
           this.stderrText = this.stderrText.slice(-STDERR_KEEP_BYTES);
@@ -454,9 +486,9 @@ export class AlRunnerServer {
     );
 
     const tests: ServerTestLine[] = [];
-    const deadline = Date.now() + deadlineMs;
+    const deadline = monoNow() + deadlineMs;
     for (;;) {
-      const remaining = deadline - Date.now();
+      const remaining = deadline - monoNow();
       if (remaining <= 0) {
         throw new Error(
           `al-runner --server: no summary line within ${deadlineMs} ms (${tests.length} test line(s) seen). stderr tail: ${this.stderrTail(600)}`,
@@ -539,14 +571,14 @@ export class AlRunnerServer {
     proc.write(`${JSON.stringify(body)}\n`);
     const tests: Record<string, unknown>[] = [];
     const entrySummaries: Record<string, unknown>[] = [];
-    const deadline = Date.now() + deadlineMs;
+    const deadline = monoNow() + deadlineMs;
     const fail = (kind: AlRunnerServerRequestError["kind"], why: string) =>
       new AlRunnerServerRequestError(
         kind,
         `${why} (${tests.length} test line(s) seen). stderr tail: ${this.stderrTail(600)}`,
       );
     for (;;) {
-      const remaining = deadline - Date.now();
+      const remaining = deadline - monoNow();
       const next = remaining <= 0 ? ({ kind: "timeout" } as const) : await stdout.next(remaining);
       if (next.kind === "timeout")
         throw fail("deadline", `no summary line within ${deadlineMs} ms`);
@@ -614,6 +646,19 @@ export class AlRunnerServer {
       proc.kill();
     } catch {
       // Already exited.
+    }
+    // PR-227: with a stderr file, let the pump read what is still in the pipe (a crash text, the last
+    // counters) before ending it below, so the file holds the FULL stderr. Bounded like the waits below.
+    // Without a file nothing changes.
+    if (this.stderrFile !== undefined) {
+      await Promise.race([
+        proc.wait?.().catch(() => undefined) ?? Promise.resolve(),
+        new Promise<void>((r) => setTimeout(r, 5000)),
+      ]);
+      await Promise.race([
+        this.stderrPump ?? Promise.resolve(),
+        new Promise<void>((r) => setTimeout(r, 1000)),
+      ]);
     }
     // END the stderr drain rather than merely waiting for it. Killing the child usually closes the
     // pipe, but "usually" leaves an outstanding read holding the event loop open, and a completed
@@ -807,6 +852,9 @@ const PR56_SLOTS: Readonly<Record<string, string>> = {
   // PR-195 (spec 2026-11-19-pr195-y2-collation-keep-precommitment.md): the two code points DO's codeunit 68986 meets under the
   // four toggle-blank-string mutants of `IsAsciiAlphaNumeric`, each by name (U+516C CJK, U+041A Cyrillic). No code-point pattern.
   COLLCHAR: "(?:516C|041A)",
+  // PR-354 (spec 2026-11-22-pr354-saveas-layout-keep.md): the four inner errors c2 and t1 met in a SaveAs of report
+  // "Standard Statement", each by name (BaseApp texts). Only the payment reference varies, and only as 15 digits.
+  SAVEASSTMTERR: String.raw`(?:Start Date must have a value\.|End Date must have a value\.|Start date must be earlier than End date\.|The payment reference must be unique\. Payment reference \d{15} already exists\.)`,
 };
 /** PR-56: an anchored entry from a text (after "NotRun: out-of-scope: ") with `%SLOT%` placeholders. */
 const pr56Entry = (template: string): RegExp =>
@@ -846,6 +894,13 @@ const PR56_KEPT: ReadonlyArray<readonly [string, string]> = [
     "company-table-read",
     "%COMPANYM% on the Company table: the database may hold companies this runtime does not know (ADR-046 decision 4a)",
   ], // PR-54 class "* on the Company table"
+  [
+    // PR-217 (pre-commitment master f24ed4448): the SAME class as upstream words it after edge-4ebfe7913 (records.rs:751 at
+    // 0e6397742 and c5861dcd9), exact; kept by the kept-vs-fresh DO check on perf-combined (/coord/handoff/PR-217/keepcheck/,
+    // 2026-11-19 22:06Z: the new text in all 28 requests, 156 rows, one kept daemon; 28 of 28 equal to fresh; self-test caught).
+    "company-table-read-named",
+    "%COMPANYM% on the Company table: the database may hold companies this runtime does not know; name them with --companies NAME[,NAME...] (serve: the `companies` field); `all` needs test data (ADR-046 decision 4a)",
+  ],
   [
     "license-permission",
     "License Permission: only a count that names one object by type and number, or one object type with a license loaded, is served",
@@ -1174,6 +1229,38 @@ const PR56_KEPT: ReadonlyArray<readonly [string, string]> = [
   // the same code points from another operation (a key or record ordering); in DO only codeunit 68986 holds such characters.
   // Pinned by `al-runner-serve-pr195.test.ts`.
   ["collation-no-weight-measured", "ordering of the character U+%COLLCHAR% (no collation weight)"],
+  // PR-354 (spec 2026-11-22-pr354-saveas-layout-keep.md, R1184): the SaveAs-with-layout refusal, 89 of c2's 146 refusal
+  // closes. One row per measured report, each with only the inner errors measured with it (census of c2 and t1:
+  // /coord/handoff/PR-354/census.txt). Kept by the kept-vs-fresh DO check of its spec section 3
+  // (/coord/handoff/PR-354/keepcheck/, main-bf3a3e863, 2026-11-22): 14 requests, every text met on ONE kept daemon (the
+  // payment-reference one at baseline, codeunit 68996), then a request with no mutant after each and one over all six codeunits;
+  // 14 of 14 equal to fresh daemons; the planted-difference self-test caught.
+  // Pinned by `pr354-saveas-keep.test.ts`.
+  [
+    "saveas-layout-statement",
+    'an error in a SaveAs of report "Standard Statement", which has a layout of this kind or an extension (whether SaveAs raises it or answers false is not pinned): %SAVEASSTMTERR%',
+  ],
+  [
+    "saveas-layout-sales-invoice",
+    'an error in a SaveAs of report "Standard Sales - Invoice", which has a layout of this kind or an extension (whether SaveAs raises it or answers false is not pinned): Tests cannot call the Commit function if TransactionModel property is set to AutoRollback.',
+  ],
+  // PR-365 (spec 2026-11-23-pr365-relationfieldno-keep.md, R1187): upstream 1bea5bc7a's refusal of Field.RelationFieldNo for a
+  // TableRelation without a field of an unmeasured shape, refused at BASELINE in 7 DO test runs. Unkept, PR-250 cut each
+  // codeunit's entry before it, leaving 1,504 of c3's mutants `error`. One exact row per measured (field, table) pair, BaseApp
+  // names; no slot, so a fourth pair or a reworded text still closes. Landed on the orchestrator's ruling of 2026-11-23 after the
+  // kept-vs-fresh DO check: A and B equal; C's 10 differences each `error` from 1bea5bc7a's out-of-scope withholding.
+  [
+    "relation-field-no-dimension-set-entry-dimension-code",
+    "the value of field 'RelationFieldNo' of platform table 'Field' is not known for field 'Dimension Code' of table 'Dimension Set Entry', a TableRelation without a field of a shape not measured: no corpus test pins it (docs/probes-needed.md)",
+  ],
+  [
+    "relation-field-no-sales-invoice-header-ship-to-post-code",
+    "the value of field 'RelationFieldNo' of platform table 'Field' is not known for field 'Ship-to Post Code' of table 'Sales Invoice Header', a TableRelation without a field of a shape not measured: no corpus test pins it (docs/probes-needed.md)",
+  ],
+  [
+    "relation-field-no-sales-invoice-header-dimension-set-id",
+    "the value of field 'RelationFieldNo' of platform table 'Field' is not known for field 'Dimension Set ID' of table 'Sales Invoice Header', a TableRelation without a field of a shape not measured: no corpus test pins it (docs/probes-needed.md)",
+  ],
 ];
 export const V3_SERVE_SAFE_REFUSALS: Readonly<Record<string, RegExp>> = {
   ...Object.fromEntries(PR56_KEPT.map(([name, text]) => [name, pr56Entry(text)])),
@@ -1227,8 +1314,9 @@ export const V3_SERVE_SAFE_REFUSALS: Readonly<Record<string, RegExp>> = {
    * (Module scope, isolation "test", coverage off); the basis is R-937's finding that nothing crosses
    * requests under any isolation. The cascade's test name, a name with no comma, is its only variable part.
    */
+  // PR-217: also upstream's wording after edge-4ebfe7913, exactly (the clause is optional and literal, nothing looser).
   "company-findset":
-    /^NotRun: out-of-scope: FindSet on the Company table: the database may hold companies this runtime does not know \(ADR-046 decision 4a\)$/,
+    /^NotRun: out-of-scope: FindSet on the Company table: the database may hold companies this runtime does not know(?:; name them with --companies NAME\[,NAME\.\.\.\] \(serve: the `companies` field\); `all` needs test data)? \(ADR-046 decision 4a\)$/,
   /**
    * R1000 (coord R-989): edge-847b1fa5a split the text by kind and names the object: "changed number
    * sequence '<name>' ... (only a new NumberSequence.Insert is)" and "changed isolated storage key
@@ -1358,6 +1446,85 @@ export const V3_SERVE_SAFE_REFUSALS: Readonly<Record<string, RegExp>> = {
   "caption-no-source-table":
     /^NotRun: out-of-scope: the caption of a page with DataCaptionExpression and no source table \(not pinned\)$/,
 };
+
+/** PR-244: lowercase words of 3+ letters or digits, not all digits. */
+function nearMissWords(s: string): Set<string> {
+  return new Set(
+    s
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((w) => w.length >= 3 && !/^\d+$/.test(w)),
+  );
+}
+
+/**
+ * PR-244: the literal words of each keep entry's regex, derived once, on first use. Both branches of an alternation
+ * count, so an entry such as `http`, `commit` or `dotnet-exception` has more words than any one text of it holds: a
+ * reworded text of one branch may stay under 0.8 and is then left to the restart-storm backstop.
+ */
+let keepEntryWords: [string, Set<string>][] | undefined;
+function keepWords(): [string, Set<string>][] {
+  keepEntryWords ??= Object.entries(V3_SERVE_SAFE_REFUSALS).map(([name, re]) => {
+    const literal = re.source
+      .replace(
+        /\\[sSdDwW]|\\(.)|\[[^\]]*\]|\(\?:|\{\d+(?:,\d*)?\}|[()|?*+^$]/g,
+        (_m, esc: string | undefined) => (esc !== undefined ? esc : " "),
+      )
+      .replace("NotRun: out-of-scope: ", "");
+    return [name, nearMissWords(literal)];
+  });
+  return keepEntryWords;
+}
+
+/**
+ * PR-244: for a refusal text that no keep entry matches, the keep entry whose literal words it holds
+ * at least 80% of (entries of 8+ words only): a reworded kept refusal. `undefined` for a kept text
+ * or when no entry is close. Warning only: it never changes a keep decision.
+ */
+export function keepNearMiss(
+  text: string,
+): { readonly entry: string; readonly found: number; readonly size: number } | undefined {
+  if (Object.values(V3_SERVE_SAFE_REFUSALS).some((re) => re.test(text))) return undefined;
+  const have = nearMissWords(text.replace(/^NotRun: out-of-scope: /, ""));
+  let best: { entry: string; found: number; size: number } | undefined;
+  for (const [entry, words] of keepWords()) {
+    // PR-244 amendment 2: entries of at least 7 literal words (`yaml-list-indent` has 7).
+    if (words.size < 7) continue;
+    let found = 0;
+    for (const w of words) if (have.has(w)) found += 1;
+    if (
+      found / words.size >= 0.8 &&
+      (best === undefined || found / words.size > best.found / best.size)
+    )
+      best = { entry, found, size: words.size };
+  }
+  return best;
+}
+
+/** PR-244 (pre-committed): unmeasured variants of kept classes, shown once as known, never as the warning. */
+export const KNOWN_NEAR_MISS_VARIANTS: readonly {
+  readonly entry: string;
+  readonly contains: string;
+  readonly why: string;
+}[] = [
+  {
+    entry: "report-parameters-no-xml-declaration",
+    contains: "given to Report.RunRequestPage",
+    why: "an unmeasured report method of a kept class",
+  },
+  {
+    entry: "cascade-manual-binding",
+    contains: "An error was expected inside an ASSERTERROR",
+    why: "an unmeasured cascade tail of a kept class",
+  },
+];
+
+export function knownNearMissVariant(
+  entry: string,
+  text: string,
+): (typeof KNOWN_NEAR_MISS_VARIANTS)[number] | undefined {
+  return KNOWN_NEAR_MISS_VARIANTS.find((v) => v.entry === entry && text.includes(v.contains));
+}
 
 /** R612: which close rule a `--server`/`serve` daemon follows. Chosen by the backend that owns
  *  the daemon, never from the rows. */

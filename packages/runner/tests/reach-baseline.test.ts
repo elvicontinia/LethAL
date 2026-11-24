@@ -15,13 +15,14 @@ import {
 } from "@lethal/schemata";
 import type { TestMethodRef, TestVerdict } from "../src/backend";
 import { fileLineMapEntries, objectIdentityOf, resolveFileLine } from "../src/line-map";
-import { testKeyOf } from "../src/selection";
 import {
+  SLIM_OPTIONS,
   baselineReachOf,
   generateMutationSet,
   operatorTiers,
   reachFromBaseline,
 } from "../src/orchestrator";
+import { testKeyOf } from "../src/selection";
 
 const REPO = resolve(import.meta.dir, "../../..");
 const tierOf: TierResolver = (name) => operatorTiers.get(name);
@@ -43,7 +44,8 @@ interface Instrumented {
 }
 
 async function instrumentDir(dir: string): Promise<Instrumented[]> {
-  const set = await generateMutationSet(dir, { emit: () => {} });
+  // PR-209: the hash pinned for R926 is the OLD default set's (`--profile slim`); it pins the emitter.
+  const set = await generateMutationSet(dir, { ...SLIM_OPTIONS, emit: () => {} });
   const out: Instrumented[] = [];
   for (const f of set.files) {
     const deduped = dedupeSpecs(f.specs, tierOf);
@@ -170,9 +172,7 @@ describe("R926: reachLine is in the coverage frame", () => {
 `);
     const linesAt = (start: string) =>
       new Set(
-        [...b.stmt]
-          .filter(([, s]) => b.source.startsWith(start, s))
-          .map(([id]) => b.lines.get(id)),
+        [...b.stmt].filter(([, s]) => b.source.startsWith(start, s)).map(([id]) => b.lines.get(id)),
       );
     const guard = linesAt("if N > 5");
     const inner = linesAt("I := 7");
@@ -272,7 +272,8 @@ describe("R926: the emitted text is byte-identical", () => {
   test("hash of the instrumented fixtures, and instrumentOneFile equals emitOneFile", async () => {
     const hash = new Bun.CryptoHasher("sha256");
     for (const rel of ["fixtures/sandbox-app", "fixtures/sandbox-multiobject"]) {
-      const set = await generateMutationSet(join(REPO, rel), { emit: () => {} });
+      // PR-209: the pinned hash is the OLD default set's (`--profile slim`); it pins the emitter.
+      const set = await generateMutationSet(join(REPO, rel), { ...SLIM_OPTIONS, emit: () => {} });
       for (const f of set.files) {
         const deduped = dedupeSpecs(f.specs, tierOf);
         const ided = assignMutantIds(new Map([[f.path, deduped]])).get(f.path) ?? [];
@@ -398,5 +399,32 @@ describe("R926: only a complete set of passing baseline coverages decides", () =
     expect(reachFromBaseline(site, [], evidence, () => "test")).toBeUndefined();
     const { reachLine: _line, ...noLine } = site;
     expect(reachFromBaseline(noLine, [a], evidence, () => "test")).toBeUndefined();
+  });
+});
+
+// PR-235 T-e: the negative control for the unbatched baseline (LETHAL_V3_BASELINE_BATCHING=off). Its rows carry
+// each test's OWN coverage, so a site gets exactly the tests that hit its line: no union, no line shift.
+describe("PR-235 attribution control (not the knob): per-test rows give exact reach, with no union attribution and no line shift", () => {
+  const a = ref("ATest");
+  const b = ref("BTest");
+  const modes = { isolationOf: () => "test" as const };
+  const rows = [
+    { ref: a, verdict: verdict(a, "pass", [5]) }, // A reaches line 5 only
+    { ref: b, verdict: verdict(b, "pass", [6]) }, // B reaches the NEXT line only
+  ];
+  const evidence = baselineReachOf(rows, new Set([a, b]), modes);
+
+  test("a statement-grain site on line 5 is reached by exactly [A]", () => {
+    expect(reachFromBaseline(site, [a, b], evidence, () => "test")).toEqual({
+      guardReached: true,
+      reachedBy: ["Sandbox Tests.ATest"],
+    });
+  });
+
+  test("a statement-grain site on the next line (6) is reached by exactly [B]", () => {
+    expect(reachFromBaseline({ ...site, reachLine: 6 }, [a, b], evidence, () => "test")).toEqual({
+      guardReached: true,
+      reachedBy: ["Sandbox Tests.BTest"],
+    });
   });
 });
