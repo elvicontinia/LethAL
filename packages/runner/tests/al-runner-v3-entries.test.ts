@@ -3,7 +3,7 @@
 // docs/superpowers/plans/2026-10-22-r635-v3-serve-entries.md (r3) §9, tests 1-13 and 16-21; the
 // orchestrator's seams (tests 14, 15) are in orchestrator.test.ts. Call counters, no wall clock.
 import { afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import {
   appendFile,
   mkdir,
@@ -36,6 +36,7 @@ import {
   AL_RUNNER_V3_VERSION,
   AlRunnerV3AutoMethodOneShotRefusedError,
   AlRunnerV3Backend,
+  AlRunnerV3BaselineBatchingKnobRefusedError,
   AlRunnerV3BaselineUniformlyRefusedError,
   type AlRunnerV3Config,
   AlRunnerV3DependencyMissingError,
@@ -47,6 +48,8 @@ import {
   AlRunnerV3ServeStopUnsetError,
   AlRunnerV3TransportFrozenError,
   AlRunnerV3UnprovenBatchError,
+  BASELINE_BATCHING_ENV,
+  COST_READINGS_KEPT,
   ISOLATED_BASELINE_PROCESSES,
   MEMORY_WATCH_OVER_TICKS,
   SPECULATE_BASELINE_ENV,
@@ -55,8 +58,11 @@ import {
   type V3RequestSized,
   V3_AUTO_METHOD_ONE_SHOT,
   V3_ROUTINE_CLOSES,
+  V3_TIMING_EXTRA_MAX_BYTES,
+  V3_TIMING_EXTRA_TRUNCATED,
   V3_UNIFORM_REFUSAL_CODEUNITS,
   WINDOW_BOUND_CAVEAT,
+  daemonStderrFileFor,
   pickV3Timings,
   unkeptRowReason,
   v3CallDeadlineMs,
@@ -95,7 +101,7 @@ import type {
   V3RequestTimed,
 } from "../src/backend";
 import { buildBackend } from "../src/cli";
-import { baselineSourceTag } from "../src/orchestrator";
+import { baselineReachOf, baselineSourceTag, reachFromBaseline } from "../src/orchestrator";
 import { splitBackend } from "../src/parallel-queue";
 import type { SpawnFn } from "../src/publisher";
 import { installResourceSelector } from "../src/resource-selector";
@@ -1369,6 +1375,30 @@ describe("R885: demo data, on the serve path", () => {
     expect(on.serve.daemons[0] ?? []).not.toContain("--no-download");
   });
 
+  test("PR-237: every serve daemon's argv carries --timings only when serveTimings is on", async () => {
+    // a run with a restart (M0002's echo times out), so a SECOND daemon must carry it too
+    const script: ServeScript = {
+      echo: (m, d, n) =>
+        m === "M0002"
+          ? { method: "Echo", status: "error", notRun: true, message: TIMEOUT_1S }
+          : goodEcho(m, d, n),
+    };
+    const on = await readyRig({
+      serve: script,
+      mutants: ["M0001", "M0002"],
+      extra: { serveTimings: true },
+    });
+    expect(on.serve.daemons.length).toBeGreaterThanOrEqual(2);
+    for (const argv of on.serve.daemons) expect(argv).toContain("--timings");
+    const off = await readyRig({ serve: script, mutants: ["M0001", "M0002"] });
+    // (review LOW) never an empty match: the off runs spawned daemons too
+    expect(off.serve.daemons.length).toBeGreaterThanOrEqual(2);
+    for (const argv of off.serve.daemons) expect(argv).not.toContain("--timings");
+    const offExplicit = await readyRig({ mutants: ["M0001"], extra: { serveTimings: false } });
+    expect(offExplicit.serve.daemons.length).toBeGreaterThanOrEqual(1);
+    for (const argv of offExplicit.serve.daemons) expect(argv).not.toContain("--timings");
+  });
+
   test("R956: the daemon argv carries --license <path> only when the license is set", async () => {
     const on = (
       await readyRig({
@@ -1379,6 +1409,15 @@ describe("R885: demo data, on the serve path", () => {
     expect(on?.[(on?.indexOf("--license") ?? -2) + 1]).toBe("/l/x.bclicense");
     expect((await readyRig({ mutants: ["M0001"] })).serve.daemons[0] ?? []).not.toContain(
       "--license",
+    );
+  });
+
+  test("PR-282: the daemon argv carries --companies <value> only when it is set", async () => {
+    const on = (await readyRig({ mutants: ["M0001"], extra: { companies: "CRONUS,Other" } })).serve
+      .daemons[0];
+    expect(on?.[(on?.indexOf("--companies") ?? -2) + 1]).toBe("CRONUS,Other");
+    expect((await readyRig({ mutants: ["M0001"] })).serve.daemons[0] ?? []).not.toContain(
+      "--companies",
     );
   });
 
@@ -1661,6 +1700,94 @@ describe("R939: why each serve daemon closed", () => {
     expect(seen.filter(([code]) => code.includes("daemon"))).toEqual([]);
   });
 
+  // PR-244: the near-miss and restart-storm warnings. Warning only: the daemon closes as before.
+  describe("PR-244: keep near-miss and restart storm", () => {
+    // A synthetic rewording (a clause inserted mid-sentence into `page-no-record-onopenpage`): unkept, and no suffix
+    // widening of that entry would keep it. (PERF-10's Company text is kept since bugs' widening, master c3355859.)
+    const REWORDED =
+      "NotRun: out-of-scope: a page opened without a record whose OnOpenPage, as the runner now explains, left Rec where its view has no row";
+    const REPORT_VARIANT =
+      "NotRun: out-of-scope: a parameters string without the XML declaration in this form, given to Report.RunRequestPage (which character BC's filter error names is not pinned)";
+    const textFor =
+      (text: string, who: readonly string[]): RowsFn =>
+      (m, cu, d, n) =>
+        allPass(m, cu, d, n).map((x) =>
+          who.includes(m) && x.method === "A"
+            ? { ...x, status: "error" as const, notRun: true, message: text }
+            : x,
+        );
+    const near = (seen: [string, string][]) =>
+      seen.filter(([c]) => c === "al-runner-v3-keep-near-miss");
+    const storm = (seen: [string, string][]) =>
+      seen.filter(([c]) => c === "al-runner-v3-refusal-restart-storm");
+
+    test("a reworded text warns once at its first close; the same text again does not; the daemon still closes", async () => {
+      const { r, seen } = await watched(textFor(REWORDED, ["M0001", "M0002"]));
+      expect(near(seen).length).toBe(1);
+      expect(near(seen)[0]?.[1]).toMatch(
+        /keep entry page-no-record-onopenpage \((\d+)\/\1 words\)/,
+      );
+      // the keep decision is unchanged: the refusal closed the daemon, and counted by reason
+      expect([...r.b.daemonCloses().byReason]).toEqual([["refusal", 2]]);
+    });
+    test("a known variant prints a plain line, never the warning", async () => {
+      const lines: string[] = [];
+      const orig = console.warn;
+      console.warn = (...a: unknown[]) => void lines.push(a.join(" "));
+      try {
+        const { r, seen } = await watched(textFor(REPORT_VARIANT, ["M0001", "M0002"]));
+        expect(near(seen)).toEqual([]);
+        expect([...r.b.daemonCloses().byReason]).toEqual([["refusal", 2]]);
+      } finally {
+        console.warn = orig;
+      }
+      expect(lines.filter((l) => l.includes("known unmeasured variant")).length).toBe(1);
+    });
+    test("an unkept family warns a storm at its 10th close only", async () => {
+      const ids = Array.from({ length: 11 }, (_, i) => `M${String(i + 1).padStart(4, "0")}`);
+      const r = await rig({
+        serve: { rows: textFor(WITH_EVENTS, ids) },
+        oneShotRows: allPass,
+      });
+      const seen: [string, string][] = [];
+      r.b.setNotify((c, m) => seen.push([c, m]));
+      await baseline(r.b, SUITE1);
+      for (let i = 0; i < 11; i++) {
+        await r.b.prefetchMutants(plans([ids[i] ?? ""], SUITE1));
+        expect(storm(seen).length).toBe(i + 1 < 10 ? 0 : 1);
+      }
+      expect(r.b.daemonCloses().refusalFamilies.get("WithEvents subscriber …")).toBe(11);
+      expect(near(seen)).toEqual([]);
+    });
+    test("a reused backend's next session (setNotify) warns again: its own 10th close, and a near-miss text the last session reported", async () => {
+      const ids = Array.from({ length: 22 }, (_, i) => `M${String(i + 1).padStart(4, "0")}`);
+      const r = await rig({
+        serve: {
+          rows: (m, cu, d, n) =>
+            ids.indexOf(m) >= 20
+              ? textFor(REWORDED, ids)(m, cu, d, n)
+              : textFor(WITH_EVENTS, ids)(m, cu, d, n),
+        },
+        oneShotRows: allPass,
+      });
+      const first: [string, string][] = [];
+      r.b.setNotify((c, m) => first.push([c, m]));
+      await baseline(r.b, SUITE1);
+      for (let i = 0; i < 10; i++) await r.b.prefetchMutants(plans([ids[i] ?? ""], SUITE1));
+      await r.b.prefetchMutants(plans([ids[20] ?? ""], SUITE1));
+      expect(storm(first).length).toBe(1);
+      expect(near(first).length).toBe(1);
+      const second: [string, string][] = [];
+      r.b.setNotify((c, m) => second.push([c, m]));
+      for (let i = 10; i < 19; i++) await r.b.prefetchMutants(plans([ids[i] ?? ""], SUITE1));
+      expect(storm(second).length).toBe(0);
+      await r.b.prefetchMutants(plans([ids[19] ?? ""], SUITE1));
+      expect(storm(second).length).toBe(1);
+      await r.b.prefetchMutants(plans([ids[21] ?? ""], SUITE1));
+      expect(near(second).length).toBe(1);
+    });
+  });
+
   test("a timeout row: reason timeout, no family", async () => {
     const { r } = await watched(timedOutFor("M0002"));
     const c = r.b.daemonCloses();
@@ -1802,6 +1929,47 @@ describe("10: R612's keep rule per entry, in entry order", () => {
     const r = await readyRig({ mutants: ["M0001"] });
     expect(r.serve.cwds).toEqual([r.l.scratch]);
     expect(r.serve.cwds[0]).not.toBe(process.cwd());
+  });
+
+  test("PR-227 daemonStderrDir: one file per serve daemon, each holding that daemon's stderr; off writes none", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pr227-rig-"));
+    const echo2: ServeScript = {
+      echo: (m, d, n) =>
+        m === "M0002"
+          ? { method: "Echo", status: "error", notRun: true, message: TIMEOUT_1S }
+          : goodEcho(m, d, n),
+      stderr: (_q, n) => `compile cache: request ${n}\n`,
+    };
+    const on = await readyRig({
+      serve: echo2,
+      mutants: ["M0001", "M0002"],
+      extra: { daemonStderrDir: join(dir, "on") },
+    });
+    expect(on.serve.daemons).toHaveLength(2);
+    const files = readdirSync(join(dir, "on")).sort();
+    expect(files).toHaveLength(2);
+    for (const f of files) {
+      expect(f).toMatch(/^\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z-lane0-pid\S+\.stderr$/);
+      expect(readFileSync(join(dir, "on", f), "utf8")).toContain("compile cache: request ");
+    }
+    // off (the default): the same run writes no stderr file: not under the folder, and nowhere in the
+    // run's own tree (its scratch, instrumented and test folders all sit under the layout's root)
+    const off = await readyRig({ serve: echo2, mutants: ["M0001", "M0002"] });
+    expect(readdirSync(dir)).toEqual(["on"]);
+    const root = dirname(off.l.batch);
+    expect(off.l.scratch.startsWith(root)).toBe(true);
+    const stray = (readdirSync(root, { recursive: true }) as string[]).filter((p) =>
+      p.endsWith(".stderr"),
+    );
+    expect(stray).toEqual([]);
+  });
+
+  test("PR-227 daemonStderrFileFor: absent dir -> none; the name carries the UTC start, the lane and the pid", () => {
+    expect(daemonStderrFileFor(undefined, 0)).toBeUndefined();
+    const f = daemonStderrFileFor("/d", 2, () => new Date("2026-11-19T15:30:01.250Z"));
+    // join(): the platform's separator (CI's check job runs on Windows)
+    expect(f?.(4242)).toBe(join("/d", "2026-11-19T15-30-01-250Z-lane2-pid4242.stderr"));
+    expect(f?.(undefined)).toBe(join("/d", "2026-11-19T15-30-01-250Z-lane2-pidunknown.stderr"));
   });
 
   test("all entries kept: one daemon", async () => {
@@ -2457,6 +2625,41 @@ describe("13: §5, the coverage window for a pass under a mutant when the Sleep 
     expect((await r.b.run(ref("A"), OPTS)).outcome).toBe("pass");
     const cov = since(r, n0).find((q) => q.body.coverage === true);
     expect(cov?.body.excludeTests).toEqual([`Codeunit${CU}.B`]);
+  });
+
+  // PR-250 (review MED-2): the entry went out with the cut before B (flagged), but a coverage window is never
+  // sent with runSelectedOnly, so it leaves out what the entry would without that cut; the rows of the tests
+  // the cut left out of the entry are not compared, so the pass still reads.
+  test("PR-250: the coverage request never carries the refused-test cut, and the pass is scored", async () => {
+    const SUITE_ABC = [ref("A"), ref("B"), ref("C")];
+    const bMid: RowsFn = (m, cu, d, n) =>
+      (cu === CU
+        ? ["A", "B", "C"].map((method) => ({ method, status: "pass" as const }))
+        : allPass(m, cu, d, n)
+      ).map((x) =>
+        x.method === "B"
+          ? {
+              ...x,
+              status: "error" as const,
+              notRun: true,
+              message: "NotRun: out-of-scope: InStream method on an unassigned Variant",
+            }
+          : x,
+      );
+    const { r, n0 } = await windowOf({
+      suite: SUITE_ABC,
+      serve: { rows: bMid },
+      oneShotRows: bMid,
+    });
+    const entry = r.serve.requests
+      .flatMap((q) => (q.body.entries as Record<string, unknown>[] | undefined) ?? [])
+      .find((e) => String(e.id).startsWith("M0001|") && String(e.test) === `Codeunit${CU}.`);
+    expect(entry?.excludeTests).toEqual([`Codeunit${CU}.B`, `Codeunit${CU}.C`]);
+    await r.b.activate("M0001");
+    expect((await r.b.run(ref("A"), OPTS)).outcome).toBe("pass");
+    const cov = since(r, n0).find((q) => q.body.coverage === true);
+    expect(cov).toBeDefined();
+    expect(cov?.body.excludeTests).toBeUndefined();
   });
 
   test("the coverage request's rows disagree with the entry's -> error entries-coverage-disagreement", async () => {
@@ -3119,6 +3322,7 @@ describe("the gate's transport flags (itest:alrunner-v3 harness)", () => {
 
 describe("R987: entries per serve request follow the daemon growth measured per codeunit", () => {
   const GiB = 2 ** 30;
+  const MiB = 2 ** 20;
   const g = (mutantId: string, ...codeunits: number[]): EntryGroup => ({ mutantId, codeunits });
 
   test("groupsThatFit: 16 unmeasured codeunit entries, 4 GiB of measured cost, 256 entries, never 0", () => {
@@ -3296,11 +3500,11 @@ describe("R987: entries per serve request follow the daemon growth measured per 
     expect(reused.sizes).toEqual([32, 32, 32, 32]);
   });
 
-  test("growth is read from the daemon's floor, not from a request's higher start", async () => {
+  test("PR-246: growth is read from the request's own start, not from the daemon's floor", async () => {
     // A daemon that keeps what each request grew it by. 16 groups on CU at 0.125 GiB a test entry:
     // +2 GiB, to 2.5 GiB. Then 16 groups on CU2 at 0.25: +4 GiB on top, to 6.5 GiB. From its 2.5 GiB
-    // start CU2 would read 0.25 GiB a test entry (4 / 16) and the next request take 16 groups; from the
-    // 0.5 GiB floor it reads 0.375 (6 / 16), so 10 groups (3.75 GiB), 20 entries.
+    // start CU2 reads 0.25 GiB a test entry (4 / 16): 16 test entries fit 4 GiB, so 32 entries. (The
+    // floor model read 0.375 (6 / 16): 10 groups, 20 entries.)
     const mem = await prefetchOf(
       new Map([
         [CU, 0.125 * GiB],
@@ -3309,7 +3513,106 @@ describe("R987: entries per serve request follow the daemon growth measured per 
       [...onCu(mids(1, 16)), ...onCu2(mids(17, 60))],
       { stack: true },
     );
-    expect(mem.sizes.slice(0, 3)).toEqual([32, 32, 20]);
+    expect(mem.sizes.slice(0, 3)).toEqual([32, 32, 32]);
+  });
+
+  test("PR-246 (a): memory the daemon holds is not charged to a request's entries", async () => {
+    // CU's 16 test entries grow the daemon 1 GiB (to 1.5 GiB, 1 GiB over its floor). CU2's 16 then grow
+    // it 160 MB: 10 MB an entry, not (1 GiB + 160 MB) / 16 = ~72 MB. Red: the floor formula.
+    const sized: V3RequestSized[] = [];
+    await prefetchOf(
+      new Map([
+        [CU, GiB / 16],
+        [CU2, 10 * MiB],
+      ]),
+      [...onCu(mids(1, 16)), ...onCu2(mids(17, 16))],
+      { stack: true, sized },
+    );
+    const second = sized.find((e) => e.calls.some((c) => c.call === CU2));
+    expect(second?.start).toBe(1.5 * GiB);
+    expect(second?.calls[0]?.cost).toBeCloseTo(10 * MiB, 0);
+  });
+
+  /** PR-246: feed a backend readings directly (cost per entry = growth / 16 test entries) and read its prices. */
+  const pricing = async () => {
+    const r = await rig();
+    const inner = r.b as unknown as {
+      noteEntryCost: (...a: unknown[]) => void;
+      costOf: (call: number) => number | undefined;
+    };
+    const sent = Array.from({ length: 16 }, () => ({ codeunit: CU, echo: false }));
+    // `over`: how far the request's start is over the daemon's floor (1 GiB).
+    const read = (growth: number, over = 0) =>
+      inner.noteEntryCost(0, GiB + over, GiB, GiB + over + growth, sent, {
+        source: "hwm",
+        sampledPeak: undefined,
+      });
+    return { read, price: () => inner.costOf(CU), costOf: inner.costOf.bind(inner) };
+  };
+
+  test("PR-246 (b): a call's price is its recent readings, not its highest ever", async () => {
+    const p = await pricing();
+    p.read(500 * MiB * 16);
+    for (let i = 0; i < 5; i++) p.read(10 * MiB * 16);
+    // The 500 MB reading has aged out of the last 5. Red: the highest-ever rule, or K > 5.
+    expect(p.price()).toBe(10 * MiB);
+  });
+
+  test("PR-246 (c): a call's price is the highest of its last K readings, K = 5", async () => {
+    expect(COST_READINGS_KEPT).toBe(5);
+    const p = await pricing();
+    // 50 is the oldest of the last 5: K = 4 would have dropped it.
+    for (const mb of [50, 10, 10, 10, 10]) p.read(mb * MiB * 16);
+    expect(p.price()).toBe(50 * MiB);
+  });
+
+  test("PR-246: a reading from a daemon that holds memory may raise a price, never lower it", async () => {
+    const p = await pricing();
+    for (const mb of [50, 10, 10, 10, 10]) p.read(mb * MiB * 16);
+    // Held: low (it may have reused memory): dropped, so the 50 does not age out.
+    p.read(5 * MiB * 16, GiB);
+    expect(p.price()).toBe(50 * MiB);
+    p.read(80 * MiB * 16, GiB); // held: above the price: raises it
+    expect(p.price()).toBe(80 * MiB);
+    // Near the floor a low reading counts: five of them age the 80 out.
+    for (let i = 0; i < COST_READINGS_KEPT; i++) p.read(5 * MiB * 16);
+    expect(p.price()).toBe(5 * MiB);
+  });
+
+  test("PR-246: a peak below the start reads 0, never a negative cost", async () => {
+    const p = await pricing();
+    p.read(-100 * MiB);
+    expect(p.price()).toBe(0);
+  });
+
+  test("PR-246 (e): a call no request ran is unmeasured, and goes 16 at a time", async () => {
+    const p = await pricing();
+    expect(p.price()).toBeUndefined();
+    p.read(MiB * 16);
+    expect(p.price()).toBe(MiB);
+    expect(p.costOf(CU2)).toBeUndefined();
+    expect(
+      groupsThatFit(
+        Array.from({ length: 60 }, (_, i) => g(`M${i}`, CU2)),
+        p.costOf,
+      ),
+    ).toBe(16);
+  });
+
+  test("PR-246 (d): a kept daemon's held memory no longer shrinks every later request", async () => {
+    // CU2 costs 10 MB an entry, on a daemon that holds 2.5 GiB after CU. The floor model priced CU2 at
+    // (2 GiB + 160 MB) / 16 = ~138 MB an entry (about 29 test entries a request, 58 entries); marginal
+    // growth prices it at 10 MB: 256-entry requests.
+    const r = await prefetchOf(
+      new Map([
+        [CU, 0.125 * GiB],
+        [CU2, 10 * MiB],
+      ]),
+      [...onCu(mids(1, 16)), ...onCu2(mids(17, 100))],
+      { stack: true },
+    );
+    expect(r.sizes[1]).toBe(32); // CU2 unmeasured
+    expect(r.sizes[2]).toBe(168); // all 84 remaining groups in one request
   });
 
   test("a codeunit no request has measured goes 16 at a time, even after cheap ones", async () => {
@@ -3468,7 +3771,7 @@ describe("R987: entries per serve request follow the daemon growth measured per 
       expect(lines.filter((m) => m.includes(`codeunit ${CU2} `)).length).toBe(1);
       for (const l of lines)
         expect(l).toMatch(
-          /requests carrying codeunit \d+ hold about \d+ test entries \(its highest measured cost: \d+ MiB per entry, from a hwm peak\)/,
+          /requests carrying codeunit \d+ hold about \d+ test entries \(its recent measured cost: \d+ MiB per entry, from a hwm peak\)/,
         );
     });
 
@@ -5205,9 +5508,10 @@ describe("R1004: the warm-up leaves out the tests the baseline refused by name",
     expect(v.outcome).toBe("pass");
   });
 
-  // R998 (review 2-3): a refused test with a test after it stays in the mutant entries, so the test
-  // after it starts from the baseline's state; the warm-up (which only compares) still leaves it out.
-  test("R998: a refused test in the middle of its codeunit stays in the mutant entries (only a trailing run is left out)", async () => {
+  // R998 (review 2-3) left a refused test with a test after it IN the mutant entries; PR-250 (option 2) cuts
+  // the mutant entries before it instead: it and every later test are left out, so no test after it runs from
+  // other state. The warm-up (which only compares) still leaves out B alone.
+  test("R998, PR-250: a refused test in the middle of its codeunit is cut from the mutant entries with every test after it", async () => {
     const SUITE_ABC = [ref("A"), ref("B"), ref("C")];
     const bMid: RowsFn = (m, cu, d, n) =>
       (cu === CU
@@ -5225,7 +5529,9 @@ describe("R1004: the warm-up leaves out the tests the baseline refused by name",
       .flatMap((q) => (q.body.entries as Record<string, unknown>[] | undefined) ?? [])
       .filter((e) => String(e.test) === `Codeunit${CU}.`);
     expect(mutantEntries.length).toBeGreaterThan(0);
-    expect(mutantEntries.every((e) => e.excludeTests === undefined)).toBe(true);
+    expect(mutantEntries.map((e) => e.excludeTests)).toEqual(
+      mutantEntries.map(() => [`Codeunit${CU}.B`, `Codeunit${CU}.C`]),
+    );
   });
 
   // PR-24 (L2): a restarted daemon's lazy warm-up leaves out what the whole-union warm-up does
@@ -6622,7 +6928,12 @@ describe("R857: --isolate-tests", () => {
     const methods = ["A", "B", "C", "D", "E", "F"];
     const suite = methods.map((m) => ref(m));
     const rows: RowsFn = () => methods.map((method) => ({ method, status: "pass" as const }));
-    const opts = { ...ISOLATE, suite, oneShotRows: rows };
+    // PR-378: an answer is kept only when 2 x its wall time stays under the budget floor (cleanBaselineAnswer); a dropped one
+    // runs again alone, one more call. The fake holds each process for up to 100 timer ticks, measured on the real clock: about
+    // 1.6 s where a tick is 15.6 ms (Windows), so the rig's 1,000 ms floor dropped some answers there (CI 45144980326: 9 calls
+    // for 6 tests). A floor of an hour leaves the counts to the call counters alone.
+    const floor = [3_600_000, 3_600_000] as const;
+    const opts = { ...ISOLATE, suite, oneShotRows: rows, floor };
     const exactOf = (r: Rig) => r.one.calls.map((c) => c[c.indexOf("--test-exact") + 1]);
 
     test("every test once, at most four at a time, each verdict its own", async () => {
@@ -6639,7 +6950,7 @@ describe("R857: --isolate-tests", () => {
     test("--workers sets how many at a time: one, or more than four", async () => {
       for (const n of [1, 6]) {
         const extra = { isolateTests: true, isolatedBaselineProcesses: n };
-        const r = await rig({ extra, suite, oneShotRows: rows });
+        const r = await rig({ extra, suite, oneShotRows: rows, floor });
         await baseline(r.b, suite);
         expect(r.one.peak()).toBe(n);
         expect(r.one.calls).toHaveLength(methods.length);
@@ -10634,7 +10945,11 @@ describe("PR-94: runSelectedOnly on prefix-cut requests", () => {
       const storeOf = (r: Rig) =>
         (
           r.b as unknown as {
-            lane: { prefetch: { pairStore: Map<string, { through?: string | undefined }> } };
+            lane: {
+              prefetch: {
+                pairStore: Map<string, { through?: string | undefined; cu: number; seq: number }>;
+              };
+            };
           }
         ).lane.prefetch.pairStore;
       const counts = (r: Rig) => r.b.entriesStats();
@@ -10703,6 +11018,55 @@ describe("PR-94: runSelectedOnly on prefix-cut requests", () => {
         for (const [k, v] of storeOf(r)) storeOf(r).set(k, { ...v, through: undefined });
         await r.b.sendKillPair("M0001", ref("C"));
         expect(counts(r)).toMatchObject({ pairBatchServed: 1, pairBatchRefused: 0 });
+        expect(r.b.pairRefusalReasons()).toEqual({
+          otherCodeunit: 0,
+          notPrefetched: 0,
+          notAfterKill: 0,
+          cutBeforeKiller: 0,
+        });
+      });
+
+      test("PR-242 (M1): each refusal is counted under its own reason, and the reasons sum to pairBatchRefused", async () => {
+        const zero = { otherCodeunit: 0, notPrefetched: 0, notAfterKill: 0, cutBeforeKiller: 0 };
+        // a killer after `through`
+        const cut = await batched();
+        await cut.b.sendKillPair("M0001", ref("C"));
+        expect(cut.b.pairRefusalReasons()).toEqual({ ...zero, cutBeforeKiller: 1 });
+        // the pair stored for another codeunit than the killing call
+        const other = await batched();
+        for (const [k, v] of storeOf(other)) storeOf(other).set(k, { ...v, cu: v.cu + 1 });
+        await other.b.sendKillPair("M0001", ref("B"));
+        expect(other.b.pairRefusalReasons()).toEqual({ ...zero, otherCodeunit: 1 });
+        // the pair's request did not run after the kill's prefetch
+        const early = await batched();
+        for (const [k, v] of storeOf(early)) storeOf(early).set(k, { ...v, seq: 0 });
+        await early.b.sendKillPair("M0001", ref("B"));
+        expect(early.b.pairRefusalReasons()).toEqual({ ...zero, notAfterKill: 1 });
+        // the kill's rows did not come from a prefetch (no prefetchSeq for its codeunit)
+        const np = await batched();
+        (
+          np.b as unknown as { lane: { rowsByCodeunit: Map<number, unknown> } }
+        ).lane.rowsByCodeunit.clear();
+        await np.b.sendKillPair("M0001", ref("B"));
+        expect(np.b.pairRefusalReasons()).toEqual({ ...zero, notPrefetched: 1 });
+        for (const x of [cut, other, early, np])
+          expect(counts(x).pairBatchRefused).toBe(
+            Object.values(x.b.pairRefusalReasons()).reduce((a, b) => a + b, 0),
+          );
+        // the summary line carries the split, next to `refused`
+        const warn = spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          await cut.b.close();
+          expect(
+            warn.mock.calls.some((a) =>
+              String(a[0]).includes(
+                "refused 1 [another codeunit 0, not prefetched 0, not after the kill 0, cut before the killer 1]",
+              ),
+            ),
+          ).toBe(true);
+        } finally {
+          warn.mockRestore();
+        }
       });
     });
   });
@@ -10809,7 +11173,8 @@ describe("PR-21 (L5): re-check of a reused serve baseline", () => {
     expect(why).toBeUndefined();
     expect(rowsOf(r2).size).toBeGreaterThan(0);
     // a lane beyond lane 0 holding a daemon makes the call a misuse, by name
-    r2.b.baselinePhase(false);
+    // PR-347: awaited, since the end of a baseline is async once the refused-cut tail is on (the default)
+    await r2.b.baselinePhase(false);
     const v1 = r2.views[1];
     if (v1 === undefined) throw new Error("no lane 1");
     await v1.activate("M0001");
@@ -11443,7 +11808,7 @@ describe("PR-100: serve-request-timed, and the phase a daemon closed in", () => 
     expect(timed.filter((e) => e.cut !== true).every((e) => e.timings !== undefined)).toBe(true);
   });
 
-  test("timings copies only the known fields, of the right type", async () => {
+  test("timings copies the known fields of the right type; every other field goes to extra (PR-227)", async () => {
     const { r, timed } = await watchedRig({
       serve: {
         rows: allPass,
@@ -11475,11 +11840,78 @@ describe("PR-100: serve-request-timed, and the phase a daemon closed in", () => 
       resetMs: 14,
       baselineSource: "snapshot",
       engineKept: true,
+      // a known field of the wrong type (compileMs "12") is dropped, never moved to extra
+      extra: { surprise: 99 },
     });
     // the same rule as a plain function
-    expect(pickV3Timings({ engineKept: false, testsMs: Number.NaN, x: 1 })).toBeUndefined();
+    expect(pickV3Timings({ engineKept: false, testsMs: Number.NaN })).toBeUndefined();
+    expect(pickV3Timings({ engineKept: false, testsMs: Number.NaN, x: 1 })).toEqual({
+      extra: { x: 1 },
+    });
     expect(pickV3Timings("nope")).toBeUndefined();
     expect(pickV3Timings({ testsMs: 0 })).toEqual({ testsMs: 0 });
+  });
+
+  test("PR-227: extra keeps al-runner's new fields (setupParts, workspaceCache), scalars and one flat level only", () => {
+    const t = pickV3Timings({
+      setupMs: 10364.2,
+      compileMs: 0.6,
+      workspaceCache: "read",
+      engineKept: true,
+      cold: false,
+      setupParts: {
+        sourcesMs: 582.7,
+        testDataMs: 8934.2,
+        note: "x",
+        bad: Number.NaN,
+        deep: { a: 1 },
+      },
+      nested: { only: { deeper: 1 } },
+      list: [1, 2],
+      nothing: null,
+      inf: Number.POSITIVE_INFINITY,
+    });
+    expect(t).toEqual({
+      setupMs: 10364.2,
+      compileMs: 0.6,
+      engineKept: true,
+      extra: {
+        workspaceCache: "read",
+        cold: false,
+        // inside a flat object: scalars only; NaN and the deeper object are left out
+        setupParts: { sourcesMs: 582.7, testDataMs: 8934.2, note: "x" },
+      },
+    });
+    // the known fields are unchanged by extra: the same answer without the unknown ones
+    const { extra: _extra, ...known } = t ?? {};
+    expect(known).toEqual(
+      pickV3Timings({ setupMs: 10364.2, compileMs: 0.6, engineKept: true }) ?? {},
+    );
+  });
+
+  test("PR-227: extra is capped at 4 KB of JSON per event; the rest is counted, never silently dropped", () => {
+    expect(V3_TIMING_EXTRA_MAX_BYTES).toBe(4096);
+    // 100 fields of about 60 bytes each: about 6 KB, over the cap
+    const many: Record<string, string> = {};
+    for (let i = 0; i < 100; i++) many[`f${String(i).padStart(3, "0")}`] = "v".repeat(50);
+    const t = pickV3Timings({ testsMs: 1, ...many });
+    const extra = t?.extra ?? {};
+    const kept = Object.keys(extra).filter((k) => k !== V3_TIMING_EXTRA_TRUNCATED);
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.length).toBeLessThan(100);
+    // in al-runner's order, a prefix
+    expect(kept).toEqual(Object.keys(many).slice(0, kept.length));
+    expect(extra[V3_TIMING_EXTRA_TRUNCATED]).toBe(100 - kept.length);
+    const keptJson = JSON.stringify(Object.fromEntries(kept.map((k) => [k, extra[k]])));
+    expect(keptJson.length).toBeLessThanOrEqual(V3_TIMING_EXTRA_MAX_BYTES + 2);
+    expect(t?.testsMs).toBe(1); // known fields are outside the cap
+    // one oversized field is left out (counted), and a small field after it is still kept
+    const t2 = pickV3Timings({ big: "x".repeat(5000), small: 1 });
+    expect(t2?.extra).toEqual({ small: 1, [V3_TIMING_EXTRA_TRUNCATED]: 1 });
+    // under the cap: no marker
+    expect(pickV3Timings({ a: 1 })?.extra).toEqual({ a: 1 });
+    // al-runner sending the marker's own name cannot forge a count
+    expect(pickV3Timings({ [V3_TIMING_EXTRA_TRUNCATED]: 99, a: 1 })?.extra).toEqual({ a: 1 });
   });
 
   test("the warm-up cause: first, after-deploy, recycle, after-<reason>", async () => {
@@ -11668,6 +12100,117 @@ describe("PR-115: batching the daemon baseline", () => {
       expect(q.body.test).toBeDefined();
       expect(q.body).not.toHaveProperty("coverage");
     }
+  });
+
+  /** PR-235: runs `fn` with LETHAL_V3_BASELINE_BATCHING set to `v` (unset when undefined), then restores it. */
+  async function withKnob<T>(v: string | undefined, fn: () => Promise<T>): Promise<T> {
+    const was = process.env[BASELINE_BATCHING_ENV];
+    if (v === undefined) delete process.env[BASELINE_BATCHING_ENV];
+    else process.env[BASELINE_BATCHING_ENV] = v;
+    try {
+      return await fn();
+    } finally {
+      if (was === undefined) delete process.env[BASELINE_BATCHING_ENV];
+      else process.env[BASELINE_BATCHING_ENV] = was;
+    }
+  }
+
+  test("PR-235 T-a: knob unset batches as today (one batch of two, then the lone codeunit)", async () => {
+    const r = await withKnob(undefined, () => bRig());
+    await baseline(r.b, SUITE3);
+    expect(r.serve.requests).toHaveLength(2);
+    const [batch, single] = r.serve.requests;
+    if (batch === undefined || single === undefined) throw new Error("two requests");
+    expect(isBatch(batch)).toBe(true);
+    expect(batch.body.excludeTests).toEqual([`Codeunit${CU3}.`, `Codeunit${ECHO}.`]);
+    expect(single.body.test).toBe(`Codeunit${CU3}.`);
+  });
+
+  test("PR-235 T-b: knob off sends one codeunit per request, each with coverage and perTestCoverage", async () => {
+    const r = await withKnob("off", () => bRig());
+    await baseline(r.b, SUITE3);
+    expect(r.serve.requests.map((q) => q.body.test)).toEqual([
+      `Codeunit${CU}.`,
+      `Codeunit${CU2}.`,
+      `Codeunit${CU3}.`,
+    ]);
+    for (const q of r.serve.requests) {
+      expect(q.body.coverage).toBe(true);
+      expect(q.body.perTestCoverage).toBe(true);
+    }
+  });
+
+  test("PR-235 T-c: a bad knob value is refused by name at construction, before any baseline request", async () => {
+    let sent = 0;
+    await expect(
+      withKnob("bogus", () =>
+        bRig({
+          serve: {
+            answer: () => {
+              sent++;
+              return undefined;
+            },
+          },
+        }),
+      ),
+    ).rejects.toThrow(AlRunnerV3BaselineBatchingKnobRefusedError);
+    await expect(withKnob("bogus", () => bRig())).rejects.toThrow(
+      `${BASELINE_BATCHING_ENV} is "bogus"; use off`,
+    );
+    expect(sent).toBe(0);
+  });
+
+  test("PR-235 T-d: an empty knob is the same as unset", async () => {
+    const r = await withKnob("", () => bRig());
+    await baseline(r.b, SUITE3);
+    expect(r.serve.requests).toHaveLength(2);
+    expect(r.serve.requests.map((q) => isBatch(q))).toEqual([true, false]);
+  });
+
+  test("PR-235 T-f: knob off, each single baseline request gives its own test's lines, and R926's reach reads exactly [A] and exactly [B]", async () => {
+    // The first method of a codeunit hits line 5 of the target, the second the NEXT line, 6 (per-test, line grain).
+    const own: CoverageFn = (_m, cu, active) => {
+      const file = join(active, "Logic.Codeunit.al");
+      const methods = SUITE_METHODS[cu] ?? [];
+      return {
+        coverage: [{ file, statements: methods.map((_m2, i) => ({ line: 5 + i, hits: 1 })) }],
+        perTestCoverage: methods.map((m, i) => ({
+          test: `Codeunit${cu}.${m}`,
+          coverage: [{ file, statements: [{ line: 5 + i, hits: 1 }] }],
+        })),
+      };
+    };
+    const r = await withKnob("off", () =>
+      bRig({
+        oneShotCoverage: own,
+        serve: { coverage: own },
+        extra: { coverage: "al-runner", daemonBaseline: true },
+      }),
+    );
+    const v = await baseline(r.b, SUITE3);
+    const linesOf = (x: TestVerdict | undefined): number[] =>
+      (x?.coverage?.entries ?? []).map((e) => e.line ?? -1);
+    const [a, b] = v;
+    if (a === undefined || b === undefined) throw new Error("two verdicts");
+    expect(a.coverage?.granularity).toBe("line");
+    expect(linesOf(a)).toEqual([5]);
+    expect(linesOf(b)).toEqual([6]);
+    expect(r.serve.requests.every((q) => q.body.test !== undefined)).toBe(true);
+    const rows = [a, b].map((verdict) => ({ ref: verdict.ref, verdict }));
+    const evidence = baselineReachOf(rows, new Set([a.ref, b.ref]), { isolationOf: () => "test" });
+    const entry = a.coverage?.entries[0];
+    if (entry === undefined) throw new Error("A has coverage");
+    const at = (line: number) => ({
+      reachGrain: "statement" as const,
+      reachLine: line,
+      objectType: entry.objectType,
+      codeunitId: entry.objectId,
+    });
+    const reach = (line: number) =>
+      reachFromBaseline(at(line), [a.ref, b.ref], evidence, () => "test");
+    const names = (line: number) => reach(line)?.reachedBy.map((n) => n.split(".").pop());
+    expect(names(5)).toEqual(["A"]); // exactly [A]
+    expect(names(6)).toEqual(["B"]); // the next line: exactly [B], no union and no shift
   });
 
   test("a batch request that fails keeps nothing: each codeunit is re-sent alone", async () => {
@@ -12714,4 +13257,41 @@ describe("PR-119: cross-check samples beside the daemon", () => {
       expect(t.rep()).toMatchObject({ samplesOverlapped: 0, samplesSequential: 2 });
     });
   });
+});
+
+describe("PR-252: a request's wallMs is a monotonic interval", () => {
+  for (const [name, step] of [
+    ["forward", 2_000_000],
+    ["backward", -2_000_000],
+  ] as const) {
+    test(`a wall clock ${name} step of 2,000 s during a prefetch leaves wallMs small, non-negative and the request unfailed`, async () => {
+      const realNow = Date.now;
+      let offset = 0;
+      let armed = false;
+      try {
+        Date.now = () => realNow() + offset;
+        const r = await rig({
+          serve: {
+            rows: (m, cu, d, n) => {
+              if (armed) offset += step; // the wall clock steps while the request is in flight
+              return allPass(m, cu, d, n);
+            },
+          },
+        });
+        const timed: V3RequestTimed[] = [];
+        r.b.setRequestTimedSink((e) => timed.push(e));
+        await baseline(r.b, SUITE1);
+        armed = true;
+        await r.b.prefetchMutants(plans(["M0001", "M0002"]));
+        expect(timed.length).toBeGreaterThan(0);
+        for (const e of timed) {
+          expect(e.failed).toBeUndefined();
+          expect(e.wallMs).toBeGreaterThanOrEqual(0);
+          expect(e.wallMs).toBeLessThan(100_000);
+        }
+      } finally {
+        Date.now = realNow;
+      }
+    });
+  }
 });

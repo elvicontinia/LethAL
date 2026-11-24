@@ -168,7 +168,7 @@ operators the warning lists, with one `--exclude-operator` each, or narrow the r
 MUTANTS run and cannot change a verdict. `--tests-only` (whole test files) and `--exclude-test <Codeunit.Method>`
 (single test methods; repeatable; bcdev only; a name that matches no test is refused) select which TESTS run
 and CAN: leave out a killing test and its mutant is reported survived or no-coverage. `--only` and `--exclude` give the `narrowed`
-caveat, `--operator` and `--exclude-operator` give `operator-narrowed`, `--lines` and `--changed-since` give `line-narrowed`,
+caveat, `--operator`, `--exclude-operator` and `--profile slim` (the default set from before PR-209: it leaves out `condition-true` and `blank-argument`) give `operator-narrowed`, `--lines` and `--changed-since` give `line-narrowed`,
 and `--tests-only` and `--exclude-test` give `tests-narrowed`. `--exclude-test` also lists each test it left out in
 `excludedTests` (reason `exclude-test`) and prints a `TESTS EXCLUDED` banner line.
 
@@ -218,6 +218,8 @@ same commit as your binary (the sidecar is not in the release files), run from a
 `doctor` prints the sidecar in the `al-runner-v3` check; a missing one is a `WARNING`, not a failure. A run records the
 sidecar it used (the dll's sha256, or `none`) and `downloadDemoData`; `--resume` and `--resume-run` refuse a run
 whose record differs, or is missing (a v3 run from before R886), and say which setting changed from what to what. The project's own gates set `dotnetSidecar: false`.
+**Which build runs (PR-294).** If a session runs a gated al-runner build that is not the `current` one, LethAL warns once with `al-runner-v3-pinned-not-current`, naming both paths. It is not a refusal: older gated builds are allowed. If you meant `current`, check `alRunnerV3.path` in the config.
+
 **The baseline daemon and the memory guard (R948).** On the serve transport the baseline runs through one serve daemon
 (one request per test codeunit, with coverage), not one al-runner process per codeunit. A few codeunits (the first, the
 last and every 25th, at most eight) are also run as fresh processes and compared test by test (status, fail text, exact
@@ -236,12 +238,32 @@ a daemon is reused, one whose resident memory passed the size, or that served th
 fresh daemon (close reason `recycle`, one warm-up each). Measured verdict-neutral with a recycle after every request. A
 daemon already over the size right after its warm-up is the project's working set: the size bound is then turned off for
 the session, said once as `al-runner-v3-daemon-recycle-off`.
+`"daemonStderrDir"` (absent = off, PR-227) is for measurement runs: each serve daemon's FULL stderr is written to
+`<folder>/<utc>-lane<N>-pid<P>.stderr`, one file per daemon (LethAL itself keeps only a 64 KB tail in memory). It changes
+nothing else. Separately, the `serve-request-timed` events keep every `summary.timings` field LethAL does not name in
+`timings.extra` (scalars, or one flat object of scalars, such as `setupParts` and `workspaceCache`), so a new al-runner field
+is recorded without a LethAL change. `extra` is capped at 4 KB of JSON per event; fields past the cap are counted in
+`extra.lethalTruncatedFields`.
+`"serveTimings"` (default `false`, PR-237) turns on al-runner's own timings switch for every serve daemon. Its stderr then also carries the
+compile-cache lines (with the workspace layer's miss reasons) and the slowest codeunits; with `daemonStderrDir` they are kept.
+It is for measurement runs and changes no verdict (measured on and off over the same scope).
 `"recheckWithheldKills"` (default `true` since PR-182; `false` opts out and saves about 10% of a run with many withheld
 rows) and `"recheckBudgetSeconds"` (default 3600) control and bound the recheck of withheld-kill rows after the main
 pass (PR-144; README, al-runner-v3 config list). Kills it recovers are not measured against BC and may be false where an
 earlier test that al-runner refused would have set state on BC. A row the recheck does not recover stays `error`:
 unmeasured, never a kill. Evidence (PR-170): 42 of 58 recovered kills confirmed on BC, 0 false, 16 unmeasurable (9
-TestPage-only killers, 7 killers red at BC's baseline).
+TestPage-only killers, 7 killers red at BC's baseline). The recheck is its own phase, `recheck`, after `teardown`: a
+`phase-left` event with `phase: "recheck"` carries the nested session's split in `detail`, and the TIMING line prints it
+(PR-370).
+`"refusedCutTail"` (default ON since PR-347; only `false` turns it off) runs the stable later tests of a test codeunit
+alone under a mutant after a baseline refusal cut that codeunit's run (PR-250, PR-297). Without it those mutants read
+`error`. A kill found this way carries a `[refused-cut tail ...]` note, and the run warns `al-runner-v3-refused-cut-tail`.
+Several tail tests of one mutant may go in one request (PR-344's packing, inside the same switch). The flag is part of
+the run's fingerprint and lending build, so a `--resume` across a change of it is refused by name. Evidence (PR-347, one
+customer project, against BC): 0 false kills, 7 confirmed, 9 false survivors (flagged by the
+`survivors-beside-unrun-tests` caveat), 6 not judgeable.
+LethAL also sets `ALRUNNER_LOGIN_REPLAY=0` on every al-runner child and drops any ambient `ALRUNNER_LOGIN_REPLAY*`
+variable (PR-360): al-runner's login replay stays off until it is measured.
 **Runs stored before this change.** A serve-entries session now records ` baseline-daemon` in its lending build
 (`runs.runner_build`), because its baseline comes from a daemon, not from one process per codeunit, and a verdict or
 baseline snapshot should be lent only to a session whose baseline came the same way. So a run stored by an earlier
@@ -257,7 +279,7 @@ A run prints one line, `[lethal] al-runner: <path> (<version>)`, naming the bina
 
 **Cost.** On `bcdev` a mutant's covering tests run in ONE call to the server (one per mutant, not
 one per test), stopping at the first failure, so a survivor with forty covering tests costs one
-round trip instead of forty. This needs LethAL Control 1.0.0.28 or newer on the server; an older
+round trip instead of forty. This needs LethAL Control 1.0.0.29 or newer on the server; an older
 one is refused before any test runs. The report's `groupedCalls` says how many such calls were
 made. Three flags touch it and you should not need them: `--max-methods-per-call <n>` caps one
 call, `--request-ceiling-ms <n>` bounds one call (keep it under the hosting gateway's idle
@@ -295,6 +317,7 @@ has the complete set.
 | `--exclude-test` | `run` |
 | `--operator` | `run` |
 | `--exclude-operator` | `run` |
+| `--profile` | `run` |
 | `--artifact` | `verify` |
 | `--survivors` | `verify` |
 | `--max-new-tests` | `verify` |
@@ -380,6 +403,14 @@ al-runner's license switch on every al-runner call that runs tests (one-shot and
 and sha256 in `executionContexts[].license`, never its contents, and a different license is a different
 run fingerprint, so `--resume` will not mix them. Use only a license you are allowed to use for testing.
 
+**Companies for al-runner (PR-282).** A mutant that loops over the Company table is refused ("FindSet on the
+Company table"), because al-runner does not know which companies the database holds. Set
+`alRunnerV3.companies` to al-runner's own list: company names, comma separated, the session company first, or `all`
+(which needs test data). LethAL passes it as al-runner's companies switch on every al-runner call that runs tests (one-shot and
+serve). There is no default: absent, nothing is passed and the refusal stays, since a guessed list would give wrong
+verdicts. The report names the value in `executionContexts[].companies`, and a different list is a different run
+fingerprint, so `--resume` will not mix them.
+
 **Isolation `auto` and a codeunit with no green test (R956).** A test codeunit whose whole-codeunit baseline
 has no green test stays on `test` and is not re-baselined one test per process; the `isolation` caveat's
 reason says "0 green under test: a tie at 0 decides nothing, kept on test (R956)".
@@ -432,7 +463,7 @@ code.
 Each surface below is versioned separately and has a published JSON Schema in [`../schemas/`](../schemas/):
 
 - the report: [../schemas/report-v3.schema.json](../schemas/report-v3.schema.json)
-- `lethal explain`: [../schemas/explain-v33.schema.json](../schemas/explain-v33.schema.json)
+- `lethal explain`: [../schemas/explain-v35.schema.json](../schemas/explain-v35.schema.json)
 - the event stream: [../schemas/stream-v1.schema.json](../schemas/stream-v1.schema.json)
 - `lethal doctor --json`: [../schemas/doctor-v1.schema.json](../schemas/doctor-v1.schema.json),
   as the `data` of [../schemas/cli-envelope-v1.schema.json](../schemas/cli-envelope-v1.schema.json)
@@ -478,9 +509,22 @@ code.
 narrowed run describes the slice, not the project. A run whose baseline was red could not score
 some mutants at all, and they read `no-coverage` rather than `survived`.
 
+**Survivors beside tests that did not run at baseline (PR-381, PR-387).**
+- **Where it shows:** an al-runner-v3 or bcdev report lists the tests that could not reach a verdict at baseline in
+  `notRunAtBaseline`. These are tests the runner refused, that timed out or that LethAL stopped; on bcdev also TestPage and
+  permission refusals and tests whose body never ran.
+- **When the caveat is added:** when that list is not empty and the run has survivors, `validity.caveats` carries
+  `survivors-beside-unrun-tests`, and `survivorsBesideUnrunTests` holds the counts (`survivors`, `notRunTests` and, on v3,
+  `sharingACodeunit`). The score line prints one sentence about it as well.
+- **How to read the count:** it is an UPPER BOUND on the survivors at risk, because every `survived` and `known-survivor`
+  row is flagged. No verdict and no score changes.
+- **The v3 hint:** `sharingACodeunit` counts the survivors carrying the `[v3-refused-test-nearby]` note. It is a hint, not
+  a bound.
+- **Before quoting a survivor as a test gap, check this caveat.**
+
 ### `lethal explain report.json`: what it MEANS (checked)
 
-`explainSchemaVersion: 33`. The top level carries `contract`, `score`, `survivors`, `notMeasured`,
+`explainSchemaVersion: 35`. The top level carries `contract`, `score`, `survivors`, `notMeasured`,
 `survivorSelection` and `markIdentityScheme`. Each `survivors` row carries `executionProven`,
 `reach` and `markKey`. The top level can also carry `markKeysStale`. Each `survivors` row can
 also carry `mark`. Explain writes it for a report that records its numbering facts.
@@ -1127,7 +1171,10 @@ now is not skipped; it reads `no-coverage`. On `--resume` the same two cases war
 deploy any more: `resume-batch-carried` is no longer emitted. Each batch is deployed, and its
 baseline is reused from a saved snapshot when one matches (`resume-baseline-reused`), or run again
 when none does. That costs one deploy per fully scored batch per resume (about 40 s on a hosted
-server), plus a baseline when no snapshot matches (R643 tracks the cost). The one exception: a batch
+server), plus a baseline when no snapshot matches (R643 tracks the cost). A snapshot saved before PR-392
+(2026-11-23) has no `payload_format` and is never reused: it lacks PR-387's body-never-ran marks, so reusing it would
+under-count `notRunAtBaseline`. So the first `--resume` of such a store re-runs each batch's baseline once (R1199).
+No verdict moves. The one exception: a batch
 whose every mutant stranded the tier in a prior run (R53) has nothing to run and is not deployed.
 A stranded mutant is skipped before coverage, so it keeps its skip note even when nothing covers it
 now.
@@ -1180,6 +1227,15 @@ Stated so a consumer does not read an absence as a finding.
   assumption (any assumption, not only this one). Fewer tests run: al-runner refuses calls it has not
   measured without a client (CurrentClientType, `Page.Run` with a record, a request page with a
   handler). On PaymentPractices' header table it then agreed with BC on every kill and every survivor.
+- `"ciSessionKind": "client" | "headless"` (top level, no default; R1168, PR-307) names the session kind your own CI runs
+  tests in. `--ci-session-kind client|headless` overrides it (flag, then config, then unset), for a config file you may
+  not edit (PR-311).
+  - **When it is required:** a run whose final test list holds a session-kind-sensitive test refuses without it, by name
+    (`SessionKindUnsetError`). A test is sensitive when it binds `HandlerFunctions`, or, on al-runner-v3, when it may
+    open a TestPage or the scan cannot read it.
+  - **What the report shows:** it lists those tests in `sessionKindSensitiveTests`, and adds the `session-kind-mismatch`
+    caveat when the backend's kind differs from yours. bcdev is headless; v3 is client unless `noClient`.
+  - **The limit:** a test that changes only through APP code (an unhandled Confirm) is not seen (R1169).
 - One-shot calls ask al-runner to skip after a timeout when the build supports it (R897): after a test
   is stopped at the limit, the rest of its codeunit is not run, so a hung mutant costs one limit.
 - A test that opens a `TestPage` cannot be scored, and on the default path one such test can hang
@@ -1226,7 +1282,7 @@ What remains is small and named, so a stranded run is diagnosable rather than my
   a call the loop's progress needs, and a deleted operand holding such a call (R855). They do not
   follow a callee: a condition inside `Done()`, read by `until Done()`, is claimed. That is the shape
   of R837, and `negate-conditional` has the same exposure.
-- The opt-in `condition-true` (`if C then T` to `if true then T`, an `if` without `else` only) refuses a site
+- `condition-true` (a default operator since PR-209; `--profile slim` leaves it out) (`if C then T` to `if true then T`, an `if` without `else` only) refuses a site
   whose then-arm holds a `while` or `repeat` that does not step a cursor, writes a name an enclosing loop's exit
   reads (`I -= 1`, `A := 0`, a requeue, a helper reset), restarts or steps back the exit's cursor
   (`R.FindFirst()`, `R.Next(-1)`), or calls back into its own procedure (recursion, also through a chain of
@@ -1238,7 +1294,7 @@ What remains is small and named, so a stranded run is diagnosable rather than my
   that calls back, `Codeunit.Run` of its own codeunit from `OnRun` through another object, and a write that a
   LATER loop reads (`Step := 1; if Backwards then Step := -1; while I < N do I += Step;`), the same exposure the
   default operators have.
-- The opt-in `blank-argument` (a variable argument to its blank) refuses a callee parameter that a `for`, a `while`
+- `blank-argument` (a default operator since PR-209; `--profile slim` leaves it out) (a variable argument to its blank) refuses a callee parameter that a `for`, a `while`
   or a `repeat` reads. The one loop it skips is a `for` with a local control variable (a `var` of the procedure
   that holds the loop: not a parameter, not a global, since a helper can write a global) that is neither assigned
   (`I := ...`, `I -= 1`) nor passed to a call (it could be a `var` parameter): its bound is read once. Every `while` and

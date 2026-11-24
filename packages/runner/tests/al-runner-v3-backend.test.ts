@@ -10,6 +10,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
@@ -45,6 +46,10 @@ import {
   v3CallDeadlineMs,
   v3CompileRefusal,
   v3MissingDependencies,
+  V3_NOT_RUN_SUFFIX,
+  V3_STALE_BUFFER_NOTE,
+  V3_STALE_BUFFER_TEXT,
+  staleBufferGuard,
   v3RowVerdict,
   v3TestDataOffNote,
 } from "../src/al-runner-v3-backend";
@@ -61,13 +66,14 @@ import {
   V3_CAPABILITY_FACTS,
 } from "../src/al-runner-v3-contract";
 import { serveRow } from "../src/al-runner-v3-entries";
-import { sha256OfFile } from "../src/al-runner-v3-pin";
+import { currentV3Build, sha256OfFile } from "../src/al-runner-v3-pin";
 import * as pinsNs from "../src/al-runner-v3-pins";
 import { AlRunnerV3CoverageJoinError } from "../src/al-runner-v3-sleep";
 import { TestAppProofStore, testAppCacheKey } from "../src/al-runner-v3-testapp-cache";
 import { AlcCompileError, type ArtifactIo, ArtifactPrepareError } from "../src/artifact";
 import { killMessageOf, looksLikeAssertionFailure } from "../src/assertion-screen";
 import type { RunOpts, TestMethodRef } from "../src/backend";
+import { v3SectionPassThrough } from "../src/cli";
 import { noGreenBaselineNote, runOnce } from "../src/orchestrator";
 import { describeTestPermissionsRefusal } from "../src/permission-canary";
 import type { SpawnFn } from "../src/publisher";
@@ -502,7 +508,12 @@ describe("R639 r9 §2: status() passes candidate into the unlike-bc refusals and
       },
     ],
   };
-  async function statusOf(candidate: boolean, contract: V3ContractResult = UNLIKE) {
+  async function statusOf(
+    candidate: boolean,
+    contract: V3ContractResult = UNLIKE,
+    extra: (bin: string) => Partial<AlRunnerV3Config> = () => ({}),
+    onNotify?: (code: string, message: string) => void,
+  ) {
     const l = await layout();
     const NS = 'xmlns="http://schemas.microsoft.com/navx/2015/manifest"';
     await writeFile(
@@ -526,9 +537,11 @@ describe("R639 r9 §2: status() passes candidate into the unlike-bc refusals and
     const b = backendOf(l, versionOnly, fakeAlc().io, {
       alRunnerPath: bin,
       ...(candidate ? { candidate: true } : {}),
+      ...extra(bin),
     });
     // The probe itself is tested in al-runner-v3-contract.test.ts; seed its result, test the wiring.
     (b as unknown as { contract: V3ContractResult }).contract = contract;
+    if (onNotify !== undefined) b.setNotify(onNotify);
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       const s = await b.status();
@@ -549,6 +562,92 @@ describe("R639 r9 §2: status() passes candidate into the unlike-bc refusals and
   test("R834: status() says which binary and version this session runs", async () => {
     const { warned } = await statusOf(true);
     expect(warned).toMatch(/\[lethal\] al-runner: \S*al-runner \(al-runner 3\.0\.0-alpha\.4\+edge/);
+  });
+  const PNC = "al-runner-v3-pinned-not-current";
+  test("PR-294: the path equals the resolved current: no notice", async () => {
+    const { warned } = await statusOf(false, UNLIKE, (bin) => ({ currentBuildPath: () => bin }));
+    expect(warned).not.toContain(PNC);
+  });
+  test("PR-294: another build than current: one notice naming both paths", async () => {
+    const seen: Array<[string, string]> = [];
+    await statusOf(
+      false,
+      UNLIKE,
+      () => ({ currentBuildPath: () => "/builds/main-current/al-runner" }),
+      (c, m) => seen.push([c, m]),
+    );
+    const w = seen.filter(([c]) => c === PNC);
+    expect(w).toHaveLength(1);
+    const m = w[0]?.[1] ?? "";
+    expect(m).toMatch(
+      /^\[lethal\] al-runner-v3-pinned-not-current: this session runs \S*al-runner \(/,
+    );
+    expect(m).toContain("/builds/main-current/al-runner");
+    expect(m).toContain("alRunnerV3.path");
+  });
+  test("PR-294: once per session: two status() calls give one notice, a fresh notifier one more", async () => {
+    const l = await layout();
+    const NS = 'xmlns="http://schemas.microsoft.com/navx/2015/manifest"';
+    await writeFile(
+      join(l.deps, "Microsoft_System Application.app"),
+      buildFakeAppWithEntries({
+        "NavxManifest.xml": `<?xml version="1.0"?><Package ${NS}><App Id="1" Name="System Application" Publisher="Microsoft" Version="28.0.46665.47126" /></Package>`,
+      }),
+    );
+    const bin = join(l.root, "al-runner");
+    await writeFile(bin, "binary");
+    await writeFile(
+      join(l.root, ".gated"),
+      JSON.stringify({
+        version: VERSION,
+        binarySha256: await sha256OfFile(bin),
+        lethalCommit: "a".repeat(40),
+      }),
+    );
+    const b = backendOf(l, versionOnly, fakeAlc().io, {
+      alRunnerPath: bin,
+      currentBuildPath: () => "/builds/main-current/al-runner",
+    });
+    (b as unknown as { contract: V3ContractResult }).contract = UNLIKE;
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const first: string[] = [];
+      b.setNotify((c) => first.push(c));
+      await b.status();
+      await b.status();
+      expect(first.filter((c) => c === PNC)).toHaveLength(1);
+      const second: string[] = [];
+      b.setNotify((c) => second.push(c));
+      await b.status();
+      expect(second.filter((c) => c === PNC)).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+  test("PR-294: the default current lookup: a link resolves to its target, none gives undefined", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pr294-"));
+    try {
+      const target = join(root, "build-1");
+      await mkdir(target);
+      await writeFile(join(target, "al-runner"), "binary");
+      await symlink(target, join(root, "current"));
+      expect(currentV3Build(join(root, "current", "al-runner"))).toBe(
+        await realpath(join(target, "al-runner")),
+      );
+      expect(currentV3Build(join(root, "none", "al-runner"))).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  test("PR-294: candidate mode with another build: no notice", async () => {
+    const { warned } = await statusOf(true, UNLIKE, () => ({
+      currentBuildPath: () => "/builds/main-current/al-runner",
+    }));
+    expect(warned).not.toContain(PNC);
+  });
+  test("PR-294: no current link: no notice", async () => {
+    const { warned } = await statusOf(false, UNLIKE, () => ({ currentBuildPath: () => undefined }));
+    expect(warned).not.toContain(PNC);
   });
   test("R834: a refused binary is not announced", async () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
@@ -903,13 +1002,66 @@ describe("R-762 B: the §6 Sleep rule is retired only on a pinned build whose pr
         warn.mockRestore();
       }
     });
+
+  // PR-281: the details line names the unit-order knob only when the order is `costliest` (opt-in).
+  for (const unitOrder of ["costliest", "manifest", undefined] as const)
+    test(`PR-281: status() details ${unitOrder === "costliest" ? "name" : "do not name"} the unit-order knob (unitOrder ${unitOrder ?? "unset"})`, async () => {
+      const VERSION = "al-runner 3.0.0-alpha.5+edge.20261024 (dcdf9e821)";
+      const versionOnly: SpawnFn = async () => ({
+        exitCode: 0,
+        stdout: `${VERSION}\n`,
+        stderr: "",
+      });
+      const l = await layout();
+      const NS = 'xmlns="http://schemas.microsoft.com/navx/2015/manifest"';
+      await writeFile(
+        join(l.deps, "Microsoft_System Application.app"),
+        buildFakeAppWithEntries({
+          "NavxManifest.xml": `<?xml version="1.0"?><Package ${NS}><App Id="1" Name="System Application" Publisher="Microsoft" Version="28.0.46665.47126" /></Package>`,
+        }),
+      );
+      const bin = join(l.root, "al-runner");
+      await writeFile(bin, "binary");
+      await writeFile(
+        join(l.root, ".gated"),
+        JSON.stringify({
+          version: VERSION,
+          binarySha256: await sha256OfFile(bin),
+          lethalCommit: "a".repeat(40),
+        }),
+      );
+      const b = backendOf(l, versionOnly, fakeAlc().io, {
+        alRunnerPath: bin,
+        ...(unitOrder !== undefined ? { unitOrder } : {}),
+      });
+      (b as unknown as { contract: V3ContractResult }).contract = { facts: [] };
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const s = await b.status();
+        expect(s.ok).toBe(true);
+        if (unitOrder === "costliest")
+          expect(s.details).toContain(
+            "procedure scopes handed out costliest first by LETHAL_V3_UNIT_ORDER=costliest (PR-281)",
+          );
+        else expect(s.details).not.toContain("LETHAL_V3_UNIT_ORDER");
+      } finally {
+        warn.mockRestore();
+      }
+    });
 });
 
 // PR-117 (M1): status() hands the build's own gate record to the batching accessor.
 describe("PR-117: status() reads baseline batching from the build's own .gated", () => {
   const VERSION = "al-runner 3.0.0-alpha.5+edge.20261024 (dcdf9e821)";
   const COMMIT = "a1".repeat(20);
-  async function batching(batchFacts: Record<string, string> | undefined) {
+  let lastStatus: { ok: boolean; details: string } | undefined;
+  async function batching(
+    batchFacts: Record<string, string> | undefined,
+    extra: Partial<AlRunnerV3Config> = {},
+    wantOk = true,
+    /** PR-256 amendment 1: this session's probe reading of sleep-is-noop (gone: the rule is retired). */
+    sleep: "gone" | "defect-present" = "gone",
+  ) {
     const sleepPin = pinsNs.V3_BUILD_PINS.find((p) => p.legC["sleep-is-noop"]?.verdict === "gone");
     if (sleepPin === undefined) throw new Error("no pin records sleep-is-noop gone");
     const versionOnly: SpawnFn = async () => ({ exitCode: 0, stdout: `${VERSION}\n`, stderr: "" });
@@ -933,7 +1085,7 @@ describe("PR-117: status() reads baseline batching from the build's own .gated",
         ...(batchFacts !== undefined ? { batchFacts } : {}),
       }),
     );
-    const b = backendOf(l, versionOnly, fakeAlc().io, { alRunnerPath: bin });
+    const b = backendOf(l, versionOnly, fakeAlc().io, { alRunnerPath: bin, ...extra });
     (b as unknown as { contract: V3ContractResult }).contract = {
       facts: [
         ...V3_CAPABILITY_FACTS.map((fact) => ({
@@ -946,7 +1098,7 @@ describe("PR-117: status() reads baseline batching from the build's own .gated",
         {
           fact: "sleep-is-noop",
           kind: "defect" as const,
-          verdict: "gone" as const,
+          verdict: sleep,
           expected: "x",
           measured: "m",
         },
@@ -955,7 +1107,8 @@ describe("PR-117: status() reads baseline batching from the build's own .gated",
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       const s = await b.status();
-      expect(s.ok).toBe(true);
+      lastStatus = s;
+      expect(s.ok).toBe(wantOk);
       return b;
     } finally {
       warn.mockRestore();
@@ -975,6 +1128,30 @@ describe("PR-117: status() reads baseline batching from the build's own .gated",
     expect(b.baselineBatchingOffWhy()).toBe(
       `this build's gate record (lethalCommit ${COMMIT}) has no batchFacts`,
     );
+  });
+
+  test("PR-256 (rule 7): stopGroups on a build whose gate record lacks stop-groups is refused by name; with it, allowed; off, nothing moves", async () => {
+    const eight = Object.fromEntries(V3_CAPABILITY_FACTS.map((n) => [n, "matches"]));
+    await batching(eight, { stopGroups: true }, false);
+    expect(lastStatus?.details).toContain("al-runner-v3-stop-groups-unsupported");
+    expect(lastStatus?.details).toContain(COMMIT);
+    await batching({ ...eight, "stop-groups": "diverged" }, { stopGroups: true }, false);
+    expect(lastStatus?.details).toContain("al-runner-v3-stop-groups-unsupported");
+    await batching({ ...eight, "stop-groups": "matches" }, { stopGroups: true }, true);
+    await batching(eight, { stopGroups: false }, true);
+    await batching(eight, {}, true);
+  });
+
+  test("PR-256 amendment 1 item 1: the fact present but the §6 Sleep rule in force (probe reads sleep-is-noop present): refused by name", async () => {
+    const withFact = {
+      ...Object.fromEntries(V3_CAPABILITY_FACTS.map((n) => [n, "matches"])),
+      "stop-groups": "matches",
+    };
+    await batching(withFact, { stopGroups: true }, false, "defect-present");
+    expect(lastStatus?.details).toContain("al-runner-v3-stop-groups-unsupported");
+    expect(lastStatus?.details).toContain("§6 Sleep rule applies");
+    // the flag off: the same build is no refusal of PR-256's
+    await batching(withFact, {}, true, "defect-present");
   });
 });
 
@@ -1025,6 +1202,9 @@ describe("T3, T4, T23", () => {
 describe("T22: the proof is bound to the bytes v3 reads (c1-c5)", () => {
   async function deployed() {
     const l = await layout();
+    // PR-259 (review S1): a file that sorts FIRST in each tree, so a change to Logic/Tests is not the first file read.
+    await writeFile(join(l.batch, "AAFirst.Codeunit.al"), "codeunit 79101 AAFirst { }");
+    await writeFile(join(l.testDir, "AAFirst.Codeunit.al"), "codeunit 79102 AAFirstTest { }");
     const v3 = fakeV3(allPass, { coverage: plainCoverage });
     const b = backendOf(l, v3.spawn, fakeAlc().io);
     await b.deploy(l.batch);
@@ -1033,6 +1213,14 @@ describe("T22: the proof is bound to the bytes v3 reads (c1-c5)", () => {
   }
   const active = (l: Layout) => join(l.scratch, "active");
   const run = (b: AlRunnerV3Backend) => b.run(ref("A"), { coverage: "none", timeoutMs: 1000 });
+  /** PR-259: the middle letter of the file swapped for another, so the size stays and only one byte moves. */
+  const flipOneByte = async (p: string) => {
+    const text = await readFile(p, "utf8");
+    const letters = [...text.matchAll(/[A-Za-z]/g)];
+    const at = letters[Math.floor(letters.length / 2)]?.index;
+    if (at === undefined) throw new Error(`no letter in ${p}`);
+    await writeFile(p, text.slice(0, at) + (text[at] === "X" ? "Y" : "X") + text.slice(at + 1));
+  };
 
   test("an unchanged folder runs (the other direction)", async () => {
     const { b, v3 } = await deployed();
@@ -1108,6 +1296,23 @@ describe("T22: the proof is bound to the bytes v3 reads (c1-c5)", () => {
     [
       "R767: a test .al added to the test dir",
       (l) => writeFile(join(l.testDir, "Extra.Codeunit.al"), "codeunit 79152 Extra { }"),
+    ],
+    // PR-259 (R1156): the bound print catches one byte changed in place, in either tree, and a rename.
+    [
+      "PR-259: one byte changed in place in a target .al",
+      (l) => flipOneByte(join(active(l), "Logic.Codeunit.al")),
+    ],
+    [
+      "PR-259: one byte changed in place in a test .al",
+      (l) => flipOneByte(join(l.testDir, "Tests.Codeunit.al")),
+    ],
+    [
+      "PR-259: a target .al renamed, its bytes unchanged",
+      (l) => rename(join(active(l), "Logic.Codeunit.al"), join(active(l), "Logic2.Codeunit.al")),
+    ],
+    [
+      "PR-259: a test .al renamed, its bytes unchanged",
+      (l) => rename(join(l.testDir, "Tests.Codeunit.al"), join(l.testDir, "Tests2.Codeunit.al")),
     ],
     [
       // R631 review L1: drift, never ProjectSymlinkRefusedError (asserted by the class below).
@@ -1566,6 +1771,52 @@ describe("R885: demo data, on the one-shot path", () => {
     expect(() => v({ downloadDemoData: "no" })).toThrow("downloadDemoData");
   });
 
+  test("PR-237 the config key serveTimings: off by default, boolean only, passed on by the CLI only when on", () => {
+    const base = { packagesDir: "/p", bcVersion: "28.0.1.2", path: "/x" };
+    const v = (extra: object) => validateAlRunnerV3Config({ ...base, ...extra }, () => true);
+    expect(v({}).serveTimings).toBe(false);
+    expect(v({ serveTimings: true }).serveTimings).toBe(true);
+    expect(v({ serveTimings: false }).serveTimings).toBe(false);
+    expect(() => v({ serveTimings: "yes" })).toThrow("serveTimings");
+    expect(v3SectionPassThrough(v({ serveTimings: true })).serveTimings).toBe(true);
+    expect("serveTimings" in v3SectionPassThrough(v({}))).toBe(false);
+    expect("serveTimings" in v3SectionPassThrough(v({ serveTimings: false }))).toBe(false);
+  });
+
+  test("PR-282 the CLI passes companies on to the backend's config only when set", () => {
+    const base = { packagesDir: "/p", bcVersion: "28.0.1.2", path: "/x" };
+    const v = (extra: object) => validateAlRunnerV3Config({ ...base, ...extra }, () => true);
+    expect(v3SectionPassThrough(v({ companies: "CRONUS,Other" })).companies).toBe("CRONUS,Other");
+    expect("companies" in v3SectionPassThrough(v({}))).toBe(false);
+  });
+
+  test("PR-227 the config key daemonStderrDir: absent by default, resolved to absolute, empty or non-string refused", () => {
+    const base = { packagesDir: "/p", bcVersion: "28.0.1.2", path: "/x" };
+    const v = (extra: object) => validateAlRunnerV3Config({ ...base, ...extra }, () => true);
+    expect(v({}).daemonStderrDir).toBeUndefined();
+    expect("daemonStderrDir" in v({})).toBe(false);
+    // resolve(): on Windows an absolute "/m/daemons" gains the drive letter
+    expect(v({ daemonStderrDir: "/m/daemons" }).daemonStderrDir).toBe(resolve("/m/daemons"));
+    expect(v({ daemonStderrDir: "rel/d" }).daemonStderrDir).toBe(resolve("rel/d"));
+    expect(() => v({ daemonStderrDir: "" })).toThrow("daemonStderrDir");
+    expect(() => v({ daemonStderrDir: 3 })).toThrow("daemonStderrDir");
+    // and the CLI passes it on to the backend's config (v3SectionPassThrough), with its siblings
+    expect(v3SectionPassThrough(v({ daemonStderrDir: "/m/daemons" })).daemonStderrDir).toBe(
+      resolve("/m/daemons"),
+    );
+    expect("daemonStderrDir" in v3SectionPassThrough(v({}))).toBe(false);
+    expect(
+      v3SectionPassThrough(
+        v({ noClient: true, downloadDemoData: false, daemonMaxRequests: 7, cacheDir: "/c" }),
+      ),
+    ).toMatchObject({
+      noClient: true,
+      downloadDemoData: false,
+      daemonMaxRequests: 7,
+      cacheDir: "/c",
+    });
+  });
+
   test("R907 the config key noClient: default from the constant, boolean only, passed through", () => {
     const base = { packagesDir: "/p", bcVersion: "28.0.1.2", path: "/x" };
     const v = (extra: object) => validateAlRunnerV3Config({ ...base, ...extra }, () => true);
@@ -1651,6 +1902,21 @@ describe("R885: demo data, on the one-shot path", () => {
     const on = await run({ license: { path: "/l/x.bclicense", sha256: "a".repeat(64) } });
     expect(on[on.indexOf("--license") + 1]).toBe("/l/x.bclicense");
     expect(await run({})).not.toContain("--license");
+  });
+
+  test("PR-282 a one-shot call carries --companies <value> exactly when it is set", async () => {
+    const run = async (extra: Partial<AlRunnerV3Config>) => {
+      const l = await layout();
+      const v3 = fakeV3(allPass);
+      const b = backendOf(l, v3.spawn, fakeAlc().io, extra);
+      await b.deploy(l.batch);
+      await b.activate("M0002");
+      await b.run(ref("A"), { coverage: "none", timeoutMs: 1000 });
+      return v3.calls[0] ?? [];
+    };
+    const on = await run({ companies: "CRONUS,Other" });
+    expect(on[on.indexOf("--companies") + 1]).toBe("CRONUS,Other");
+    expect(await run({})).not.toContain("--companies");
   });
 
   test("R938 a one-shot call carries --environment <value> exactly when the choice is stated", async () => {
@@ -2163,6 +2429,51 @@ describe("§4 selection, the cache and T5 / T21 / T28 / T29", () => {
     );
   });
 
+  // PR-396: #8721's stale-buffer text under a mutant is never a kill; at baseline it is left as it is.
+  const STALE = `The changes to the Document Template Line record ${V3_STALE_BUFFER_TEXT}. Close the page, reopen it, and try again.`;
+
+  test("PR-396: the #8721 text stays a fail at baseline, and under a mutant reads error with the note, never a kill", async () => {
+    const l = await layout();
+    const staleA = () => [{ method: "A", status: "fail" as const, message: STALE }];
+    const b = backendOf(l, fakeV3(staleA).spawn, fakeAlc().io);
+    await b.deploy(l.batch);
+    const base = await b.run(ref("A"), { coverage: "none", timeoutMs: 1000 });
+    expect(base.outcome).toBe("fail");
+    expect(base.failureMessage ?? "").not.toContain(V3_STALE_BUFFER_NOTE);
+    await b.activate("M0001");
+    const mut = await b.run(ref("A"), { coverage: "none", timeoutMs: 1000 });
+    expect([mut.outcome, mut.runnerRow]).toEqual(["error", "runner-test-error"]);
+    expect(mut.failureMessage ?? "").toContain(V3_STALE_BUFFER_TEXT);
+    expect(mut.failureMessage ?? "").toContain(V3_STALE_BUFFER_NOTE);
+    // Not a PR-144 recheck target: no not-run suffix.
+    expect(mut.failureMessage ?? "").not.toContain(V3_NOT_RUN_SUFFIX);
+  });
+
+  test("PR-396: another fail text under a mutant stays a kill (control)", async () => {
+    const l = await layout();
+    const failA = () => [
+      { method: "A", status: "fail" as const, message: "Assert.AreEqual failed" },
+    ];
+    const b = backendOf(l, fakeV3(failA).spawn, fakeAlc().io);
+    await b.deploy(l.batch);
+    await b.activate("M0001");
+    const mut = await b.run(ref("A"), { coverage: "none", timeoutMs: 1000 });
+    expect(mut.outcome).toBe("fail");
+    expect(mut.failureMessage ?? "").not.toContain(V3_STALE_BUFFER_NOTE);
+  });
+
+  test("PR-396: staleBufferGuard touches only a FAIL holding the text", () => {
+    const r = { codeunitId: 1, codeunitName: "T", method: "A" };
+    const stale = { ref: r, outcome: "fail" as const, durationMs: 1, failureMessage: STALE };
+    expect(staleBufferGuard(stale).outcome).toBe("error");
+    for (const v of [
+      { ...stale, outcome: "pass" as const },
+      { ...stale, outcome: "error" as const },
+      { ...stale, failureMessage: "Assert.AreEqual failed" },
+    ])
+      expect(staleBufferGuard(v)).toBe(v);
+  });
+
   test("R590: v3's hidden-notes line refuses too (a skipped line may be among the hidden)", async () => {
     const l = await layout();
     const hidden = "... 14 more dependency notes (--verbose lists them)";
@@ -2386,6 +2697,16 @@ describe("§5 the row decoder", () => {
     expect(lic.runnerRow).toBe("runner-refused");
     expect(lic.failureMessage).toContain("set alRunnerV3.license to a .bclicense file (R956)");
     expect(refuse("NotRun: something else").failureMessage).not.toContain("alRunnerV3.license");
+  });
+  test("PR-282: a Company-table refusal names alRunnerV3.companies; another refusal does not", () => {
+    const refuse = (message: string) =>
+      v3RowVerdict(r, row({ status: "error", notRun: true, message }), 3, 10, undefined);
+    const c = refuse("NotRun: out-of-scope: FindSet on the Company table: the database may hold");
+    expect(c.runnerRow).toBe("runner-refused");
+    expect(c.failureMessage).toContain(
+      "set alRunnerV3.companies to the database's companies (PR-282)",
+    );
+    expect(refuse("NotRun: something else").failureMessage).not.toContain("alRunnerV3.companies");
   });
   // R963: a row with no durationMs of its own has an UNKNOWN test time; the call's wall (here 777)
   // is never stored as the test's. With one, it is passed through. Each branch its own test.

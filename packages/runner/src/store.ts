@@ -369,6 +369,9 @@ export interface TestNarrowing {
 /** R896: the `runner_build` suffix of an `isolation: "auto"` run (always last). */
 export const ISOLATION_AUTO_BUILD_TAG = " isolation-auto";
 
+/** PR-303 rule 4: the note on a mutant whose every covering codeunit was pruned. History never lends such a survivor. */
+export const PRUNED_NOTE = "pruned: no covering test reaches its site";
+
 /** R586: the session side of `runMayLend` step 1: its backend and, on v3, its build. */
 export interface LendingSession {
   readonly backend: string;
@@ -704,6 +707,14 @@ CREATE TABLE IF NOT EXISTS installed_bundle_files (
 );
 `;
 
+/**
+ * PR-392 (R1199): the format of a `baseline_snapshots` payload. 2: its rows carry `bodyNeverRan` where the test body never
+ * ran (PR-387). A row written before the column existed reads NULL and is never reused (`=` never matches NULL), so a
+ * snapshot that lacks the flag cannot hide a not-run test from `notRunAtBaseline`. Bump it whenever the payload's rows
+ * gain a field a reader depends on. 1 was never written (the rows before this column read NULL), so never reuse 1.
+ */
+export const SNAPSHOT_PAYLOAD_FORMAT = 2;
+
 export class ResultsStore {
   readonly db: Database;
   /**
@@ -751,6 +762,11 @@ export class ResultsStore {
     }>;
     if (!snapCols.some((c) => c.name === "backend_state")) {
       this.db.exec("ALTER TABLE baseline_snapshots ADD COLUMN backend_state TEXT");
+    }
+    // PR-392 (R1199): the payload's format; NULL on every row written before it, which
+    // `findBaselineSnapshot` never reuses (see `SNAPSHOT_PAYLOAD_FORMAT`).
+    if (!snapCols.some((c) => c.name === "payload_format")) {
+      this.db.exec("ALTER TABLE baseline_snapshots ADD COLUMN payload_format INTEGER");
     }
     const cols = this.db.query("PRAGMA table_info(mutants)").all() as Array<{ name: string }>;
     if (!cols.some((c) => c.name === "failure_note")) {
@@ -1431,8 +1447,11 @@ export class ResultsStore {
     }[];
     // The tag sits before the optional license tag (R956) and the (always last) isolation-auto tag;
     // both stay in the stripped build, so another license is still a different build.
-    const tag = / environment-(saas|onprem)( license-[0-9a-f]{8})?( isolation-auto)?$/;
-    const strip = (b: string) => b.replace(tag, "$2$3");
+    // PR-282: the optional companies tag sits between the license tag and isolation-auto.
+    const tag =
+      / environment-(saas|onprem)( license-[0-9a-f]{8})?( companies-[0-9a-f]{8})?( refused-cut-tail)?( stop-groups)?( isolation-auto)?$/;
+    // PR-297: refused-cut-tail, then PR-256's stop-groups, sit before isolation-auto
+    const strip = (b: string) => b.replace(tag, "$2$3$4$5$6");
     for (const r of rows) {
       if (r.runner_build === q.runnerBuild || strip(r.runner_build) !== strip(q.runnerBuild))
         continue;
@@ -2155,8 +2174,8 @@ export class ResultsStore {
   }): void {
     this.db
       .query(
-        `INSERT INTO baseline_snapshots (run_id, batch_index, batch_hash, test_app_hash, payload, backend_state)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO baseline_snapshots (run_id, batch_index, batch_hash, test_app_hash, payload, backend_state, payload_format)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.runId,
@@ -2165,6 +2184,7 @@ export class ResultsStore {
         input.testAppHash,
         JSON.stringify(input.baseline),
         input.backendState === undefined ? null : JSON.stringify(input.backendState),
+        SNAPSHOT_PAYLOAD_FORMAT,
       );
   }
 
@@ -2219,6 +2239,7 @@ export class ResultsStore {
       .query(
         `SELECT run_id, batch_index, batch_hash, test_app_hash, payload, backend_state FROM baseline_snapshots
          WHERE batch_hash = ?1 AND test_app_hash = ?2
+           AND payload_format = ?7
            AND run_id IN (SELECT id FROM runs WHERE COALESCE(identity_scheme, 1) = ?3 AND coverage_mode = ?4
              AND test_app_hash = baseline_snapshots.test_app_hash
              AND test_app_proven = 1
@@ -2236,6 +2257,7 @@ export class ResultsStore {
         coverageMode,
         testAppDeps,
         serverGeneration ?? null,
+        SNAPSHOT_PAYLOAD_FORMAT,
       ) as {
       run_id: number;
       batch_index: number;
@@ -2549,6 +2571,24 @@ export class ResultsStore {
     };
   }
 
+  /**
+   * PR-225 (R1142): the tests (`Codeunit.Method`) whose outcome under one mutant of this run was not `pass`. The
+   * mutant is named by its code AND batch, because `mutant_code` alone is unique only within a batch (I5). Rows run
+   * with NO mutant active (an unmutated kill confirm, a warm replay, a discovery confirm: `mutant_code` NULL) are not
+   * outcomes under the mutant, so they are left out.
+   */
+  notPassTestsOf(runId: number, mutantCode: string, batchIndex: number): string[] {
+    const rows = this.db
+      .query(
+        `SELECT DISTINCT t.codeunit_name AS cu, t.method AS method FROM test_results t
+         JOIN mutants m ON m.id = t.mutant_row_id
+         WHERE t.run_id = ? AND m.run_id = ? AND m.mutant_code = ? AND m.batch_index = ? AND t.outcome <> 'pass'
+           AND t.mutant_code = m.mutant_code`,
+      )
+      .all(runId, runId, mutantCode, batchIndex) as { cu: string | null; method: string }[];
+    return rows.flatMap((r) => (r.cu === null ? [] : [`${r.cu}.${r.method}`]));
+  }
+
   /** R198: how many `test_results` rows in a run came from group calls, and for how many mutants. */
   groupedRows(runId: number): { rows: number; mutants: number } {
     const r = this.db
@@ -2785,7 +2825,8 @@ export class ResultsStore {
     const rows = this.db
       .query(
         "SELECT ast_hash, codeunit_name, procedure_name, operator_name, operator_major, identity_ordinal, file, member_hash, covering_tests FROM mutants " +
-          "WHERE run_id = ? AND verdict IN ('survived', 'known-survivor')",
+          // PR-303: a pruned survivor never ran a test, so it is never lent into another run.
+          "WHERE run_id = ? AND verdict IN ('survived', 'known-survivor') AND COALESCE(failure_note, '') NOT LIKE 'pruned:%'",
       )
       .all(run.id) as Array<{
       covering_tests: string | null;

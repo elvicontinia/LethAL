@@ -215,6 +215,19 @@ export function o1LoginWorkDate(
   return set === "cdo" ? pin?.o1?.cdoWorkDate : undefined;
 }
 
+/**
+ * PR-233: `judgeOrderProbe`'s `partnerLogin` for a set: the CDO set (the one with partner apps) only, `pinned` from the
+ * pin's `o1.partnerLoginRefusal.text`; the own set gets none, so it is judged as before.
+ */
+export function o1PartnerLogin(
+  set: string,
+  pin: { readonly o1?: { readonly partnerLoginRefusal?: { readonly text: string } } } | undefined,
+): { readonly pinned?: string } | undefined {
+  if (set !== "cdo") return undefined;
+  const text = pin?.o1?.partnerLoginRefusal?.text;
+  return text !== undefined ? { pinned: text } : {};
+}
+
 /** R807: how many package apps O1's CDO set must load: the pin's `cdoApps`, else 17 (alpha.7 to alpha.11). */
 export function o1CdoApps(
   pin: { readonly o1?: { readonly cdoApps?: number } } | undefined,
@@ -229,15 +242,43 @@ export function o1CdoApps(
  * R771: `loginWorkDate`, from a build pin, replaces the clock for WorkDate: the build runs Base
  * Application's login code, so in a demo company every Reader entry starts at that one date (R0.0 on
  * the fresh daemon included). A writer value still fails, and a pin naming a writer value is refused.
+ * PR-233 (pre-commitment master d46eaa1ee): `partnerLogin` is the CDO set's only (absent: the own set, judged as before).
+ * With `pinned` (a pin's `o1.partnerLoginRefusal.text`), exactly `O1_PARTNER_LOGIN_TESTS` must be refused with exactly that
+ * text in every W and C entry; a pass or any other answer there is a gate-fail. Without it, those tests refused with exactly
+ * `O1_PARTNER_LOGIN_TEXT` make the set `held` (a known coverage loss waiting for a pre-committed pin), never a pass; any
+ * other deviation is a gate-fail as before.
  */
 export function judgeOrderProbe(
   requests: readonly O1Request[],
   today: readonly string[],
   loginWorkDate?: string,
   commitRuns = false,
+  partnerLogin?: { readonly pinned?: string },
 ): { readonly outcome: "pass" | "held" | "gate-fail"; readonly lines: string[] } {
   const bad: string[] = [];
   const held: string[] = [];
+  const partnerHeld: string[] = [];
+  /** PR-233: one of the 4 row-insert tests in the CDO set; returns true when it judged the row (else: judge as before). */
+  const partnerRow = (
+    at: string,
+    t: string,
+    l: { readonly status: string; readonly message?: string },
+  ): boolean => {
+    if (partnerLogin === undefined || !O1_PARTNER_LOGIN_TESTS.includes(t)) return false;
+    const refused = l.status === "error";
+    if (partnerLogin.pinned !== undefined) {
+      if (!refused || l.message !== partnerLogin.pinned)
+        bad.push(
+          `${at}: ${t} is ${l.status} (${l.message ?? ""}), pre-committed refused by the pin's partner-login text (PR-233, #8239)`,
+        );
+      return true;
+    }
+    if (refused && l.message === O1_PARTNER_LOGIN_TEXT) {
+      partnerHeld.push(`${at}: ${t}`);
+      return true;
+    }
+    return false;
+  };
   if (
     loginWorkDate !== undefined &&
     O1_WRITER_VALUES.some((v) => `WORKDATE=${loginWorkDate}`.includes(v))
@@ -275,6 +316,7 @@ export function judgeOrderProbe(
         for (const t of O1_COMMIT_TESTS) {
           const l = mine.find((x) => x.name.endsWith(`.${t}`));
           if (l === undefined) bad.push(`${at}: no row for ${t}`);
+          else if (partnerRow(at, t, l)) continue;
           else if (commitRuns) {
             if (l.status !== "pass")
               bad.push(`${at}: ${t} is ${l.status} (${l.message ?? ""}), pre-committed pass`);
@@ -293,6 +335,7 @@ export function judgeOrderProbe(
         for (const t of O1_WRITE_TESTS) {
           const l = mine.find((x) => x.name.endsWith(`.${t}`));
           if (l === undefined) bad.push(`${at}: no row for ${t}`);
+          else if (partnerRow(at, t, l)) continue;
           else if (l.status !== "pass")
             bad.push(`${at}: ${t} is ${l.status} (${l.message ?? ""}), pre-committed pass`);
         }
@@ -314,9 +357,35 @@ export function judgeOrderProbe(
       }
     }
   }
+  // PR-233 (build review MED): held only for the WHOLE measured pattern, every row insert of every W and C entry refused;
+  // a part of it (an unstable or narrowed refusal) is a gate-fail, so a pin is never pre-committed for a pattern that moved.
+  const partnerAll = O1_PLAN.flat().filter((k) => k !== "R").length * 2;
+  if (partnerHeld.length > 0 && partnerHeld.length !== partnerAll)
+    bad.push(
+      `${partnerHeld.length} of the ${partnerAll} row-insert tests refused after the partner login, pre-committed all or none (PR-233; first: ${partnerHeld[0]})`,
+    );
   if (bad.length > 0) return { outcome: "gate-fail", lines: bad };
+  if (partnerHeld.length > 0)
+    held.push(
+      `held for PR-233's O1 pin: ${partnerHeld.length} row-insert tests refused after the partner login (al-runner f9116dc96, a known coverage loss on #8239; first: ${partnerHeld[0]}); re-pre-commit this build's pin with o1.partnerLoginRefusal`,
+    );
   return held.length > 0 ? { outcome: "held", lines: held } : { outcome: "pass", lines: [] };
 }
+
+/**
+ * PR-233: the tests O1's CDO set loses on builds carrying al-runner f9116dc96: the 4 that insert a row (measured on plain
+ * 0e6397742, `/coord/handoff/PR-233/o1-base/gate.log`: in every W and C entry, these and no others).
+ */
+export const O1_PARTNER_LOGIN_TESTS: readonly string[] = [
+  "InsertRow",
+  "InsertDepRow",
+  "CommitLocalRow",
+  "CommitDepRow",
+];
+
+/** PR-233: the refusal text those tests answer, exactly (status `error`, `notRun`). */
+export const O1_PARTNER_LOGIN_TEXT =
+  "NotRun: out-of-scope: a read of a global of SingleInstance codeunit Server Setting Impl.: OnAfterLogin raised to the login subscribers of the partner dependency apps changed it before the first test, and it is not the one codeunit of the one subscriber's app with the measured globals (two Integer, a List of [Text], a Text): what BC leaves there is not pinned";
 
 /** R807: O1's seed sub-check codeunit (`fixtures/sandbox-order-tests`): one test that reports Random, CreateGuid and a SystemId. */
 export const O1_SEED_CODEUNIT = 77055;
@@ -682,6 +751,282 @@ export function judgeRecheckLeg(
   return fails;
 }
 
+/**
+ * PR-347, leg TC: `sandbox-tailcut` (codeunit 76100 "Tailcut Logic", tests 76150 "Tailcut Tests") on serve-entries,
+ * `"isolation": "test"`, three sessions on `current`: TC-off (`refusedCutTail: false`), TC-on (the key absent, the new
+ * default) and TC-alone (`isolateTests`, where `refusedCut()` is undefined). Pre-commitment:
+ * `docs/superpowers/specs/2026-11-23-pr347-refused-cut-tail-default.md` (the table, and the judge's order (a1)-(e)).
+ * Not in `V3_GATE_LEGS` (a build gated before this leg stays gated), as RC is not.
+ */
+export const V3_TC_LEG = "TC";
+export const TC_SESSIONS = ["TC-off", "TC-on", "TC-alone"] as const;
+export type TcSession = (typeof TC_SESSIONS)[number];
+
+/** The report row's fields the TC judge reads. */
+export interface TcRow {
+  readonly procedureName: string;
+  readonly operatorName?: string;
+  readonly verdict: string;
+  readonly killingTest?: string;
+  readonly killingTestFailure?: string;
+}
+
+/** The test codeunit, the test T0 whose Format is refused, and the unstable test T4. */
+export const TC_CODEUNIT_ID = 76150;
+export const TC_STABLE_TAIL = [
+  "T1_DoubleTwo",
+  "T2_IsBigTen",
+  "T3_SetsMark",
+  "T5_IsSmallOne",
+  "T6_HalveZero",
+  "T7_HalveTen",
+];
+export const TC_UNSTABLE_TAIL = ["T4_SeesTheMark"];
+/** (a3) PR-393: TC-on sends exactly one pack per Halve mutant. */
+export const TC_PACKS = 2;
+/** The note the tail kills carry (`al-runner-v3-backend.ts`, `[refused-cut tail: ...]`). */
+export const TC_TAIL_NOTE = "[refused-cut tail";
+
+interface TcExpect {
+  readonly verdict: "killed" | "survived" | "error";
+  readonly killingTest?: string;
+}
+interface TcSite {
+  readonly procedureName: string;
+  readonly operator: string;
+  /** The row under TC-off, TC-on, TC-alone (the spec's table). */
+  readonly expect: Readonly<Record<TcSession, TcExpect>>;
+  /** Under TC-on the kill is a tail kill (alone, noted). */
+  readonly tailKillOn: boolean;
+}
+const cut: TcExpect = { verdict: "error" };
+const killedBy = (t: string): TcExpect => ({ verdict: "killed", killingTest: t });
+const sameKill = (t: string, off: TcExpect = cut): Record<TcSession, TcExpect> => ({
+  "TC-off": off,
+  "TC-on": killedBy(t),
+  "TC-alone": killedBy(t),
+});
+
+/** The ten mutants of codeunit 76100, as the offline census gave them (empty-block, return-value, boundary). */
+export const TC_TABLE: readonly TcSite[] = [
+  ...["lethal.empty-block", "lethal.return-value"].map((operator) => ({
+    procedureName: "Triple",
+    operator,
+    expect: sameKill("G0_TripleTwo", killedBy("G0_TripleTwo")),
+    tailKillOn: false,
+  })),
+  ...["lethal.empty-block", "lethal.return-value"].map((operator) => ({
+    procedureName: "Double",
+    operator,
+    expect: sameKill("T1_DoubleTwo"),
+    tailKillOn: true,
+  })),
+  ...["lethal.empty-block", "lethal.return-value"].map((operator) => ({
+    procedureName: "IsBig",
+    operator,
+    expect: sameKill("T2_IsBigTen"),
+    tailKillOn: true,
+  })),
+  {
+    // T4 covers it and passes only after T3: the tail never measures T4, so under TC-on it stays a cut `error`.
+    procedureName: "IsBig",
+    operator: "lethal.conditional-boundary",
+    expect: {
+      "TC-off": cut,
+      "TC-on": cut,
+      "TC-alone": { verdict: "survived" },
+    },
+    tailKillOn: false,
+  },
+  ...["lethal.empty-block", "lethal.return-value"].map((operator) => ({
+    procedureName: "IsSmall",
+    operator,
+    expect: sameKill("T5_IsSmallOne"),
+    tailKillOn: true,
+  })),
+  {
+    procedureName: "IsSmall",
+    operator: "lethal.conditional-boundary",
+    expect: {
+      "TC-off": cut,
+      "TC-on": { verdict: "survived" },
+      "TC-alone": { verdict: "survived" },
+    },
+    tailKillOn: false,
+  },
+  // PR-393: Halve returns 0 under both; T6 passes, so T7 kills whichever the walk reaches first (a pack of [T, mate]).
+  ...["lethal.empty-block", "lethal.return-value"].map((operator) => ({
+    procedureName: "Halve",
+    operator,
+    expect: sameKill("T7_HalveTen"),
+    tailKillOn: true,
+  })),
+];
+
+/** What the judge reads: the three sessions' rows, the cut counts, the tail's alone calls and its notices. */
+export interface TcInput {
+  readonly rows: Readonly<Record<TcSession, readonly TcRow[]>>;
+  /** The stats line's `cut before a baseline-refused test (PR-250)` of TC-off and TC-on. */
+  readonly cutEntries: { readonly off: number; readonly on: number };
+  /** TC-on's `refusedCutTailStats()`: alone calls of the stability pass and under a mutant. */
+  readonly tailCalls: {
+    readonly stability: number;
+    readonly mutant: number;
+    /** PR-393: the pack stats of the same call (PR-344). */
+    readonly packs: number;
+    readonly failedPacks: number;
+    readonly servedFromPack: number;
+  };
+  /** TC-on's `al-runner-v3-refused-cut-tail` notices (messages). */
+  readonly tailNotices: readonly string[];
+  /** What T0 showed in TC-off and TC-on: the refused tests and the `baseline-refused-cut` notice, printed on (a1). */
+  readonly t0Evidence: { readonly off: string; readonly on: string };
+  /** Each session's report: `notRunAtBaseline` and `survivorsBesideUnrunTests` (PR-381), judged by (f). */
+  readonly notRun: Readonly<
+    Record<
+      TcSession,
+      {
+        readonly notRunAtBaseline: readonly string[] | undefined;
+        readonly caveat: { readonly survivors: number; readonly notRunTests: number } | undefined;
+      }
+    >
+  >;
+}
+
+/** (f): T0, qualified as the report names it, is the one test not run at baseline in every session. */
+export const TC_NOT_RUN_TEST = "Tailcut Tests.T0_RefusedFormat";
+/** (f): the caveat's counts per session; TC-off has none (no survivor). */
+export const TC_CAVEAT: Readonly<
+  Record<TcSession, { readonly survivors: number; readonly notRunTests: number } | undefined>
+> = {
+  "TC-off": undefined,
+  "TC-on": { survivors: 1, notRunTests: 1 },
+  "TC-alone": { survivors: 2, notRunTests: 1 },
+};
+
+/** The names after `<label>: ` up to `;` or the end of the list, from the stability notice (`none` is empty). */
+function tcNoticeList(notice: string, label: "stable" | "unstable"): string[] | undefined {
+  const m = (
+    label === "stable" ? /(?:^|[ ;(])stable: ([^;]*?);/ : /unstable: ([^;(]*?)(?: \(|$)/
+  ).exec(notice);
+  const text = m?.[1];
+  if (text === undefined) return undefined;
+  return text === "none" ? [] : text.split(", ").map((s) => s.trim());
+}
+
+const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && [...a].sort().join("|") === [...b].sort().join("|");
+
+/**
+ * TC's judge, in the pre-committed order. Returns every failure, each starting `TC:`, in order:
+ * (a1) the cut fired, (a2) the tail ran, (a3) TC-on sent exactly 2 packs and none failed (PR-393), (b) the three tables per mutant, (c) TC-on equals TC-alone but for the one
+ * T4-only mutant, (d) tail kills carry the note, (f) PR-381's not-run field and caveat per session. (e), the frozen
+ * baseline, is the caller's (R332). (a1), (a2) and (a3) return early; (b), (c), (d) and (f) all report together.
+ * Pure, so it is red-checked offline.
+ */
+export function judgeTailcutLeg(input: TcInput): readonly string[] {
+  const fails: string[] = [];
+  for (const [s, n, evidence] of [
+    ["TC-off", input.cutEntries.off, input.t0Evidence.off],
+    ["TC-on", input.cutEntries.on, input.t0Evidence.on],
+  ] as const)
+    if (n <= 0)
+      fails.push(
+        `TC: no PR-250 cut: ${s} read "cut before a baseline-refused test (PR-250)" ${n}, pre-committed above 0 for codeunit ${TC_CODEUNIT_ID}. T0's evidence (${s}): ${evidence || "none"}`,
+      );
+  if (fails.length > 0) return fails;
+  const stabilityNotice = input.tailNotices.find((n) => n.includes(`codeunit ${TC_CODEUNIT_ID}:`));
+  const notRun = input.tailNotices.filter(
+    (n) => n.includes("stability pass was not run") || n.includes("stability pass failed"),
+  );
+  const stable =
+    stabilityNotice === undefined ? undefined : tcNoticeList(stabilityNotice, "stable");
+  const unstable =
+    stabilityNotice === undefined ? undefined : tcNoticeList(stabilityNotice, "unstable");
+  if (
+    stable === undefined ||
+    unstable === undefined ||
+    !sameSet(stable, TC_STABLE_TAIL) ||
+    !sameSet(unstable, TC_UNSTABLE_TAIL) ||
+    input.tailCalls.mutant <= 0
+  )
+    fails.push(
+      `TC: the tail route did not run: stability notice ${stabilityNotice === undefined ? "absent" : `"${stabilityNotice.slice(0, 400)}"`}, pre-committed stable ${TC_STABLE_TAIL.join(", ")} and unstable ${TC_UNSTABLE_TAIL.join(", ")}; tail alone calls under a mutant ${input.tailCalls.mutant}, pre-committed above 0${notRun.length > 0 ? `; ${notRun.map((n) => n.slice(0, 300)).join(" | ")}` : ""}`,
+    );
+  if (fails.length > 0) return fails;
+  // (a3) PR-393: PR-344's packing ran live: one pack per Halve mutant, none failed. servedFromPack is recorded only.
+  if (input.tailCalls.packs !== TC_PACKS || input.tailCalls.failedPacks !== 0)
+    fails.push(
+      `TC: packing did not run as pre-committed: packs ${input.tailCalls.packs} (pre-committed ${TC_PACKS}), failedPacks ${input.tailCalls.failedPacks} (pre-committed 0), servedFromPack ${input.tailCalls.servedFromPack} (recorded only)`,
+    );
+  if (fails.length > 0) return fails;
+  const find = (s: TcSession, site: TcSite): TcRow[] =>
+    input.rows[s].filter(
+      (r) => r.procedureName === site.procedureName && r.operatorName === site.operator,
+    );
+  for (const s of TC_SESSIONS) {
+    if (input.rows[s].length !== TC_TABLE.length)
+      fails.push(`${s}: ${input.rows[s].length} mutants, pre-committed ${TC_TABLE.length}`);
+    for (const site of TC_TABLE) {
+      const rows = find(s, site);
+      const want = site.expect[s];
+      const [row] = rows;
+      if (
+        rows.length !== 1 ||
+        row === undefined ||
+        row.verdict !== want.verdict ||
+        row.killingTest !== want.killingTest
+      )
+        fails.push(
+          `${s}: ${site.procedureName} ${site.operator} is ${rows.map((r) => `${r.verdict} by ${r.killingTest ?? "no test"}`).join("; ") || "absent"}, pre-committed ${want.verdict} by ${want.killingTest ?? "no test"}`,
+        );
+    }
+  }
+  // (c) the equality TC-on = TC-alone, but for the one mutant only T4 covers (error vs survived): by name, exactly 1.
+  const moved = TC_TABLE.filter((site) => {
+    const [on] = find("TC-on", site);
+    const [alone] = find("TC-alone", site);
+    return on?.verdict !== alone?.verdict || on?.killingTest !== alone?.killingTest;
+  });
+  if (
+    moved.length !== 1 ||
+    moved[0]?.operator !== "lethal.conditional-boundary" ||
+    moved[0]?.procedureName !== "IsBig"
+  )
+    fails.push(
+      `TC: TC-on differs from TC-alone at ${moved.map((s) => `${s.procedureName} ${s.operator}`).join(", ") || "no mutant"}, pre-committed exactly IsBig lethal.conditional-boundary (error, never survived)`,
+    );
+  // (d)
+  for (const site of TC_TABLE.filter((x) => x.tailKillOn)) {
+    for (const r of find("TC-on", site))
+      if (r.verdict === "killed" && r.killingTestFailure?.includes(TC_TAIL_NOTE) !== true)
+        fails.push(
+          `TC: TC-on ${site.procedureName} ${site.operator} was killed without the "${TC_TAIL_NOTE} ..." note`,
+        );
+  }
+  // (f) PR-381's not-run field and caveat (amendment 3), checked even when (b)-(d) failed (only (a1) and (a2) return
+  // early). `sharingACodeunit` is recorded, never judged.
+  for (const s of TC_SESSIONS) {
+    const got = input.notRun[s];
+    const names = got.notRunAtBaseline;
+    if (names === undefined || names.length !== 1 || names[0] !== TC_NOT_RUN_TEST)
+      fails.push(
+        `TC: ${s} notRunAtBaseline is ${names === undefined ? "absent" : JSON.stringify(names)}, pre-committed exactly ["${TC_NOT_RUN_TEST}"]`,
+      );
+    const want = TC_CAVEAT[s];
+    const c = got.caveat;
+    const ok =
+      want === undefined
+        ? c === undefined
+        : c !== undefined && c.survivors === want.survivors && c.notRunTests === want.notRunTests;
+    if (!ok)
+      fails.push(
+        `TC: ${s} survivors-beside-unrun-tests is ${c === undefined ? "absent" : `survivors ${c.survivors}, notRunTests ${c.notRunTests}`}, pre-committed ${want === undefined ? "absent" : `survivors ${want.survivors}, notRunTests ${want.notRunTests}`}`,
+      );
+  }
+  return fails;
+}
+
 /** The legs the itest runs when `LETHAL_ITEST_V3_LEGS` is unset, in run order. */
 export function v3DefaultLegs(o: { readonly cdo: boolean; readonly tables: boolean }): string[] {
   return [
@@ -708,6 +1053,7 @@ export function v3DefaultLegs(o: { readonly cdo: boolean; readonly tables: boole
     "MOE",
     "WRE",
     V3_RC_LEG, // PR-144: the withheld-kill recheck; not in V3_GATE_LEGS, as ISO and DB are not
+    V3_TC_LEG, // PR-347: the refused-cut tail, off / default / alone; not in V3_GATE_LEGS, as RC is not
     V3_K_LEG,
     ...(o.cdo ? ["D1", "D1c"] : []),
     ...(o.tables ? ["T"] : []),
@@ -831,6 +1177,7 @@ export const V3_MO_KILLERS: readonly V3Killer[] = [
   ["M0001", "src/MultiControl.Codeunit.al", 4, "empty-block", "ControlDoubles"],
   ["M0002", "src/MultiControl.Codeunit.al", 5, "return-value", "ControlDoubles"],
   ["M0007", "src/MultiPair.Codeunit.al", 12, "empty-block", "ReachedBothWays"],
+  // PR-209 amendment 4 (§0e item 3): MO runs `--profile slim`, so these are the pre-flip codes again.
   ["M0009", "src/MultiPair.Codeunit.al", 14, "return-value", "ReachedBothWays"],
   ["M0010", "src/MultiPair.Codeunit.al", 14, "delete-additive-right", "ReachedBothWays"],
   ["M0011", "src/MultiPair.Codeunit.al", 14, "swap-additive", "ReachedBothWays"],
@@ -843,68 +1190,68 @@ export const V3_MO_KILLERS: readonly V3Killer[] = [
  * refusal of a two-arm wrapper costs; `judgeWrArms` pins that refusal instead). 62 rows.
  */
 export const V3_WR_KILLERS: readonly V3Killer[] = [
-  ["M0004", "src/WrappedPairA.Codeunit.al", 10, "empty-block", "PairPick"],
-  ["M0006", "src/WrappedPairA.Codeunit.al", 12, "return-value", "PairPick"],
-  ["M0007", "src/WrappedPre.Codeunit.al", 9, "empty-block", "GrowPre"],
-  ["M0009", "src/WrappedPre.Codeunit.al", 11, "return-value", "GrowPre"],
-  ["M0010", "src/WrappedPre.Codeunit.al", 11, "delete-additive-right", "GrowPre"],
-  ["M0011", "src/WrappedPre.Codeunit.al", 11, "swap-additive", "GrowPre"],
-  ["M0013", "src/WrappedPre.Codeunit.al", 35, "empty-block", "TwicePre"],
-  ["M0014", "src/WrappedPre.Codeunit.al", 36, "return-value", "TwicePre"],
-  ["M0015", "src/WrappedPreTwin.Codeunit.al", 9, "empty-block", "GrowPreTwin"],
-  ["M0017", "src/WrappedPreTwin.Codeunit.al", 11, "return-value", "GrowPreTwin"],
-  ["M0018", "src/WrappedPreTwin.Codeunit.al", 11, "delete-additive-right", "GrowPreTwin"],
-  ["M0019", "src/WrappedPreTwin.Codeunit.al", 11, "swap-additive", "GrowPreTwin"],
-  ["M0021", "src/WrappedPreTwin.Codeunit.al", 35, "empty-block", "TwicePreTwin"],
-  ["M0022", "src/WrappedPreTwin.Codeunit.al", 36, "return-value", "TwicePreTwin"],
-  ["M0023", "src/WrappedTop.Codeunit.al", 7, "empty-block", "GrowTop"],
-  ["M0025", "src/WrappedTop.Codeunit.al", 9, "return-value", "GrowTop"],
-  ["M0026", "src/WrappedTop.Codeunit.al", 9, "delete-additive-right", "GrowTop"],
-  ["M0027", "src/WrappedTop.Codeunit.al", 9, "swap-additive", "GrowTop"],
-  ["M0029", "src/WrappedTop.Codeunit.al", 32, "empty-block", "TwiceTop"],
-  ["M0030", "src/WrappedTop.Codeunit.al", 34, "remove-assignment", "TwiceTop"],
-  ["M0031", "src/WrappedTop.Codeunit.al", 36, "return-value", "TwiceTop"],
-  ["M0032", "src/WrappedTopTwin.Codeunit.al", 7, "empty-block", "GrowTopTwin"],
-  ["M0034", "src/WrappedTopTwin.Codeunit.al", 9, "return-value", "GrowTopTwin"],
-  ["M0035", "src/WrappedTopTwin.Codeunit.al", 9, "delete-additive-right", "GrowTopTwin"],
-  ["M0036", "src/WrappedTopTwin.Codeunit.al", 9, "swap-additive", "GrowTopTwin"],
-  ["M0038", "src/WrappedTopTwin.Codeunit.al", 32, "empty-block", "TwiceTopTwin"],
-  ["M0039", "src/WrappedTopTwin.Codeunit.al", 34, "remove-assignment", "TwiceTopTwin"],
-  ["M0040", "src/WrappedTopTwin.Codeunit.al", 36, "return-value", "TwiceTopTwin"],
-  ["M0041", "src/WrappedTrigger.Table.al", 19, "empty-block", "ClampTrigger"],
-  ["M0043", "src/WrappedTrigger.Table.al", 21, "remove-assignment", "ClampTrigger"],
-  ["M0044", "src/WrappedTrigger.Table.al", 21, "shift-integer", "ClampTrigger"],
-  ["M0045", "src/WrappedTrigger.Table.al", 35, "empty-block", "DoubledTrigger"],
-  ["M0046", "src/WrappedTrigger.Table.al", 36, "return-value", "DoubledTrigger"],
-  ["M0047", "src/WrappedTriggerTwin.Table.al", 19, "empty-block", "ClampTriggerTwin"],
-  ["M0049", "src/WrappedTriggerTwin.Table.al", 21, "remove-assignment", "ClampTriggerTwin"],
-  ["M0050", "src/WrappedTriggerTwin.Table.al", 21, "shift-integer", "ClampTriggerTwin"],
-  ["M0051", "src/WrappedTriggerTwin.Table.al", 35, "empty-block", "DoubledTriggerTwin"],
-  ["M0052", "src/WrappedTriggerTwin.Table.al", 36, "return-value", "DoubledTriggerTwin"],
-  ["M0056", "src/WrappedView.Page.al", 32, "empty-block", "LabelView"],
-  ["M0061", "src/WrappedViewTwin.Page.al", 32, "empty-block", "LabelViewTwin"],
-  ["M0066", "src/WrappedXtra.PageExt.al", 19, "empty-block", "ScaledXtra"],
-  ["M0068", "src/WrappedXtra.PageExt.al", 21, "return-value", "ScaledXtra"],
-  ["M0072", "src/WrappedXtraTwin.PageExt.al", 19, "empty-block", "ScaledXtraTwin"],
-  ["M0074", "src/WrappedXtraTwin.PageExt.al", 21, "return-value", "ScaledXtraTwin"],
-  ["M0075", "src/WrappedYBand.Report.al", 22, "empty-block", "BandYRun"],
-  ["M0076", "src/WrappedYBand.Report.al", 23, "remove-assignment", "BandYRun"],
-  ["M0082", "src/WrappedYBand.Report.al", 53, "shift-integer", "BandYRun"],
-  ["M0083", "src/WrappedYBand.Report.al", 57, "empty-block", "BandYDirect"],
-  ["M0084", "src/WrappedYBand.Report.al", 58, "conditional-boundary", "BandYDirect"],
-  ["M0085", "src/WrappedYBand.Report.al", 59, "return-value", "BandYDirect"],
-  ["M0086", "src/WrappedYBand.Report.al", 60, "return-value", "BandYDirect"],
-  ["M0087", "src/WrappedYBand.Report.al", 64, "empty-block", "BandYRun"],
-  ["M0088", "src/WrappedYBand.Report.al", 65, "return-value", "BandYRun"],
-  ["M0089", "src/WrappedYBandTwin.Report.al", 22, "empty-block", "BandYRunTwin"],
-  ["M0090", "src/WrappedYBandTwin.Report.al", 23, "remove-assignment", "BandYRunTwin"],
-  ["M0096", "src/WrappedYBandTwin.Report.al", 53, "shift-integer", "BandYRunTwin"],
-  ["M0097", "src/WrappedYBandTwin.Report.al", 57, "empty-block", "BandYDirectTwin"],
-  ["M0098", "src/WrappedYBandTwin.Report.al", 58, "conditional-boundary", "BandYDirectTwin"],
-  ["M0099", "src/WrappedYBandTwin.Report.al", 59, "return-value", "BandYDirectTwin"],
-  ["M0100", "src/WrappedYBandTwin.Report.al", 60, "return-value", "BandYDirectTwin"],
-  ["M0101", "src/WrappedYBandTwin.Report.al", 64, "empty-block", "BandYRunTwin"],
-  ["M0102", "src/WrappedYBandTwin.Report.al", 65, "return-value", "BandYRunTwin"],
+  ["M0005", "src/WrappedPairA.Codeunit.al", 10, "empty-block", "PairPick"],
+  ["M0008", "src/WrappedPairA.Codeunit.al", 12, "return-value", "PairPick"],
+  ["M0009", "src/WrappedPre.Codeunit.al", 9, "empty-block", "GrowPre"],
+  ["M0012", "src/WrappedPre.Codeunit.al", 11, "return-value", "GrowPre"],
+  ["M0013", "src/WrappedPre.Codeunit.al", 11, "delete-additive-right", "GrowPre"],
+  ["M0014", "src/WrappedPre.Codeunit.al", 11, "swap-additive", "GrowPre"],
+  ["M0016", "src/WrappedPre.Codeunit.al", 35, "empty-block", "TwicePre"],
+  ["M0017", "src/WrappedPre.Codeunit.al", 36, "return-value", "TwicePre"],
+  ["M0018", "src/WrappedPreTwin.Codeunit.al", 9, "empty-block", "GrowPreTwin"],
+  ["M0021", "src/WrappedPreTwin.Codeunit.al", 11, "return-value", "GrowPreTwin"],
+  ["M0022", "src/WrappedPreTwin.Codeunit.al", 11, "delete-additive-right", "GrowPreTwin"],
+  ["M0023", "src/WrappedPreTwin.Codeunit.al", 11, "swap-additive", "GrowPreTwin"],
+  ["M0025", "src/WrappedPreTwin.Codeunit.al", 35, "empty-block", "TwicePreTwin"],
+  ["M0026", "src/WrappedPreTwin.Codeunit.al", 36, "return-value", "TwicePreTwin"],
+  ["M0027", "src/WrappedTop.Codeunit.al", 7, "empty-block", "GrowTop"],
+  ["M0030", "src/WrappedTop.Codeunit.al", 9, "return-value", "GrowTop"],
+  ["M0031", "src/WrappedTop.Codeunit.al", 9, "delete-additive-right", "GrowTop"],
+  ["M0032", "src/WrappedTop.Codeunit.al", 9, "swap-additive", "GrowTop"],
+  ["M0034", "src/WrappedTop.Codeunit.al", 32, "empty-block", "TwiceTop"],
+  ["M0035", "src/WrappedTop.Codeunit.al", 34, "remove-assignment", "TwiceTop"],
+  ["M0036", "src/WrappedTop.Codeunit.al", 36, "return-value", "TwiceTop"],
+  ["M0037", "src/WrappedTopTwin.Codeunit.al", 7, "empty-block", "GrowTopTwin"],
+  ["M0040", "src/WrappedTopTwin.Codeunit.al", 9, "return-value", "GrowTopTwin"],
+  ["M0041", "src/WrappedTopTwin.Codeunit.al", 9, "delete-additive-right", "GrowTopTwin"],
+  ["M0042", "src/WrappedTopTwin.Codeunit.al", 9, "swap-additive", "GrowTopTwin"],
+  ["M0044", "src/WrappedTopTwin.Codeunit.al", 32, "empty-block", "TwiceTopTwin"],
+  ["M0045", "src/WrappedTopTwin.Codeunit.al", 34, "remove-assignment", "TwiceTopTwin"],
+  ["M0046", "src/WrappedTopTwin.Codeunit.al", 36, "return-value", "TwiceTopTwin"],
+  ["M0047", "src/WrappedTrigger.Table.al", 19, "empty-block", "ClampTrigger"],
+  ["M0050", "src/WrappedTrigger.Table.al", 21, "remove-assignment", "ClampTrigger"],
+  ["M0051", "src/WrappedTrigger.Table.al", 21, "shift-integer", "ClampTrigger"],
+  ["M0052", "src/WrappedTrigger.Table.al", 35, "empty-block", "DoubledTrigger"],
+  ["M0053", "src/WrappedTrigger.Table.al", 36, "return-value", "DoubledTrigger"],
+  ["M0054", "src/WrappedTriggerTwin.Table.al", 19, "empty-block", "ClampTriggerTwin"],
+  ["M0057", "src/WrappedTriggerTwin.Table.al", 21, "remove-assignment", "ClampTriggerTwin"],
+  ["M0058", "src/WrappedTriggerTwin.Table.al", 21, "shift-integer", "ClampTriggerTwin"],
+  ["M0059", "src/WrappedTriggerTwin.Table.al", 35, "empty-block", "DoubledTriggerTwin"],
+  ["M0060", "src/WrappedTriggerTwin.Table.al", 36, "return-value", "DoubledTriggerTwin"],
+  ["M0064", "src/WrappedView.Page.al", 32, "empty-block", "LabelView"],
+  ["M0070", "src/WrappedViewTwin.Page.al", 32, "empty-block", "LabelViewTwin"],
+  ["M0076", "src/WrappedXtra.PageExt.al", 19, "empty-block", "ScaledXtra"],
+  ["M0079", "src/WrappedXtra.PageExt.al", 21, "return-value", "ScaledXtra"],
+  ["M0083", "src/WrappedXtraTwin.PageExt.al", 19, "empty-block", "ScaledXtraTwin"],
+  ["M0086", "src/WrappedXtraTwin.PageExt.al", 21, "return-value", "ScaledXtraTwin"],
+  ["M0087", "src/WrappedYBand.Report.al", 22, "empty-block", "BandYRun"],
+  ["M0088", "src/WrappedYBand.Report.al", 23, "remove-assignment", "BandYRun"],
+  ["M0094", "src/WrappedYBand.Report.al", 53, "shift-integer", "BandYRun"],
+  ["M0095", "src/WrappedYBand.Report.al", 57, "empty-block", "BandYDirect"],
+  ["M0097", "src/WrappedYBand.Report.al", 58, "conditional-boundary", "BandYDirect"],
+  ["M0098", "src/WrappedYBand.Report.al", 59, "return-value", "BandYDirect"],
+  ["M0099", "src/WrappedYBand.Report.al", 60, "return-value", "BandYDirect"],
+  ["M0100", "src/WrappedYBand.Report.al", 64, "empty-block", "BandYRun"],
+  ["M0101", "src/WrappedYBand.Report.al", 65, "return-value", "BandYRun"],
+  ["M0102", "src/WrappedYBandTwin.Report.al", 22, "empty-block", "BandYRunTwin"],
+  ["M0103", "src/WrappedYBandTwin.Report.al", 23, "remove-assignment", "BandYRunTwin"],
+  ["M0109", "src/WrappedYBandTwin.Report.al", 53, "shift-integer", "BandYRunTwin"],
+  ["M0110", "src/WrappedYBandTwin.Report.al", 57, "empty-block", "BandYDirectTwin"],
+  ["M0112", "src/WrappedYBandTwin.Report.al", 58, "conditional-boundary", "BandYDirectTwin"],
+  ["M0113", "src/WrappedYBandTwin.Report.al", 59, "return-value", "BandYDirectTwin"],
+  ["M0114", "src/WrappedYBandTwin.Report.al", 60, "return-value", "BandYDirectTwin"],
+  ["M0115", "src/WrappedYBandTwin.Report.al", 64, "empty-block", "BandYRunTwin"],
+  ["M0116", "src/WrappedYBandTwin.Report.al", 65, "return-value", "BandYRunTwin"],
 ];
 
 /**
@@ -916,7 +1263,7 @@ export const V3_WR_KILLERS: readonly V3Killer[] = [
  * R976 (R-973 amendment 1): M0089, the same trigger's body `empty-block`, too, since it carries
  * M0090's line. The three left are the `#if`-wrapped original's, which carry no line.
  */
-export const V3_WR_STATE_NOTES: readonly string[] = ["0/M0075", "0/M0076", "0/M0082"];
+export const V3_WR_STATE_NOTES: readonly string[] = ["0/M0087", "0/M0088", "0/M0094"];
 
 /** One line when the run's state notes are not exactly `want` (both as `batch/code`); else none. */
 export function judgeStateNotes(got: readonly string[], want: readonly string[]): string[] {
@@ -977,13 +1324,14 @@ export function judgeKillers(rows: readonly V3RowFacts[], killers: readonly V3Ki
 const WR_ARMS_FILE = "src/WrappedArms.Codeunit.al";
 
 /**
- * Leg WR's by-name refusal: exactly three `WrappedArms` rows, each `no-coverage` with `refusal` as
- * its note, and no other row carrying that note. Empty is a pass.
+ * Leg WR's by-name refusal: exactly four `WrappedArms` rows, each `no-coverage` with `refusal` as
+ * its note, and no other row carrying that note. Empty is a pass. PR-209 amendment 6 item 1: four since condition-true
+ * is default-on (`Pick` gains one; the BC twin `bcdev.wrapped.baseline.json` holds the same four), three before.
  */
 export function judgeWrArms(rows: readonly V3RowFacts[], refusal: string): string[] {
   const out: string[] = [];
   const arms = rows.filter((r) => r.file.replace(/\\/g, "/") === WR_ARMS_FILE);
-  if (arms.length !== 3) out.push(`${arms.length} WrappedArms row(s), pre-committed 3`);
+  if (arms.length !== 4) out.push(`${arms.length} WrappedArms row(s), pre-committed 4`);
   for (const r of arms) {
     if (r.verdict !== "no-coverage" || r.failureNote !== refusal) {
       out.push(
@@ -1060,9 +1408,31 @@ export function judgeLegK(f: LegKFacts): string[] {
     );
   if (!f.warned) out.push("K: AL_RUNNER_V3_NOT_AUTHORITATIVE was not printed");
   const off = f.noCoverageFiles.filter((p) => !p.replace(/\\/g, "/").endsWith(NO_COVERAGE_FILE));
-  if (f.noCoverageFiles.length !== 5 || off.length > 0)
+  // PR-209 amendment 9 addendum: 6 (DiscountedPrice condition-true joins; bcdev.baseline.json), was 5.
+  if (f.noCoverageFiles.length !== 6 || off.length > 0)
     out.push(
-      `K: ${f.noCoverageFiles.length} no-coverage mutant(s) (${off.length} outside ${NO_COVERAGE_FILE}), pre-committed 5, all in ${NO_COVERAGE_FILE}`,
+      `K: ${f.noCoverageFiles.length} no-coverage mutant(s) (${off.length} outside ${NO_COVERAGE_FILE}), pre-committed 6, all in ${NO_COVERAGE_FILE}`,
     );
   return out;
+}
+
+/**
+ * PR-340 (S1): the carry gate's "the daemon is clean after a walk" pin only means something when an
+ * ORDINARY serve request goes to the lane's daemon AFTER the last walk. `order` is the run's events in
+ * time: "walk" at the first send of each walk that REALLY sent (a call that sends nothing leaves no mark),
+ * "close" for each `serve-daemon-closed`, and "req:<kind>" for each `serve-request-timed`. A prefetch that
+ * came before every walk does not count (every mutant's prefetch rows predate the walks), and a request
+ * that follows a daemon close does not either: it ran on a FRESH daemon, which proves nothing about the
+ * walked one. Returns the problem, or `undefined` when the order holds.
+ */
+export function judgeCarryOrder(order: readonly string[]): string | undefined {
+  const lastWalk = order.lastIndexOf("walk");
+  if (lastWalk < 0) return "no walk ran in the walk arm";
+  const after = order.slice(lastWalk + 1);
+  const firstReq = after.findIndex((e) => e === "req:live" || e === "req:prefetch");
+  if (firstReq < 0)
+    return "no ordinary serve request came after the last walk, so the after-walk pin would be empty";
+  return after.slice(0, firstReq).includes("close")
+    ? "the lane's daemon was closed between the last walk and the next ordinary request, which ran on a fresh daemon: the pin would prove nothing about the walked one"
+    : undefined;
 }

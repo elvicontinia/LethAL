@@ -993,6 +993,7 @@ const base = (root: string) =>
     identityScheme: IDENTITY_SCHEME,
     coverageMode: "procedure",
     selectorIds: { selectorId: 50147, controlId: 50148, tableId: 50149 },
+    defaultOperators: 2, // PR-209: what a default run computes now
   }) as const;
 
 describe("R424: runSession", () => {
@@ -1018,7 +1019,8 @@ describe("R424: runSession", () => {
     const root = await project({ "HelperOpens.Codeunit.al": HELPER_OPENS });
     const store = new ResultsStore(":memory:");
     const backend = new StubBackend(false);
-    await session(root, store, backend);
+    // PR-307: a test that opens a TestPage is session-kind-sensitive on v3, so a run needs the setting.
+    await session(root, store, backend, { ciSessionKind: "headless" });
     expect([...new Set(backend.baselineMethods)].sort()).toEqual([
       "OpensThroughHelper",
       "PlainTest",

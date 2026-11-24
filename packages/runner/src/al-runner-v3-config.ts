@@ -18,9 +18,14 @@
  *     "daemonMaxRssGb": 6,                                    // R952 (R948); a serve daemon whose RSS passed this many GiB is replaced by a fresh one before its next request. 0 = off
  *     "daemonMaxRequests": 0,                                 // R952 (R948); a serve daemon is replaced after this many requests. 0 (default) = off
  *     "license": "<optional .bclicense file>",             // R956; passed as --license on every al-runner call that runs tests; its sha256 is in the fingerprint and the report
+ *     "companies": "<optional>",                              // PR-282; passed as --companies on every al-runner call that runs tests (one-shot and serve), in al-runner's syntax: names, comma separated, the session company first, or `all` (needs test data). No default: absent passes nothing, and al-runner refuses "FindSet on the Company table" because it does not know the database's companies. In the fingerprint and the report.
+ *     "refusedCutTail": false,                                // PR-297; ON by default since PR-347, only false turns it off (a resume across the change is refused by name). On: runs each green test after a baseline-refusal cut (PR-250) alone under a mutant, if it passed alone once at the end of the baseline, instead of scoring it error. Every such kill carries a note. In the fingerprint, the report and the lending build.
+ *     "stopGroups": false,                                    // PR-256, OFF by default; true sends each mutant request with stopAfterFirstFailure and one stopGroup per entry, so a group's tests after its first failure do not run. Needs the build fact stop-groups (refused by name without it). In the fingerprint, the report and the lending build.
  *     "dotnetSidecar": "<optional AlDotNetSidecar.dll>"      // R886; passed as --dotnet-sidecar. Absent: the pinned build's own sidecar, when its .gated names one; false: none (gates)
  *     "recheckWithheldKills": true,                          // PR-144, ON by default (PR-182); false opts out and saves about 10% of a run with many withheld rows (nothing when there are none). After the main pass, re-run the withheld-kill rows under method isolation. A row the recheck does not recover stays `error`: unmeasured, never a kill. Evidence (PR-170): 42 of 58 recovered kills confirmed on BC, 0 false, 16 unmeasurable (9 TestPage-only killers, 7 killers red at BC's baseline). Warning: kills recovered this way are not measured against BC; they may be false where an earlier test that al-runner refused would have set state on BC.
- *     "recheckBudgetSeconds": 3600                           // PR-144; the recheck's own time budget (the main pass's --time-budget does not cover it)
+ *     "recheckBudgetSeconds": 3600,                          // PR-144; the recheck's own time budget (the main pass's --time-budget does not cover it)
+ *     "daemonStderrDir": "<optional folder>",                // PR-227; off by default. Each serve daemon's FULL stderr goes to <folder>/<utc>-lane<N>-pid<P>.stderr (LethAL itself keeps a 64 KB tail in memory). For measurement runs
+ *     "serveTimings": false                                  // PR-237; off by default. true passes --timings to every serve daemon: stderr gains the compile-cache and timing lines (with daemonStderrDir, they are kept). For measurement runs; verdicts unchanged (measured)
  *   }
  *
  * `serverMode` and `selectorMode` are refused by name (the static selector only, and no v2-style serve).
@@ -68,6 +73,20 @@ export interface AlRunnerV3ConfigSection {
   readonly environment?: "saas" | "onprem";
   /** R956: a `.bclicense` file, absolute, passed as `--license <path>` on every al-runner call that runs tests. Absent: none. */
   readonly license?: string;
+  /** PR-282: `--companies <value>` on every al-runner call that runs tests. Absent: not passed (no default). */
+  readonly companies?: string;
+  /** PR-297: run a stable green test after a baseline-refusal cut alone under a mutant. Absent: off. */
+  readonly refusedCutTail?: boolean;
+  /** PR-256: per-entry stop groups on mutant requests (needs the build fact `stop-groups`). Absent: off. */
+  readonly stopGroups?: boolean;
+  /**
+   * PR-227: a folder (a relative one is resolved against the working directory, as `license` is) that
+   * receives every serve daemon's full stderr, one file per daemon. One-shot and `--isolate-tests`
+   * processes are not daemons and get none. Absent: none written.
+   */
+  readonly daemonStderrDir?: string;
+  /** PR-237: `--timings` on every serve daemon (stderr only: compile-cache and timing lines). Default `false`. */
+  readonly serveTimings: boolean;
   /**
    * R948: GiB the memory guard keeps free below the container's cgroup limit: no new test call
    * starts while the container uses more than `memory.max` less this, and the run stops with its
@@ -153,12 +172,17 @@ export const V3_ISOLATION_DEFAULT = "auto";
 const KEYS = [
   "extraArgs",
   "allowUngated",
+  "daemonStderrDir",
+  "serveTimings",
   "recheckWithheldKills",
   "recheckBudgetSeconds",
   "memoryHeadroomGb",
   "daemonMaxRssGb",
   "daemonMaxRequests",
   "license",
+  "companies",
+  "refusedCutTail",
+  "stopGroups",
   "environment",
   "isolation",
   "downloadDemoData",
@@ -305,7 +329,22 @@ export function validateAlRunnerV3Config(
       );
     }
   }
-  for (const k of ["path", "alcPath", "cacheDir"]) {
+  if (r.companies !== undefined && (typeof r.companies !== "string" || r.companies.trim() === "")) {
+    throw new Error(
+      `al-runner-v3-config-refused: "alRunnerV3.companies" must be a non-empty string (the database's company names, comma separated, or "all"), got ${JSON.stringify(r.companies)} (PR-282).`,
+    );
+  }
+  if (r.stopGroups !== undefined && typeof r.stopGroups !== "boolean") {
+    throw new Error(
+      `al-runner-v3-config-refused: "alRunnerV3.stopGroups" must be true or false, got ${JSON.stringify(r.stopGroups)} (PR-256).`,
+    );
+  }
+  if (r.refusedCutTail !== undefined && typeof r.refusedCutTail !== "boolean") {
+    throw new Error(
+      `al-runner-v3-config-refused: "alRunnerV3.refusedCutTail" must be true or false, got ${JSON.stringify(r.refusedCutTail)} (PR-297).`,
+    );
+  }
+  for (const k of ["path", "alcPath", "cacheDir", "daemonStderrDir"]) {
     if (r[k] !== undefined && (typeof r[k] !== "string" || r[k] === "")) {
       throw new Error(`"alRunnerV3.${k}" must be a non-empty string`);
     }
@@ -323,6 +362,11 @@ export function validateAlRunnerV3Config(
   if (r.downloadDemoData !== undefined && typeof r.downloadDemoData !== "boolean") {
     throw new Error(
       `al-runner-v3-config-refused: "alRunnerV3.downloadDemoData" must be a boolean, got ${JSON.stringify(r.downloadDemoData)} (R885).`,
+    );
+  }
+  if (r.serveTimings !== undefined && typeof r.serveTimings !== "boolean") {
+    throw new Error(
+      `al-runner-v3-config-refused: "alRunnerV3.serveTimings" must be a boolean, got ${JSON.stringify(r.serveTimings)} (PR-237).`,
     );
   }
   if (r.noClient !== undefined && typeof r.noClient !== "boolean") {
@@ -412,6 +456,13 @@ export function validateAlRunnerV3Config(
     isolation: (r.isolation as "auto" | "test" | "method" | undefined) ?? V3_ISOLATION_DEFAULT,
     ...(r.environment !== undefined ? { environment: r.environment as "saas" | "onprem" } : {}),
     ...(typeof r.license === "string" ? { license: resolve(r.license) } : {}),
+    ...(typeof r.companies === "string" ? { companies: r.companies } : {}), // PR-282
+    ...(typeof r.refusedCutTail === "boolean" ? { refusedCutTail: r.refusedCutTail } : {}), // PR-297
+    ...(typeof r.stopGroups === "boolean" ? { stopGroups: r.stopGroups } : {}), // PR-256
+    ...(typeof r.daemonStderrDir === "string"
+      ? { daemonStderrDir: resolve(r.daemonStderrDir) }
+      : {}),
+    serveTimings: r.serveTimings === true,
   };
 }
 

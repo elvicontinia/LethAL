@@ -1030,6 +1030,41 @@ describe("generated JSON Schemas — report and stream (R152)", () => {
     expect(conformsTo(reportSchema, doc)).toEqual([]);
   });
 
+  test("PR-247: costlyTests is additive under v3: optional; a report WITH it validates, a bad one does not", () => {
+    const without = JSON.parse(
+      readFileSync(
+        join(REPO_ROOT, "docs/campaign/2026-08-16-gift-card/rehearsal.report.json"),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+    expect("costlyTests" in without).toBe(false);
+    expect((reportSchema as { required: string[] }).required).not.toContain("costlyTests");
+    expect(conformsTo(reportSchema, without)).toEqual([]);
+    const costlyTests = {
+      scope: "this-session",
+      carriedMutants: 2,
+      totalOwnMs: 30,
+      ambiguousKills: 1,
+      top: [
+        {
+          test: "Sandbox Tests.A",
+          coveredMutants: 2,
+          runs: 2,
+          ownMs: 30,
+          share: 1,
+          meanMs: 15,
+          baselineMs: 12,
+          kills: 1,
+          killRate: 0.5,
+          msUnderSurvivors: 10,
+        },
+      ],
+    };
+    expect(conformsTo(reportSchema, { ...without, costlyTests })).toEqual([]);
+    const bad = { ...without, costlyTests: { ...costlyTests, scope: "x" } };
+    expect(conformsTo(reportSchema, bad)).not.toEqual([]);
+  });
+
   test("R351: coverageArmNames is additive under v3: a report without it validates, and with it", () => {
     // v3 was edited in place, which is sound only while the field stays OPTIONAL. Making it
     // required on a row or a survivor group would reject every report written before R351.
@@ -1279,6 +1314,18 @@ describe("generated JSON Schemas — report and stream (R152)", () => {
         "totals",
         "v3Sha256",
       ],
+      // PR-381 (R1197): v2 added the optional `totals.survivorsBesideUnrunTests`; the required set is v1's.
+      "confirmation-v2.schema.json": [
+        "confirmationVersion",
+        "dependencySourceSha256",
+        "flags",
+        "kind",
+        "mutants",
+        "sample",
+        "seed",
+        "totals",
+        "v3Sha256",
+      ],
       "doctor-v1.schema.json": ["checks", "doctorSchemaVersion", "notChecked", "ok"],
       "explain-v4.schema.json": [
         "caveats",
@@ -1506,6 +1553,30 @@ describe("generated JSON Schemas — report and stream (R152)", () => {
         "toolConditions",
       ],
       "explain-v23.schema.json": [
+        "caveats",
+        "contract",
+        "derivedFromReportSchemaVersion",
+        "explainSchemaVersion",
+        "markIdentityScheme",
+        "notMeasured",
+        "score",
+        "survivorSelection",
+        "survivors",
+        "toolConditions",
+      ],
+      "explain-v35.schema.json": [
+        "caveats",
+        "contract",
+        "derivedFromReportSchemaVersion",
+        "explainSchemaVersion",
+        "markIdentityScheme",
+        "notMeasured",
+        "score",
+        "survivorSelection",
+        "survivors",
+        "toolConditions",
+      ],
+      "explain-v34.schema.json": [
         "caveats",
         "contract",
         "derivedFromReportSchemaVersion",
@@ -1821,6 +1892,7 @@ describe("generated JSON Schemas — report and stream (R152)", () => {
         "tests-testpage-unsupported",
         "tests-testpage-refused",
         "tests-restrictive-default-at-risk",
+        "session-kind-mismatch",
         "runner-disagreement",
         "stop-hung-sessions",
         "stop-answer-400",
@@ -1846,6 +1918,7 @@ describe("generated JSON Schemas — report and stream (R152)", () => {
         "withheld-kills",
         "isolated-recheck-kills",
         "workdate-changed",
+        "survivors-beside-unrun-tests",
       ],
       "#/properties/survivorSelection/properties/rankedBy": ["report-order", "actionability"],
       "#/properties/survivors/items/properties/attribution": [
@@ -1902,7 +1975,11 @@ describe("generated JSON Schemas — report and stream (R152)", () => {
         "workdate-changed",
         "left-out-test-reach",
       ],
-      "#/properties/toolConditions/items/properties/condition": ["quarantined", "stranded-skips"],
+      "#/properties/toolConditions/items/properties/condition": [
+        "quarantined",
+        "stranded-skips",
+        "not-run-tests-not-recorded",
+      ],
       // R273: new domains on the new optional `suggestions` (an optional additive field, so no
       // bump, orchestrator ruling 2026-10-06). From here on a value added to them bumps (R233).
       "#/properties/suggestions/properties/gaps/items/properties/kind": [
@@ -1999,6 +2076,10 @@ describe("generated JSON Schemas — report and stream (R152)", () => {
     expect(required("explain-v32.schema.json")).toEqual(required("explain-v31.schema.json"));
     // PR-212's v33 added a cause value, not a required field.
     expect(required("explain-v33.schema.json")).toEqual(required("explain-v32.schema.json"));
+    // PR-307's v34 added a caveat value, not a required field.
+    expect(required("explain-v34.schema.json")).toEqual(required("explain-v33.schema.json"));
+    // PR-381's v35 added a caveat value and an optional `score` block, not a required field.
+    expect(required("explain-v35.schema.json")).toEqual(required("explain-v34.schema.json"));
     expect(v6).toEqual([
       "attribution",
       "codeunitName",

@@ -19,6 +19,7 @@ import {
   BC_END_OF_TEST_TEXT,
   BC_HTTP_HUB_TEXT,
   V3_CAPABILITY_FACTS,
+  V3_CARRY_FACT,
 } from "../src/al-runner-v3-contract";
 import type { V3ContractResult } from "../src/al-runner-v3-contract";
 import {
@@ -190,7 +191,7 @@ describe("R586c pins: the table", () => {
 // Leg C
 // ---------------------------------------------------------------------------------------------
 
-/** The 36 facts as alpha.5 read them: 9 defect, 18 contract, 1 warn, 8 capability (PR-114a: all matches). */
+/** The 38 facts as alpha.5 read them: 9 defect, 18 contract, 1 warn, 8 capability, the carry fact and stop-groups (all matches). */
 function alpha5Facts(): { fact: string; verdict: string; measured?: string }[] {
   const facts: { fact: string; verdict: string; measured?: string }[] = [];
   for (const d of V3_DEFECT_FACTS) {
@@ -203,6 +204,9 @@ function alpha5Facts(): { fact: string; verdict: string; measured?: string }[] {
     facts.push({ fact: `contract-${i}`, verdict: "matches", measured: "ok" });
   facts.push({ fact: "serve-keep-reasons", verdict: "matches", measured: "ok" });
   for (const c of V3_CAPABILITY_FACTS) facts.push({ fact: c, verdict: "matches", measured: "ok" });
+  // PR-340: the carry fact has no per-build pin entry, so every pin judges it by the default table (matches).
+  facts.push({ fact: V3_CARRY_FACT, verdict: "matches", measured: "ok" });
+  facts.push({ fact: "stop-groups", verdict: "matches", measured: "ok" }); // PR-342
   return facts;
 }
 const withFact = (
@@ -220,7 +224,7 @@ const runC = (facts: ReturnType<typeof alpha5Facts>, withPin = true) =>
   );
 
 describe("R586c leg C: the pin", () => {
-  test("the 36 facts: 9 defect, 18 contract, 1 warn, 8 capability", () => {
+  test("the 38 facts: 9 defect, 18 contract, 1 warn, 8 capability, the carry fact (no pin entry), stop-groups", () => {
     expect(alpha5Facts().length).toBe(V3_LEG_C_FACTS);
   });
   test("C-pin-1: alpha.5's readings with the pin pass, with seven pinned lines and no held line", () => {
@@ -413,9 +417,12 @@ describe("R586c leg T: the seven rows", () => {
     expect(j.outcome).toBe("held");
     expect(j.pinned).toBeUndefined();
   });
-  test("T-pin-0 (B1): all seven still survived, the baseline's 298/54/66, with the pin: exactly held (no pin: pass)", () => {
-    expect(judge(ownRows, { pinned: false, counts: [298, 54, 66] }).outcome).toBe("pass");
-    const j = judge(ownRows, { counts: [298, 54, 66] });
+  // PR-209: the unpinned own baseline is 318/64/68 over 450 (`LEG_T_OWN_COUNTS`; 298/54/66 over 418 before).
+  test("T-pin-0 (B1): all seven still survived, the baseline's 318/64/68, with the pin: exactly held (no pin: pass)", () => {
+    expect(
+      judge(ownRows, { pinned: false, counts: [318, 64, 68], extra: { total: 450 } }).outcome,
+    ).toBe("pass");
+    const j = judge(ownRows, { counts: [318, 64, 68], extra: { total: 450 } });
     expect(j.outcome).toBe("held");
     expect(j.pinned).toBeUndefined();
     expect(j.lines.some((l) => l.startsWith("T: pin-mismatch: "))).toBe(true);
@@ -632,6 +639,8 @@ describe("R756 edge pin: the edge readings are pinned and pass", () => {
     facts.push({ fact: "serve-keep-reasons", verdict: "matches", measured: "ok" });
     for (const c of V3_CAPABILITY_FACTS)
       facts.push({ fact: c, verdict: "matches", measured: "ok" });
+    facts.push({ fact: V3_CARRY_FACT, verdict: "matches", measured: "ok" }); // PR-340
+    facts.push({ fact: "stop-groups", verdict: "diverged", measured: "refused" }); // PR-342: no #8564
     return facts;
   };
   const runEdge = (withPin: boolean) =>
@@ -775,6 +784,8 @@ describe("R771: the edge build a157b2d34 (alpha.5's readings plus N1E)", () => {
       "edge-2c63a382e",
       "alpha.12-d4bc8d3a5", // R807
       "edge-d72d3197d", // R-815
+      "main-ccd0f823d", // PR-255: the root's readings
+      "main-ef9f6a222", // R1161: the root's readings
     ]);
     expect(serveRowFieldsFor(A_VERSION, A_SHA)).toBe(true);
     expect(serveRowFieldsFor(A_VERSION, flip(A_SHA))).toBe(false);
@@ -915,17 +926,18 @@ describe("edge-8078bcf49: every pinned defect gone, 48 known differences at BC's
     }
   });
   // R975 (R-965 amendment 2): the baseline was 298/60/60 until 6 Data Main rows read no-coverage.
-  test("leg T: the counts are the committed baseline's 298/54/66 plus exactly these moves", () => {
+  // PR-209: the committed baseline is 318/64/68 over 450 (was 298/54/66 over 418; +32 default-operator rows).
+  test("leg T: the counts are the committed baseline's 318/64/68 plus exactly these moves", () => {
     const rows = need(bPin).legT.rows;
     const n = (v: string) =>
       rows.filter((r) => r.verdict === v).length - rows.filter((r) => r.from?.verdict === v).length;
     expect(need(bPin).legT.counts).toEqual({
-      killed: 298 + n("killed"),
-      survived: 54 + n("survived"),
-      noCoverage: 66 + n("no-coverage"),
+      killed: 318 + n("killed"),
+      survived: 64 + n("survived"),
+      noCoverage: 68 + n("no-coverage"),
     });
-    expect(need(bPin).legT.counts).toEqual({ killed: 326, survived: 67, noCoverage: 25 });
-    expect(need(bPin).legT.total).toBe(418);
+    expect(need(bPin).legT.counts).toEqual({ killed: 346, survived: 77, noCoverage: 27 });
+    expect(need(bPin).legT.total).toBe(450);
     expect(need(bPin).legT.refusedTests).toBe(0);
   });
   test("applyTPin: a row's `from` must equal the committed row exactly", () => {
@@ -1009,11 +1021,11 @@ describe("edge-8078bcf49: every pinned defect gone, 48 known differences at BC's
       noCoverage: rs.filter((r) => r.verdict === "no-coverage").length,
       error: rs.filter((r) => r.verdict === "error").length,
     });
-    // R975 (R-965): 298/60/60 until 6 Data Main rows read no-coverage.
+    // R975 (R-965): 298/60/60 until 6 Data Main rows read no-coverage. PR-209: +32 rows (20 / 10 / 2).
     expect(tally(committed.entries)).toEqual({
-      killed: 298,
-      survived: 54,
-      noCoverage: 66,
+      killed: 318,
+      survived: 64,
+      noCoverage: 68,
       error: 0,
     });
     const b = applyTPin(committed.entries, need(bPin).legT);
@@ -1023,10 +1035,11 @@ describe("edge-8078bcf49: every pinned defect gone, 48 known differences at BC's
     expect(need(b).filter((r) => r.coverageFiltered !== (r.verdict === "no-coverage"))).toEqual([]);
     for (const p of V3_BUILD_PINS.filter((x) => x.legT !== need(bPin).legT)) {
       const out = applyTPin(committed.entries, p.legT);
+      // PR-209: the 32 added rows move every earlier pin by the same 20 / 10 / 2 (was 298 / 47 / 66).
       expect(tally(need(out)), p.id).toEqual({
-        killed: 298,
-        survived: 47,
-        noCoverage: 66,
+        killed: 318,
+        survived: 57,
+        noCoverage: 68,
         error: 7,
       });
     }

@@ -38,6 +38,7 @@ import {
 } from "./al-runner-v3-backend";
 import {
   AL_RUNNER_V3_NOT_AUTHORITATIVE,
+  type AlRunnerV3ConfigSection,
   assertAlcRunnable,
   assertBcVersionMatchesPackages,
   defaultV3Path,
@@ -82,6 +83,7 @@ import {
   cliOk,
   wantsEnvelope,
 } from "./cli-envelope";
+import { monoNow } from "./clock";
 import {
   ConfirmBackendNotBcdevError,
   ConfirmInputNotReportError,
@@ -141,7 +143,10 @@ import {
   LARGE_RUN_MUTANT_THRESHOLD,
   MIN_MUTANT_BUDGET_MS,
   NoMutableLinesError,
+  PROFILES,
   REQUEST_CEILING_MS,
+  SIGNAL_STOP_EXIT_CODE,
+  SLIM_LEFT_OUT,
   defaultQuarantineDir,
   generateMutationSet,
   operatorTiers,
@@ -170,6 +175,7 @@ import type { SessionReport } from "./report";
 import { quarantineResourceKey } from "./resource-key";
 import { assertResourceSelectorRuntime, runtimeBelow14 } from "./resource-selector";
 import { RunMutantTransport } from "./run-mutant-transport";
+import { validateCiSessionKind } from "./session-kind";
 import { ResultsStore } from "./store";
 import type { PublishOutcomeRow } from "./store";
 import { buildTestAppModel, readTestAppSources } from "./testpage-scan";
@@ -466,6 +472,8 @@ export const DRY_RUN_REFUSED = [
   "confirm-from",
   "confirm-sample",
   "confirm-seed",
+  // PR-311: a dry run runs no test, so the session kind would do nothing.
+  "ci-session-kind",
 ] as const;
 
 export interface DryRunCliConfig {
@@ -489,6 +497,8 @@ export interface DryRunCliConfig {
   readonly operators?: readonly string[];
   /** R832: `--exclude-operator` names, honoured for the same reason. */
   readonly excludeOperators?: readonly string[];
+  /** PR-209: `--profile slim`, honoured for the same reason. */
+  readonly profile?: "slim";
   /** Issue #19 (R227): `--lines <file>:<start>-<end>` (repeatable), parsed. */
   readonly lines?: readonly LineRange[];
   /** Issue #19 (R227): `--changed-since <git-ref>`. Resolved to line ranges by `resolveLineRanges`
@@ -571,8 +581,11 @@ export interface RunCliConfig {
    * `empty-block` and `void-method-call` site in them.
    */
   readonly operators?: readonly string[];
-  /** R832: `--exclude-operator <name>` (repeatable): every operator but these. Refused with `--operator`. */
+  /** R832: `--exclude-operator <name>` (repeatable): every operator but these. Refused with `--operator`.
+   *  With `--profile slim` this already holds the profile's two names too. */
   readonly excludeOperators?: readonly string[];
+  /** PR-209: `--profile slim`: the older default set (no condition-true, no blank-argument). */
+  readonly profile?: "slim";
   /** Issue #19 (R227): `--lines <file>:<start>-<end>` (repeatable), parsed. */
   readonly lines?: readonly LineRange[];
   /** Issue #19 (R227): `--changed-since <git-ref>`. Resolved to line ranges by `resolveLineRanges`
@@ -597,6 +610,8 @@ export interface RunCliConfig {
   readonly excludeTests?: readonly string[];
   /** PR-212 (R1113): `--keep-company-tests` runs the test methods that write the Company table; by default a BC run leaves them out. */
   readonly keepCompanyTests?: boolean;
+  /** PR-307b: `--ci-session-kind`. It OVERRIDES the config's `ciSessionKind` (precedence: flag, then config, then unset). */
+  readonly ciSessionKind?: "client" | "headless";
   /**
    * R44: `--max-guards-per-batch <n>` bounds how many injected guards go into one published
    * artifact. Absent means no limit.
@@ -1149,11 +1164,20 @@ RUN — scope. These bound cost. --tests-only can change a verdict; the others c
   --operator <name>          only these operators contribute mutants (repeatable). The 'lethal.'
                              prefix is optional; an unregistered name, or a registered one with no
                              deployable site here, is refused. The report flags it
-                             'operator-narrowed'. An opt-in operator (swap-workdate-today,
-                             condition-true, blank-argument) runs only when this flag names it
+                             'operator-narrowed'. The opt-in operator swap-workdate-today runs
+                             only when this flag names it
   --exclude-operator <name>  every operator but these contributes mutants (repeatable). Same
                              prefix rule and same flag in the report. An unregistered name is
                              refused, and so is giving --operator as well
+  --profile slim             the older, faster default set: leaves out condition-true and
+                             blank-argument (default operators since PR-209). The default set
+                             keeps every fact; slim saves time. Measured on DO: the default
+                             is +12.7% mutants (5,526 on 43,511) at 0.91x the per-mutant cost,
+                             about +11.5% wall; on two BC.History apps +81 and +154 mutants.
+                             The report flags it 'operator-narrowed'. Adds to --exclude-operator;
+                             refused with --operator; an unknown profile is refused. Resume or
+                             compare a store or campaign stage made BEFORE PR-209 with this
+                             flag: a default run refuses to resume it, by name
   --lines <file>:<a>-<b>     only mutants whose span touches these lines contribute (repeatable;
                              <file>:<n> for one line). Paths are project-relative. A mutant that
                              spans a given line and others is kept. Applied after dedup, so it
@@ -1180,6 +1204,9 @@ RUN — scope. These bound cost. --tests-only can change a verdict; the others c
                              names them: on BC 29 they broke the server's tier (R1113). A write two
                              calls away is not seen. Use it on a server you can restart. Also read
                              by --dry-run. al-runner-v3 never leaves them out
+  --ci-session-kind <kind>   client | headless: the session kind your CI runs tests in. OVERRIDES the
+                             config's "ciSessionKind" (flag, then config, then unset); needed when a
+                             test can change with the session kind (PR-307)
   --skip-known-survivors    skip mutants a prior finished run recorded as survivors
   --confirm-from <v3.json>   deploy only the mutants an al-runner-v3 report selects: its survivors
                              noted '[v3-refused-test-nearby]', its no-coverage rows noted by R609,
@@ -1524,6 +1551,8 @@ export const RUN_FLAGS = {
   // R127: repeatable — several `--operator` names union. See `RunCliConfig.operators`.
   operator: { type: "string", multiple: true },
   "exclude-operator": { type: "string", multiple: true },
+  // PR-209: `--profile slim`, the older default operator set. See `RunCliConfig.profile`.
+  profile: { type: "string" },
   // Issue #19 (R227): line-scoped mutant filter. `--lines` is repeatable and unions.
   lines: { type: "string", multiple: true },
   "changed-since": { type: "string" },
@@ -1533,6 +1562,8 @@ export const RUN_FLAGS = {
   "exclude-test": { type: "string", multiple: true },
   // PR-212: see `RunCliConfig.keepCompanyTests`.
   "keep-company-tests": { type: "boolean", default: false },
+  // PR-307b: see `RunCliConfig.ciSessionKind`.
+  "ci-session-kind": { type: "string" },
   // R44: see `RunCliConfig.maxGuardsPerBatch`.
   "max-guards-per-batch": { type: "string" },
   // R47: see `RunCliConfig.mutantTimeoutMs` / `resume`.
@@ -1614,6 +1645,7 @@ const RUN_ONLY_FLAGS = [
   "exclude",
   "operator",
   "exclude-operator",
+  "profile",
   "lines",
   "changed-since",
   "max-guards-per-batch",
@@ -1628,6 +1660,7 @@ const RUN_ONLY_FLAGS = [
   "retry-stranded",
   "stop-hung-sessions",
   "keep-company-tests",
+  "ci-session-kind",
   "allow-large-run",
   "fresh-probe",
   "isolate-tests",
@@ -2289,11 +2322,28 @@ export function parseCliConfig(argv: readonly string[]): CliConfig {
   if (operatorRaw !== undefined && excludeOperatorRaw !== undefined) {
     throw new Error("--operator and --exclude-operator cannot be combined");
   }
+  // PR-209: `--profile slim` is the same narrowing `--exclude-operator` makes, for the two operators
+  // that became default; with `--exclude-operator` the exclusions add up.
+  const profileRaw = values.profile;
+  if (profileRaw !== undefined && !PROFILES.includes(profileRaw)) {
+    throw new Error(
+      `--profile "${profileRaw}" is not a known profile. Known: ${PROFILES.join(", ")}.`,
+    );
+  }
+  if (profileRaw !== undefined && operatorRaw !== undefined) {
+    throw new Error(
+      "--profile and --operator cannot be combined. Name the operators to run, or pick a profile.",
+    );
+  }
+  const slim = profileRaw === "slim";
+  const excludedByFlags = [
+    ...(slim ? SLIM_LEFT_OUT : []),
+    ...(excludeOperatorRaw ?? []).filter((n) => !(slim && SLIM_LEFT_OUT.includes(n))),
+  ];
   const operators = {
     ...(operatorRaw !== undefined && operatorRaw.length > 0 ? { operators: operatorRaw } : {}),
-    ...(excludeOperatorRaw !== undefined && excludeOperatorRaw.length > 0
-      ? { excludeOperators: excludeOperatorRaw }
-      : {}),
+    ...(excludedByFlags.length > 0 ? { excludeOperators: excludedByFlags } : {}),
+    ...(slim ? { profile: "slim" as const } : {}),
   };
 
   // Issue #19 (R227). `--changed-since` is kept as the ref here; `git` runs when the run starts.
@@ -2494,6 +2544,9 @@ export function parseCliConfig(argv: readonly string[]): CliConfig {
   const selectorIdFlag = parseObjectIdFlag(values["selector-id"], "selector-id");
   const controlIdFlag = parseObjectIdFlag(values["control-id"], "control-id");
   const tableIdFlag = parseObjectIdFlag(values["table-id"], "table-id");
+  // PR-311: `--ci-session-kind` overrides the config's `ciSessionKind`; refused by name like the config's own value.
+  // Read after the dry-run branch, which refuses the flag by name (a dry run runs no test).
+  const ciSessionKindFlag = validateCiSessionKind(values["ci-session-kind"], "--ci-session-kind");
   const selectorIdOverrides: Partial<SelectorConfig> = {
     ...(selectorIdFlag !== undefined ? { selectorId: selectorIdFlag } : {}),
     ...(controlIdFlag !== undefined ? { controlId: controlIdFlag } : {}),
@@ -2619,6 +2672,7 @@ export function parseCliConfig(argv: readonly string[]): CliConfig {
     ...(values["retry-stranded"] === true ? { retryStranded: true } : {}),
     ...(values["stop-hung-sessions"] === true ? { stopHungSessions: true } : {}),
     ...(values["keep-company-tests"] === true ? { keepCompanyTests: true } : {}),
+    ...(ciSessionKindFlag !== undefined ? { ciSessionKind: ciSessionKindFlag } : {}),
     ...(values["fresh-probe"] === true ? { freshProbe: true } : {}),
     ...(values["isolate-tests"] === true ? { isolateTests: true } : {}),
     ...(values["fail-on-survivors"] === true ? { failOnSurvivors: true as const } : {}),
@@ -2761,6 +2815,12 @@ export interface LethalConfigFile {
    * nothing says so.
    */
   readonly preprocessorSymbols?: readonly string[];
+  /**
+   * PR-307 (R1168): the session kind the user's own CI runs its tests in, `"client"` (GuiAllowed true) or `"headless"`
+   * (GuiAllowed false). NO DEFAULT: a run with a test that can change with the session kind is refused while it is unset
+   * (`SessionKindUnsetError`). Validated once, in `loadLethalConfigFile`.
+   */
+  readonly ciSessionKind?: "client" | "headless";
   /**
    * R900 — the folders alc searches for .NET assemblies (`/assemblyprobingpaths:`), relative to the
    * project. TOP-LEVEL for the reason `preprocessorSymbols` is: every backend compiles with alc.
@@ -3013,6 +3073,8 @@ async function loadLethalConfigFile(path: string): Promise<LethalConfigFile> {
   refuseRetiredV2ConfigSection(parsed, path);
   refuseRetiredBcHost(parsed.bcdev);
   refuseCredentialsEnvWithEnvTool(parsed);
+  // PR-307: the ONE validation of `ciSessionKind`; every path that reads a config file comes through here.
+  validateCiSessionKind(parsed.ciSessionKind, path);
   setPackageCacheDirs(configuredPackageCaches(parsed));
   return parsed;
 }
@@ -3394,7 +3456,14 @@ export function v3RecheckOf(a: {
   const runner: RecheckRunner = async (req) => {
     const methodConfig: LethalConfigFile = {
       ...a.effectiveConfig,
-      alRunnerV3: { ...(a.effectiveConfig.alRunnerV3 as object), isolation: "method" },
+      // PR-256 (rule 2): the recheck is a confirm path; it never carries the stop.
+      alRunnerV3: {
+        ...(a.effectiveConfig.alRunnerV3 as object),
+        isolation: "method",
+        ...((a.effectiveConfig.alRunnerV3 as { stopGroups?: unknown }).stopGroups !== undefined
+          ? { stopGroups: false }
+          : {}),
+      },
     };
     const {
       recheck: _recheck,
@@ -3420,13 +3489,37 @@ export function v3RecheckOf(a: {
     }));
     const exactSites = new Set(req.targets.map((t) => recheckSiteKey(t.mutant)));
     const backend = await a.build(methodConfig, join(a.scratchRoot, "recheck"));
+    // PR-277 (R1158): a second signal during the recheck closes the nested daemons at once; the main session abandons
+    // the run.
+    const closeOnSignal = () => {
+      backend.close?.().catch(() => {});
+    };
+    if (req.signal?.aborted === true) closeOnSignal();
+    else req.signal?.addEventListener("abort", closeOnSignal, { once: true });
     const store = a.newStore();
     const events: RunEvent[] = [];
     try {
       const report = await a.runSession({
         ...base,
+        // PR-277: the main session owns the process signals; the nested one never registers its own (R1158: it took
+        // a second SIGTERM as its own first, so the process did not end). The main session's first signal (`stop`)
+        // and second (`signal`) each spend the nested budget, so it starts nothing new.
+        registerStopSignal: (stop) => {
+          const on = [req.stop, req.signal].filter((s) => s !== undefined);
+          for (const s of on) {
+            if (s.aborted) stop();
+            else s.addEventListener("abort", stop, { once: true });
+          }
+          return () => {
+            for (const s of on) s.removeEventListener("abort", stop);
+          };
+        },
         backend,
         store,
+        // PR-298: the nested session never traces: it would truncate the main run's LETHAL_REACH_TRACE file.
+        reachTrace: null,
+        // PR-303: nor does it prune: the recheck must run every covering test.
+        reachPrune: false,
         instrumentedDir: join(a.scratchRoot, "recheck-instrumented"),
         emit: [(e) => events.push(e)],
         lines,
@@ -3445,6 +3538,10 @@ export function v3RecheckOf(a: {
         baselineElapsedMs: events.reduce(
           (n, e) => (e.type === "phase-left" && e.phase === "baseline" ? n + e.elapsedMs : n),
           0,
+        ),
+        // PR-370 (R1189): the nested session's phases, for the recheck phase's detail.
+        phases: events.flatMap((e) =>
+          e.type === "phase-left" ? [{ phase: e.phase, elapsedMs: e.elapsedMs }] : [],
         ),
         identity: {
           ...(ctx?.runnerBuild !== undefined ? { version: ctx.runnerBuild } : {}),
@@ -3756,6 +3853,26 @@ export function assertBcdevToolsLocated(
  * transport is serve-entries where proven and one-shot otherwise (R761), unless the config names
  * one. Coverage is turned off (with a warning) by `v3CoverageMode`.
  */
+/**
+ * PR-227: the `alRunnerV3` keys that reach the backend's config unchanged, in one place so a test
+ * pins the wiring (a key the config parses but the CLI never passes on was invisible before).
+ */
+export function v3SectionPassThrough(c: AlRunnerV3ConfigSection) {
+  return {
+    ...(c.cacheDir !== undefined ? { cacheDir: c.cacheDir } : {}),
+    downloadDemoData: c.downloadDemoData,
+    noClient: c.noClient, // R907
+    memoryHeadroomGb: c.memoryHeadroomGb, // R948
+    daemonMaxRssGb: c.daemonMaxRssGb, // R952
+    daemonMaxRequests: c.daemonMaxRequests, // R952
+    ...(c.daemonStderrDir !== undefined ? { daemonStderrDir: c.daemonStderrDir } : {}), // PR-227
+    ...(c.serveTimings ? { serveTimings: true } : {}), // PR-237
+    ...(c.companies !== undefined ? { companies: c.companies } : {}), // PR-282
+    ...(c.refusedCutTail !== undefined ? { refusedCutTail: c.refusedCutTail } : {}), // PR-297; PR-347: an explicit false must reach the backend (default on)
+    ...(c.stopGroups === true ? { stopGroups: true } : {}), // PR-256
+  };
+}
+
 async function buildAlRunnerV3Backend(
   parsed: BackendInputs,
   configFile: LethalConfigFile,
@@ -3808,12 +3925,7 @@ async function buildAlRunnerV3Backend(
       ...(parsed.baselineProcesses !== undefined
         ? { isolatedBaselineProcesses: parsed.baselineProcesses }
         : {}),
-      ...(c.cacheDir !== undefined ? { cacheDir: c.cacheDir } : {}),
-      downloadDemoData: c.downloadDemoData,
-      noClient: c.noClient, // R907
-      memoryHeadroomGb: c.memoryHeadroomGb, // R948
-      daemonMaxRssGb: c.daemonMaxRssGb, // R952
-      daemonMaxRequests: c.daemonMaxRequests, // R952
+      ...v3SectionPassThrough(c),
       daemonBaseline: c.transport === "serve-entries", // R948: the baseline through one daemon
       environmentChoice, // R938
       ...(license !== undefined ? { license } : {}), // R956
@@ -4257,6 +4369,8 @@ export async function printDryRun(
     readonly operators?: readonly string[];
     /** R832: `--exclude-operator` names, likewise. */
     readonly excludeOperators?: readonly string[];
+    /** PR-209: `--profile slim`, likewise (the walk skips the two operators). */
+    readonly profile?: "slim";
     /** Issue #19: the resolved line filter, honoured for the same reason. */
     readonly lines?: readonly LineRange[];
     /**
@@ -4310,6 +4424,7 @@ export async function printDryRun(
     ...(exclude !== undefined ? { exclude } : {}),
     ...(operators !== undefined ? { operators } : {}),
     ...(excludeOperators !== undefined ? { excludeOperators } : {}),
+    ...(paths.profile !== undefined ? { profile: paths.profile } : {}),
     ...(paths.lines !== undefined ? { lines: paths.lines } : {}),
     ...(paths.source !== undefined ? { source: paths.source } : {}),
     ...(paths.preprocessorSymbols !== undefined
@@ -4946,6 +5061,7 @@ export async function runFromCliWithAccept(
               ...(parsed.excludeOperators !== undefined
                 ? { excludeOperators: parsed.excludeOperators }
                 : {}),
+              ...(parsed.profile !== undefined ? { profile: parsed.profile } : {}),
               ...(lineRanges !== undefined
                 ? {
                     lines: lineRanges.ranges,
@@ -4999,6 +5115,11 @@ export async function runFromCliWithAccept(
               // C02-06: the symbols the target compiler was built with (see `buildBackend`), so the
               // recorded source hash covers them. Also what `SessionReport.preprocessorSymbols` reports.
               preprocessorSymbols: validatePreprocessorSymbols(effectiveConfig.preprocessorSymbols),
+              // PR-307: validated at load; the nested recheck's `base` spreads this config, so it carries the same value.
+              // PR-307b: `--ci-session-kind` overrides the config file's value.
+              ...((parsed.ciSessionKind ?? effectiveConfig.ciSessionKind) !== undefined
+                ? { ciSessionKind: parsed.ciSessionKind ?? effectiveConfig.ciSessionKind }
+                : {}),
               // R900: the list `buildBackend` gave alc, for the resume fingerprint.
               assemblyProbingPaths: probing.paths,
               ...afterLeaseAcquiredFor(envSession),
@@ -5170,7 +5291,7 @@ export const NOTHING_SCORED_EXIT_CODE = 4;
  * out, not survived), so a CI script branching on 0 would read a partial score as a pass. Not 5 or 6,
  * which `lethal verify` uses. Quarantine and nothing-scored both win over it.
  */
-export const TIME_BUDGET_EXIT_CODE = 7;
+export const TIME_BUDGET_EXIT_CODE = SIGNAL_STOP_EXIT_CODE;
 
 /**
  * R1079. A line filter (`--lines`, `--changed-since`) kept no deployable mutation site, so the run
@@ -6169,6 +6290,11 @@ export async function buildDoctorDeps(
       ...(v3Check !== undefined ? { alRunnerV3: v3Check } : {}),
       ...(v3EnvCheck !== undefined ? { alRunnerV3Environment: v3EnvCheck } : {}),
       ...probingCheck,
+      // PR-315: `run` reads the config field only when there is no envTool section.
+      stopHungSessions: async () => ({
+        on: configFile.bcdev?.stopHungSessions === true && configFile.envTool === undefined,
+        envTool: configFile.envTool !== undefined,
+      }),
     },
     ...(isCreateMode ? { caveat: DOCTOR_CREATE_MODE_CAVEAT } : {}),
   };
@@ -6688,7 +6814,7 @@ export async function verifyFromCli(
     readonly runVerify?: typeof runVerify;
   } = {},
 ): Promise<number> {
-  const started = Date.now();
+  const started = monoNow();
   const write = deps.write ?? ((t: string) => process.stdout.write(t));
   const print = (o: VerifyOutput): number => {
     write(`${JSON.stringify(o, null, 2)}\n`);
@@ -6780,7 +6906,7 @@ export async function verifyFromCli(
       ),
     );
   } catch (err) {
-    const out = refusalOutput(err, { totalMs: Date.now() - started });
+    const out = refusalOutput(err, { totalMs: monoNow() - started });
     if (out === undefined) throw err;
     return print(out);
   } finally {
@@ -7155,6 +7281,7 @@ export async function dryRunFromCli(parsed: DryRunCliConfig): Promise<number> {
     ...(parsed.outPath !== undefined ? { outPath: parsed.outPath } : {}),
     ...(parsed.operators !== undefined ? { operators: parsed.operators } : {}),
     ...(parsed.excludeOperators !== undefined ? { excludeOperators: parsed.excludeOperators } : {}),
+    ...(parsed.profile !== undefined ? { profile: parsed.profile } : {}),
     ...(dryRunLines !== undefined ? { lines: dryRunLines.ranges } : {}),
     ...(dryRunExclude.length > 0 ? { exclude: dryRunExclude } : {}),
     ...(dryRunConfig?.preprocessorSymbols !== undefined

@@ -61,6 +61,9 @@ export function splitBackend(owner: ExecutionBackend, lane0: ExecutionBackend): 
     get isolatesTests() {
       return owner.isolatesTests === true;
     },
+    get baselineBatchingKnobOff() {
+      return owner.baselineBatchingKnobOff === true;
+    },
     ...(owner.baselineState !== undefined
       ? { baselineState: () => owner.baselineState?.() ?? Promise.resolve(undefined) }
       : {}),
@@ -81,7 +84,7 @@ export function splitBackend(owner: ExecutionBackend, lane0: ExecutionBackend): 
     compileCheck: (dir) => owner.compileCheck(dir),
     activate: (id) => lane0.activate(id),
     run: (ref, opts) => lane0.run(ref, opts),
-    baselinePhase: (on) => owner.baselinePhase?.(on),
+    baselinePhase: (on, completed) => owner.baselinePhase?.(on, completed),
     mayStartGroup: () => lane0.mayStartGroup?.() ?? Promise.resolve(true), // R948
     noteReusedBaseline: (baseline) => owner.noteReusedBaseline?.(baseline),
     // R896: the choice is the owner's (every lane reads it); absent on an owner without auto.
@@ -101,9 +104,28 @@ export function splitBackend(owner: ExecutionBackend, lane0: ExecutionBackend): 
     restoreCutState: (id, state) => lane0.restoreCutState?.(id, state),
     sendKillPair: (id, ref) => lane0.sendKillPair?.(id, ref) ?? Promise.resolve(),
     dropPendingPair: (id) => lane0.dropPendingPair?.(id),
-    survivorNote: (covering) => lane0.survivorNote?.(covering),
+    survivorNote: (covering, site) => lane0.survivorNote?.(covering, site),
+    // PR-340: NO `carryWalk` here, on purpose. A walk runs on the daemon and resource file of the lane
+    // that scored the mutant; forwarding it to lane 0 would walk on another lane's daemon. A caller
+    // holding this view sees an absent method, which means no walk.
     baselineNote: () => owner.baselineNote?.(),
   };
+}
+
+/**
+ * PR-281: the units, costliest first inside each window. A stable sort by window (ascending), then estimated
+ * cost (descending), then original index. Windows stay non-decreasing (the look-ahead bound needs it); a unit's
+ * mutants are never touched, so no scope's internal order (the R197 ledger's) changes. Returns a new array.
+ */
+export function orderUnitsCostliestFirst<U>(
+  units: readonly U[],
+  windowOf: (unit: U) => number,
+  costOf: (unit: U) => number,
+): U[] {
+  return units
+    .map((unit, i) => ({ unit, i, w: windowOf(unit), c: costOf(unit) }))
+    .sort((a, b) => a.w - b.w || b.c - a.c || a.i - b.i)
+    .map((x) => x.unit);
 }
 
 /** The first latch of the batch and the mutant behind it, or `undefined`. */
@@ -187,6 +209,8 @@ export class OrderedCommit {
     codes: readonly string[],
     private readonly latch: Latch,
     private readonly workers: number,
+    /** PR-281: called each time a lane finishes a mutant, before the record waits for its turn. */
+    private readonly onFinish?: () => void,
   ) {
     this.codes = codes;
     for (const [i, c] of codes.entries()) this.index.set(c, i);
@@ -267,6 +291,7 @@ export class OrderedCommit {
 
   private finish(code: string, commit: () => void, stop: Error | undefined): void {
     const i = this.idx(code);
+    this.onFinish?.();
     // R962: after the memory guard's stop a lane's in-flight mutant still finishes; its result is
     // complete, so it waits with the others and `conclude()` records it, by the latch rule then.
     if (this.stoppedByGuard) {
@@ -447,6 +472,20 @@ export async function runScopeQueue<M extends { readonly mutantId: string }>(o: 
     readonly windowOf: (unit: readonly M[]) => number;
     readonly budgetSpent: () => boolean;
   };
+  /**
+   * PR-241 (A/B knob, off when absent): after taking a unit a lane also takes the CONSECUTIVE units that
+   * come next while `fits(batch + next)` holds and the look-ahead bound (and the budget, the commit, the
+   * unsafe flag) would hand them out now. `prefetch` runs once for the batch, then `runUnit` runs each unit
+   * in order. Never crosses lanes, never reorders; each unit ends (look-ahead, waiters) as it finishes.
+   */
+  readonly pack?: {
+    readonly fits: (batch: readonly (readonly M[])[]) => boolean;
+    readonly prefetch: (
+      lane: number,
+      batch: readonly (readonly M[])[],
+      sink: LaneSink,
+    ) => Promise<void>;
+  };
   readonly split?: {
     readonly barrierPassed: () => boolean;
     readonly measured: () => boolean;
@@ -557,16 +596,46 @@ export async function runScopeQueue<M extends { readonly mutantId: string }>(o: 
           const t0 = pace?.now() ?? 0;
           const w = pace?.weight(unit) ?? 0;
           const epoch0 = pace?.epoch?.();
+          const endUnit = (i: number): void => {
+            // A unit that ended by a throw counts as ended: it must not hold the bound or a waiter.
+            ended[i] = true;
+            while (ended[oldest] === true) oldest += 1;
+            wake();
+          };
+          const batch: (readonly M[])[] = [unit];
+          const pack = o.pack;
           try {
-            await o.runUnit(k, unit, sink);
+            // PR-241: only a unit `take` would hand out now (same bound, budget and stop rules). Inside the
+            // `try`: a throw in `fits` fails the session and ends the units taken, never hangs the lane.
+            while (
+              pack !== undefined &&
+              !o.commit.closed &&
+              !o.isUnsafe() &&
+              nextUnit < o.units.length &&
+              look?.budgetSpent() !== true &&
+              inBound()
+            ) {
+              const next = o.units[nextUnit];
+              if (next === undefined || !pack.fits([...batch, next])) break;
+              queuedW -= weights[nextUnit] ?? 0;
+              batch.push(next);
+              nextUnit += 1;
+            }
+            if (pack !== undefined) await pack.prefetch(k, batch, sink);
+            for (const [j, u] of batch.entries()) {
+              try {
+                await o.runUnit(k, u, sink);
+              } finally {
+                endUnit(idx + j);
+              }
+              // As after a unit sent alone: a lane waiting on the bound may now start.
+              if (j < batch.length - 1) tryLaunch();
+            }
           } catch (err) {
             o.commit.fail(current() ?? unit[0]?.mutantId, err);
             throw err;
           } finally {
-            // A unit that ended by a throw counts as ended: it must not hold the bound or a waiter.
-            ended[idx] = true;
-            while (ended[oldest] === true) oldest += 1;
-            wake();
+            for (let j = 0; j < batch.length; j++) if (ended[idx + j] !== true) endUnit(idx + j);
           }
           // A unit that restarted lane 0's daemon carries a warm-up: it does not measure the work.
           if (pace !== undefined && k === 0 && w > 0 && pace.epoch?.() === epoch0) {
